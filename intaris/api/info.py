@@ -416,25 +416,64 @@ async def config(
         analysis_llm_base_url_display = (
             "openai" if cfg.llm_analysis.base_url == default_openai else "custom"
         )
+        backend = (
+            "openai_decisions"
+            if cfg.decisions.enabled
+            else "jev"
+            if cfg.jev.enabled
+            else "llm"
+        )
 
         return {
             "version": __version__,
             "evaluator": {
-                "backend": "jev" if cfg.jev.enabled else "llm",
-                "model": cfg.jev.model if cfg.jev.enabled else cfg.llm.model,
+                "backend": backend,
+                "model": (
+                    cfg.decisions.model
+                    if cfg.decisions.enabled
+                    else cfg.jev.model
+                    if cfg.jev.enabled
+                    else cfg.llm.model
+                ),
                 "timeout_ms": (
-                    cfg.jev.timeout_ms if cfg.jev.enabled else cfg.llm.timeout_ms
+                    cfg.decisions.timeout_ms
+                    if cfg.decisions.enabled
+                    else cfg.jev.timeout_ms
+                    if cfg.jev.enabled
+                    else cfg.llm.timeout_ms
                 ),
                 "minimum_confidence": (
-                    cfg.jev.minimum_confidence if cfg.jev.enabled else None
+                    cfg.decisions.minimum_confidence
+                    if cfg.decisions.enabled
+                    else cfg.jev.minimum_confidence
+                    if cfg.jev.enabled
+                    else None
                 ),
                 "decision_question": (
-                    cfg.jev.decision_question if cfg.jev.enabled else None
+                    cfg.jev.decision_question
+                    if backend == "jev"
+                    else True
+                    if backend == "openai_decisions"
+                    else None
                 ),
                 "approval_risk_confidence": (
-                    cfg.jev.approval_risk_confidence if cfg.jev.enabled else None
+                    cfg.jev.approval_risk_confidence if backend == "jev" else None
                 ),
-                "diagnostics": cfg.jev.diagnostics if cfg.jev.enabled else False,
+                "diagnostics": cfg.jev.diagnostics
+                if backend == "jev"
+                else backend == "openai_decisions",
+                "fallback_available": cfg.decisions.enabled and bool(cfg.llm.api_key),
+                "fallback_model": cfg.llm.model
+                if cfg.decisions.enabled and cfg.llm.api_key
+                else None,
+                "budget_ms": cfg.llm.timeout_ms if cfg.decisions.enabled else None,
+                "base_url": (
+                    "openai"
+                    if cfg.decisions.base_url.rstrip("/") == default_openai
+                    else "custom"
+                )
+                if cfg.decisions.enabled
+                else None,
             },
             "llm": {
                 "model": cfg.llm.model,

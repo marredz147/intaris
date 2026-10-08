@@ -94,6 +94,7 @@ class LLMClient:
         temperature: float | None = None,
         max_tokens: int = 16384,
         reasoning_effort: str | None = None,
+        deadline: float | None = None,
     ) -> str:
         """Generate a chat completion, returning the content string.
 
@@ -104,6 +105,9 @@ class LLMClient:
             temperature: Override default temperature.
             max_tokens: Maximum tokens to generate.
             reasoning_effort: Override instance-level reasoning effort.
+            deadline: Optional monotonic deadline for bounded fallback calls;
+                      disables transport/content retries while retaining bounded
+                      parameter adaptation and uses remaining time per request.
 
         Returns:
             The raw content string from the LLM response.
@@ -121,14 +125,17 @@ class LLMClient:
                     temperature=temp,
                     max_tokens=max_tokens,
                     reasoning_effort=reasoning_effort,
+                    deadline=deadline,
                 )
                 self._supports_structured = True
                 return result
             except LLMTemporaryError:
                 raise
             except BadRequestError as exc:
+                self._check_deadline(deadline)
                 recovered = _recover_failed_generation(exc, json_schema)
                 if recovered is not None:
+                    self._check_deadline(deadline)
                     self._supports_structured = True
                     return recovered
 
@@ -158,7 +165,13 @@ class LLMClient:
             temperature=temp,
             max_tokens=max_tokens,
             reasoning_effort=reasoning_effort,
+            deadline=deadline,
         )
+
+    @staticmethod
+    def _check_deadline(deadline: float | None) -> None:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise LLMTemporaryError("LLM evaluation timed out.")
 
     def _call(
         self,
@@ -167,6 +180,7 @@ class LLMClient:
         temperature: float,
         max_tokens: int,
         reasoning_effort: str | None = None,
+        deadline: float | None = None,
     ) -> str:
         """Execute a single chat completion call.
 
@@ -189,15 +203,17 @@ class LLMClient:
         # clients keep zero transient retries to preserve latency budgets.
         max_retries = 3
         response = None
-        transient_attempts = self._transient_retries + 1
+        transient_attempts = 1 if deadline is not None else self._transient_retries + 1
         for attempt in range(1 + max_retries):
             try:
                 response = self._call_with_transient_retries(
                     params,
                     max_attempts=transient_attempts,
+                    deadline=deadline,
                 )
                 break
             except BadRequestError as e:
+                self._check_deadline(deadline)
                 if attempt < max_retries and self._try_fix_params(
                     e, params, max_tokens
                 ):
@@ -210,7 +226,10 @@ class LLMClient:
         # When finish_reason=length and content is empty, the model ran out
         # of tokens before producing any output (all budget consumed by
         # reasoning). Double max_tokens on each retry to give it more room.
-        content_retries = 2
+        content_retries = 0 if deadline is not None else 2
+        if deadline is not None:
+            self._check_deadline(deadline)
+            return _clean_response(response.choices[0].message.content or "")
         for retry in range(content_retries):
             choice = response.choices[0]
             content = choice.message.content or ""
@@ -277,12 +296,23 @@ class LLMClient:
         params: dict[str, Any],
         *,
         max_attempts: int,
+        deadline: float | None = None,
     ) -> Any:
         """Execute a chat completion with optional transient retry handling."""
         for attempt in range(1, max_attempts + 1):
             try:
+                if deadline is not None:
+                    self._check_deadline(deadline)
+                    remaining = deadline - time.monotonic()
+                    response = self._client.with_options(
+                        max_retries=0
+                    ).chat.completions.create(**params, timeout=remaining)
+                    self._check_deadline(deadline)
+                    return response
                 return self._client.chat.completions.create(**params)
             except BadRequestError:
+                raise
+            except LLMTemporaryError:
                 raise
             except Exception as exc:
                 normalized = normalize_llm_error(exc)

@@ -72,6 +72,7 @@ _config = None
 _db = None
 _evaluator = None
 _jev_client = None
+_decisions_client = None
 _mcp_proxy_ref = None  # Module-level reference for _MCPEndpoint ASGI wrapper
 
 
@@ -103,6 +104,18 @@ def _get_jev_client():
     return _jev_client
 
 
+def _get_decisions_client():
+    global _decisions_client
+    cfg = _get_config()
+    if not cfg.decisions.enabled:
+        return None
+    if _decisions_client is None:
+        from intaris.decisions import DecisionsClient
+
+        _decisions_client = DecisionsClient(cfg.decisions)
+    return _decisions_client
+
+
 def _get_evaluator(alignment_barrier=None):
     global _evaluator
     if _evaluator is None:
@@ -114,13 +127,15 @@ def _get_evaluator(alignment_barrier=None):
         cfg = _get_config()
         db = _get_db()
         _evaluator = Evaluator(
-            llm=LLMClient(cfg.llm),
+            llm=LLMClient(cfg.llm) if cfg.llm.api_key else None,
             session_store=SessionStore(db),
             audit_store=AuditStore(db),
             db=db,
             analysis_config=cfg.analysis,
             alignment_barrier=alignment_barrier,
             jev=_get_jev_client(),
+            decisions=_get_decisions_client(),
+            llm_timeout_ms=cfg.llm.timeout_ms,
         )
     return _evaluator
 
@@ -963,7 +978,7 @@ async def lifespan(app):
             pass  # Table may not exist yet on first run.
 
     # Initialize MCP proxy
-    global _jev_client, _mcp_proxy_ref
+    global _jev_client, _decisions_client, _evaluator, _mcp_proxy_ref
     try:
         mcp_proxy = _init_mcp_proxy(cfg)
     except Exception:
@@ -1118,6 +1133,16 @@ async def lifespan(app):
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 _jev_client.close()
             _jev_client = None
+
+        if _decisions_client is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                _decisions_client.close()
+            _decisions_client = None
+
+        if _evaluator is not None and _evaluator._llm is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                _evaluator._llm.close()
+        _evaluator = None
 
         logger.info("Intaris shut down")
 

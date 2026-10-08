@@ -53,7 +53,12 @@ JWT validation requires:
 | `LLM_BASE_URL` | `https://api.openai.com/v1` | LLM API base URL. Falls back to `OPENAI_API_BASE`. |
 | `LLM_MODEL` | `gpt-5.4-nano` | Model for safety evaluation when `EVALUATOR_BACKEND=llm`. |
 | `LLM_REASONING_EFFORT` | `low` | Reasoning effort hint (provider-specific). |
-| `LLM_TIMEOUT_MS` | `4000` | Timeout for LLM calls in milliseconds. Must be under the 5-second circuit breaker. Minimum: 500ms. |
+| `LLM_TIMEOUT_MS` | `4000` | Legacy LLM timeout and cooperative L1 Decisions/fallback budget in milliseconds. This is not a hard wall-clock deadline. Minimum: 500ms. |
+| `DECISIONS_API_KEY` | (unset) | Dedicated credential; setting this enables native Decisions as the primary L1 classifier regardless of `EVALUATOR_BACKEND`. Never inherited from `LLM_API_KEY` or `OPENAI_API_KEY`. |
+| `DECISIONS_BASE_URL` | `https://api.openai.com/v1` | Decisions API root; append `/decisions`. Dedicated override, never inherited from `LLM_BASE_URL` or `OPENAI_API_BASE`. Custom prefixes and trailing slashes are supported. |
+| `DECISIONS_MODEL` | (unset) | Required when `DECISIONS_API_KEY` is set. No default or model allowlist; the endpoint must support this model and the Decisions contract. |
+| `DECISIONS_TIMEOUT_MS` | `2000` | Primary Decisions request timeout, minimum 500ms. When legacy LLM fallback is available, primary gets at most half `LLM_TIMEOUT_MS`. |
+| `DECISIONS_MINIMUM_CONFIDENCE` | `0.8` | Provisional threshold; calibrate for the chosen provider. |
 | `JEV_API_KEY` | (required for Jev) | Jev provider API key. Falls back to `TYPESAFE_API_KEY` only for the native TypeSafe endpoint; OpenRouter requires an explicit key. |
 | `JEV_BASE_URL` | `https://api.typesafe.ai` | TypeSafe API base URL; set `https://openrouter.ai/api` for OpenRouter's decisions API. |
 | `JEV_MODEL` | `jev-1.13.0` | Pinned Jev model; OpenRouter: `typesafe/jev-1.13-20260917`. |
@@ -78,6 +83,31 @@ does not silently switch models. Jev's returned probabilities are converted
 into concise audit text and are not represented as model-generated reasoning.
 It is opt-in and **not the recommended production default**; see the
 [Jev evaluator assessment](jev-evaluator.md) for benchmark results and caveats.
+
+Native Decisions uses typed predicate/choice questions for L1 only. It takes
+precedence over `EVALUATOR_BACKEND=llm` or `jev` when `DECISIONS_API_KEY` is set;
+Jev still handles child alignment when selected, and analysis, intention and
+judge retain their separate generative configurations. No generic LLM key is
+needed when Decisions is enabled **and** analysis is disabled (judge without
+its own key still cannot review). With a generic LLM key, temporary Decisions
+connection/timeouts, HTTP 429 and 5xx failures can fall back to the legacy L1
+model. Authentication/configuration/other 4xx errors, malformed responses,
+refusals and low confidence do not fall back. `LLM_TIMEOUT_MS` is a cooperative
+budget: the primary request gets the lesser of `DECISIONS_TIMEOUT_MS` and half
+the budget when fallback exists. The legacy fallback uses the observed remaining
+time. HTTP request timeouts are per-phase/inactivity allocations, not guaranteed
+wall-clock limits; a response that arrives past the deadline is checked after
+the phase, not interrupted mid-request. Half the budget is therefore not
+guaranteed to remain available for fallback.
+No cross-provider fallback is available without a generative LLM key.
+
+Example native L1 setup (supply credentials through your secret mechanism):
+
+```bash
+DECISIONS_MODEL=<model supported by your Decisions endpoint>
+DECISIONS_BASE_URL=https://api.openai.com/v1
+# DECISIONS_API_KEY is supplied separately; omit it to keep legacy L1 routing.
+```
 
 Example split configuration:
 

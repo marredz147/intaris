@@ -196,6 +196,11 @@ The middleware sets three ContextVars (`_session_user_id`, `_session_agent_id`, 
 | `JEV_BASE_URL` | TypeSafe API base URL (default `https://api.typesafe.ai`) |
 | `JEV_TIMEOUT_MS` | Jev request timeout (default `4000`) |
 | `JEV_MINIMUM_CONFIDENCE` | Minimum confidence before Jev results escalate (default `0.6`) |
+| `DECISIONS_API_KEY` | Dedicated native Decisions credential; when set, Decisions overrides L1 dispatch (no shared-key activation) |
+| `DECISIONS_MODEL` | Required when Decisions is enabled; no default or model allowlist |
+| `DECISIONS_BASE_URL` | Decisions API root (default `https://api.openai.com/v1`; independent of generative API root) |
+| `DECISIONS_TIMEOUT_MS` | Native primary request timeout (default `2000`) |
+| `DECISIONS_MINIMUM_CONFIDENCE` | Provisional confidence floor (default `0.8`) |
 | `COOKIE_SECURE` | Set the Secure flag on SSO cookies (default `true`). Set to `false` for local development over plain HTTP. |
 | `WEBHOOK_URL` | Cognis webhook URL for escalation callbacks (optional) |
 | `WEBHOOK_SECRET` | HMAC-SHA256 secret for signing webhook payloads (required if WEBHOOK_URL is set) |

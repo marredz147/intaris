@@ -61,6 +61,7 @@ from intaris.sanitize import ANTI_INJECTION_PREAMBLE
 from intaris.session import SessionStore
 
 if TYPE_CHECKING:
+    from intaris.decisions import DecisionsClient
     from intaris.jev import JevClient
 
 # Escalation retry: reuse approval if same tool+args approved within this window.
@@ -253,16 +254,20 @@ class Evaluator:
     def __init__(
         self,
         *,
-        llm: LLMClient,
+        llm: LLMClient | None,
         session_store: SessionStore,
         audit_store: AuditStore,
         db: Database | None = None,
         analysis_config: AnalysisConfig | None = None,
         alignment_barrier: Any | None = None,
         jev: JevClient | None = None,
+        decisions: DecisionsClient | None = None,
+        llm_timeout_ms: int = 4000,
     ):
         self._llm = llm
         self._jev = jev
+        self._decisions = decisions
+        self._llm_timeout_ms = llm_timeout_ms
         self._sessions = session_store
         self._audit = audit_store
         self._db = db
@@ -854,6 +859,9 @@ class Evaluator:
 
         # Step 7: Audit (with args_hash for escalation retry, profile_version)
         audit_context = redact(context) if context else None
+        if decision.metadata is not None:
+            audit_context = dict(audit_context or {})
+            audit_context["evaluation_metadata"] = decision.metadata
         self._audit.insert(
             call_id=call_id,
             user_id=user_id,
@@ -1274,7 +1282,45 @@ class Evaluator:
         ]
 
         try:
-            if self._jev is not None:
+            backend = "jev" if self._jev is not None else "llm"
+            if self._decisions is not None:
+                from intaris.decisions import DecisionsTemporaryError
+
+                backend = "openai_decisions"
+                started = time.monotonic()
+                deadline = started + self._llm_timeout_ms / 1000
+                primary_budget = min(
+                    self._decisions._timeout_ms,
+                    self._llm_timeout_ms // (2 if self._llm is not None else 1),
+                )
+                try:
+                    evaluation = self._decisions.evaluate(
+                        system_prompt=messages[0]["content"],
+                        user_prompt=user_prompt,
+                        timeout_ms=primary_budget,
+                    )
+                    if time.monotonic() >= deadline:
+                        raise DecisionsTemporaryError("Decisions evaluation timed out.")
+                except DecisionsTemporaryError:
+                    if self._llm is None or time.monotonic() >= deadline:
+                        raise
+                    primary_latency_ms = int((time.monotonic() - started) * 1000)
+                    backend = "llm"
+                    evaluation = self._legacy_evaluate(messages, deadline=deadline)
+                    evaluation.metadata = {
+                        "backend": "llm",
+                        "primary_backend": "openai_decisions",
+                        "requested_model": self._llm._model,
+                        "fallback_reason": "temporary_unavailable",
+                        "primary_latency_ms": primary_latency_ms,
+                    }
+                else:
+                    evaluation.metadata = {
+                        **(evaluation.metadata or {}),
+                        "backend": "openai_decisions",
+                        "primary_backend": "openai_decisions",
+                    }
+            elif self._jev is not None:
                 evaluation = self._jev.evaluate_tool_call(
                     state={
                         "intention": session["intention"],
@@ -1294,29 +1340,21 @@ class Evaluator:
                     ),
                 )
             else:
-                raw = self._llm.generate(
-                    messages,
-                    json_schema=SAFETY_EVALUATION_SCHEMA,
-                    max_tokens=1024,
-                )
-                result = parse_json_response(
-                    raw,
-                    expected_keys={"aligned", "risk", "reasoning", "decision"},
-                )
-
-                evaluation = EvaluationResult(
-                    aligned=bool(result.get("aligned", False)),
-                    risk=str(result.get("risk", "high")),
-                    reasoning=str(result.get("reasoning", "No reasoning provided")),
-                    decision=str(result.get("decision", "escalate")),
-                )
+                evaluation = self._legacy_evaluate(messages)
             evaluation = _apply_authoritative_user_precedent(
                 evaluation,
                 tool=tool,
                 args_redacted=args_redacted,
                 user_decisions=user_decisions,
             )
-            if self._jev is not None and evaluation.decision == "escalate":
+            if (
+                backend in ("jev", "openai_decisions")
+                and evaluation.decision == "escalate"
+                and (
+                    backend != "openai_decisions"
+                    or evaluation.risk.lower() != "critical"
+                )
+            ):
                 return Decision(
                     decision="escalate",
                     risk=evaluation.risk,
@@ -1336,6 +1374,26 @@ class Evaluator:
             # (approve/deny/escalate) on an infra failure is wrong.
             logger.exception("LLM safety evaluation failed")
             raise
+
+    def _legacy_evaluate(
+        self, messages: list[dict[str, str]], *, deadline: float | None = None
+    ) -> EvaluationResult:
+        """Evaluate using the legacy structured-output LLM policy."""
+        if self._llm is None:
+            raise RuntimeError("LLM evaluation requires an LLM client")
+        kwargs: dict[str, Any] = {"deadline": deadline} if deadline is not None else {}
+        raw = self._llm.generate(
+            messages, json_schema=SAFETY_EVALUATION_SCHEMA, max_tokens=1024, **kwargs
+        )
+        result = parse_json_response(
+            raw, expected_keys={"aligned", "risk", "reasoning", "decision"}
+        )
+        return EvaluationResult(
+            aligned=bool(result.get("aligned", False)),
+            risk=str(result.get("risk", "high")),
+            reasoning=str(result.get("reasoning", "No reasoning provided")),
+            decision=str(result.get("decision", "escalate")),
+        )
 
 
 def _compute_path_prefix(resolved_path: str, working_directory: str) -> str:
