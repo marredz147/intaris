@@ -861,7 +861,7 @@ class Evaluator:
         audit_context = redact(context) if context else None
         if decision.metadata is not None:
             audit_context = dict(audit_context or {})
-            audit_context["evaluation_metadata"] = decision.metadata
+            audit_context["evaluation_metadata"] = redact(decision.metadata)
         self._audit.insert(
             call_id=call_id,
             user_id=user_id,

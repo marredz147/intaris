@@ -11,7 +11,9 @@ import httpx
 import pytest
 from openai import BadRequestError
 
-from intaris.config import DecisionsConfig
+from intaris.audit import AuditStore
+from intaris.config import DBConfig, DecisionsConfig
+from intaris.db import Database
 from intaris.decision import EvaluationResult
 from intaris.decisions import (
     DecisionsClient,
@@ -21,6 +23,7 @@ from intaris.decisions import (
 )
 from intaris.evaluator import Evaluator
 from intaris.llm import LLMClient, LLMTemporaryError
+from intaris.session import SessionStore
 
 
 def _setup(*, llm: MagicMock | None = None, jev: MagicMock | None = None):
@@ -114,6 +117,47 @@ def test_native_selection_context_audit_and_fast_paths():
         == "critical"
     )
     assert decisions.evaluate.call_count == 1
+
+
+def test_native_metadata_redacted_only_in_stored_audit(tmp_path):
+    db = Database(DBConfig(path=str(tmp_path / "audit.db")))
+    sessions = SessionStore(db)
+    sessions.create(
+        user_id="user", session_id="session", intention="Edit documentation"
+    )
+    audit = AuditStore(db)
+    decisions = MagicMock()
+    decisions._timeout_ms = 3000
+    native = _result()
+    secret_model = "sk-Ab12Cd34Ef56Gh78Ij90KlMn"
+    native.metadata.update(
+        model=secret_model,
+        score=0.97,
+        usage={"input_tokens": 12, "output_tokens": 3},
+        details={"token": "synthetic-token", "notes": ["safe", secret_model]},
+    )
+    decisions.evaluate.return_value = native
+    evaluator = Evaluator(
+        llm=None, decisions=decisions, session_store=sessions, audit_store=audit
+    )
+
+    response = _call(evaluator)
+    stored = audit.get_by_call_id(response["call_id"], user_id="user")
+    metadata = stored["args_redacted"]["__intaris_context"]["evaluation_metadata"]
+
+    assert metadata["model"] == "[REDACTED:api_key]"
+    assert metadata["details"] == {
+        "token": "[REDACTED:credential]",
+        "notes": ["safe", "[REDACTED:api_key]"],
+    }
+    assert metadata["backend"] == "openai_decisions"
+    assert metadata["requested_model"] == "native"
+    assert metadata["score"] == 0.97
+    assert metadata["usage"] == {"input_tokens": 12, "output_tokens": 3}
+    assert secret_model not in json.dumps(stored["args_redacted"])
+    assert response["evaluation_metadata"] == native.metadata
+    assert response["evaluation_metadata"]["model"] == secret_model
+    assert native.metadata["details"]["token"] == "synthetic-token"
 
 
 @pytest.mark.parametrize(
