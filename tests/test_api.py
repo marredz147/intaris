@@ -28,10 +28,14 @@ def _reset_server_globals(monkeypatch):
     srv._config = None
     srv._db = None
     srv._evaluator = None
+    srv._jev_client = None
+    srv._decisions_client = None
     yield
     srv._config = None
     srv._db = None
     srv._evaluator = None
+    srv._jev_client = None
+    srv._decisions_client = None
 
 
 @pytest.fixture
@@ -57,6 +61,7 @@ def env_no_auth(tmp_db):
             "INTARIS_API_KEYS",
             "WEBHOOK_URL",
             "WEBHOOK_SECRET",
+            "DECISIONS_API_KEY",
         ):
             os.environ.pop(key, None)
         yield env
@@ -74,7 +79,12 @@ def env_with_auth(tmp_db):
         "METRICS_ENABLED": "false",
     }
     with patch.dict(os.environ, env, clear=False):
-        for key in ("INTARIS_API_KEYS", "WEBHOOK_URL", "WEBHOOK_SECRET"):
+        for key in (
+            "INTARIS_API_KEYS",
+            "WEBHOOK_URL",
+            "WEBHOOK_SECRET",
+            "DECISIONS_API_KEY",
+        ):
             os.environ.pop(key, None)
         yield env
 
@@ -3521,6 +3531,114 @@ class TestConfig:
         )
         assert resp.status_code == 200
         assert resp.json()["webhook_configured"] is False
+
+    @pytest.mark.parametrize("with_fallback", [False, True])
+    def test_decisions_config_diagnostics(
+        self, env_no_auth, monkeypatch, with_fallback
+    ):
+        from intaris.server import create_app
+
+        monkeypatch.setenv("DECISIONS_API_KEY", "dedicated-secret")
+        monkeypatch.setenv("DECISIONS_BASE_URL", "https://private.example/prefix/v1/")
+        monkeypatch.setenv("DECISIONS_MODEL", "provider-model")
+        if not with_fallback:
+            monkeypatch.delenv("LLM_API_KEY", raising=False)
+            monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+            monkeypatch.setenv("ANALYSIS_ENABLED", "false")
+        with TestClient(create_app()) as client:
+            data = client.get(
+                "/api/v1/config", headers={"X-User-Id": "user-cfg"}
+            ).json()
+        evaluator = data["evaluator"]
+        assert evaluator["backend"] == "openai_decisions"
+        assert evaluator["model"] == "provider-model"
+        assert evaluator["timeout_ms"] == 2000
+        assert evaluator["minimum_confidence"] == 0.8
+        assert evaluator["fallback_available"] is with_fallback
+        assert evaluator["budget_ms"] == 4000
+        assert evaluator["base_url"] == "custom"
+        assert "private.example" not in json.dumps(data)
+        assert "dedicated-secret" not in json.dumps(data)
+
+    def test_legacy_and_jev_config_selection(self, client_no_auth):
+        from intaris.server import _get_config
+
+        cfg = _get_config()
+        headers = {"X-User-Id": "user-cfg"}
+        assert (
+            client_no_auth.get("/api/v1/config", headers=headers).json()["evaluator"][
+                "backend"
+            ]
+            == "llm"
+        )
+        cfg.jev.enabled = True
+        assert (
+            client_no_auth.get("/api/v1/config", headers=headers).json()["evaluator"][
+                "backend"
+            ]
+            == "jev"
+        )
+
+
+@pytest.mark.parametrize("failure,status", [("protocol", 500), ("temporary", 503)])
+def test_decisions_api_failures_are_not_404(env_no_auth, monkeypatch, failure, status):
+    from intaris.decisions import DecisionsProtocolError, DecisionsTemporaryError
+    from intaris.server import create_app
+
+    monkeypatch.setenv("DECISIONS_API_KEY", "dedicated")
+    monkeypatch.setenv("DECISIONS_MODEL", "any-model")
+    monkeypatch.setenv("ANALYSIS_ENABLED", "false")
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    error = (
+        DecisionsProtocolError("Malformed provider answers")
+        if failure == "protocol"
+        else DecisionsTemporaryError("Provider temporarily unavailable")
+    )
+    decisions = Mock()
+    decisions.evaluate.side_effect = error
+    decisions._timeout_ms = 2000
+    decisions.close = Mock()
+    with patch("intaris.server._get_decisions_client", return_value=decisions):
+        with TestClient(create_app()) as client:
+            headers = {"X-User-Id": "decisions-user"}
+            _create_session(client, "decisions-session", headers).raise_for_status()
+            resp = client.post(
+                "/api/v1/evaluate",
+                headers=headers,
+                json={
+                    "session_id": "decisions-session",
+                    "tool": "write",
+                    "args": {"filePath": "docs/a.md", "content": "new"},
+                },
+            )
+            assert resp.status_code == status
+            decisions.evaluate.assert_called_once()
+
+
+def test_decisions_lifecycle_and_jev_alignment(env_no_auth, monkeypatch):
+    import intaris.server as srv
+
+    monkeypatch.setenv("DECISIONS_API_KEY", "dedicated")
+    monkeypatch.setenv("DECISIONS_MODEL", "any-model")
+    monkeypatch.setenv("EVALUATOR_BACKEND", "jev")
+    monkeypatch.setenv("JEV_API_KEY", "jev-key")
+    decisions = Mock()
+    jev = Mock()
+    with (
+        patch("intaris.decisions.DecisionsClient", return_value=decisions),
+        patch("intaris.jev.JevClient", return_value=jev),
+    ):
+        with TestClient(srv.create_app()) as client:
+            assert srv._get_decisions_client() is decisions
+            assert srv._get_decisions_client() is decisions
+            assert srv._get_evaluator()._decisions is decisions
+            assert srv._get_evaluator()._jev is jev
+            assert client.app.state.alignment_barrier._jev is jev
+        decisions.close.assert_called_once()
+        jev.close.assert_called_once()
+        assert srv._decisions_client is None
+        assert srv._jev_client is None
 
 
 # ── Audit Resolved Filter ────────────────────────────────────────────

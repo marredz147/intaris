@@ -10,6 +10,7 @@ In Docker, DATA_DIR is set to /data for volume mounting.
 from __future__ import annotations
 
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
@@ -140,6 +141,28 @@ class JevConfig:
         self.api_key = _env("JEV_API_KEY")
         if not self.api_key and urlsplit(self.base_url).hostname != "openrouter.ai":
             self.api_key = _env("TYPESAFE_API_KEY")
+
+
+@dataclass
+class DecisionsConfig:
+    """Native Decisions configuration for L1 tool-call classification."""
+
+    api_key: str = field(default_factory=lambda: _env("DECISIONS_API_KEY"))
+    base_url: str = field(
+        default_factory=lambda: _env("DECISIONS_BASE_URL", "https://api.openai.com/v1")
+    )
+    model: str = field(default_factory=lambda: _env("DECISIONS_MODEL"))
+    timeout_ms: int = field(
+        default_factory=lambda: _env_int("DECISIONS_TIMEOUT_MS", 2000)
+    )
+    minimum_confidence: float = field(
+        default_factory=lambda: _env_float("DECISIONS_MINIMUM_CONFIDENCE", 0.8)
+    )
+
+    @property
+    def enabled(self) -> bool:
+        """Enable native L1 evaluation only with dedicated credentials."""
+        return bool(self.api_key)
 
 
 @dataclass
@@ -616,6 +639,7 @@ class Config:
 
     llm: LLMConfig = field(default_factory=LLMConfig)
     jev: JevConfig = field(default_factory=JevConfig)
+    decisions: DecisionsConfig = field(default_factory=DecisionsConfig)
     llm_analysis: LLMConfig = field(default_factory=_build_analysis_llm_config)
     llm_l3_analysis: LLMConfig = field(default_factory=_build_l3_analysis_llm_config)
     llm_judge: LLMConfig = field(default_factory=_build_judge_llm_config)
@@ -707,7 +731,32 @@ class Config:
                     "JEV_APPROVAL_RISK_CONFIDENCE requires JEV_DECISION_QUESTION=false."
                 )
 
-        if not self.llm.api_key:
+        if self.decisions.enabled:
+            if not self.decisions.model.strip():
+                raise ValueError(
+                    "DECISIONS_MODEL is required when DECISIONS_API_KEY is set."
+                )
+            parsed_url = urlsplit(self.decisions.base_url)
+            if (
+                parsed_url.scheme not in ("http", "https")
+                or not parsed_url.netloc
+                or parsed_url.query
+                or parsed_url.fragment
+            ):
+                raise ValueError(
+                    "DECISIONS_BASE_URL must be an HTTP(S) API root without query or fragment."
+                )
+            if self.decisions.timeout_ms < 500:
+                raise ValueError("DECISIONS_TIMEOUT_MS must be >= 500.")
+            if (
+                not math.isfinite(self.decisions.minimum_confidence)
+                or not 0 <= self.decisions.minimum_confidence <= 1
+            ):
+                raise ValueError(
+                    "DECISIONS_MINIMUM_CONFIDENCE must be between 0 and 1."
+                )
+
+        if not self.llm.api_key and not self.decisions.enabled:
             raise ValueError(
                 "LLM API key is required. Set LLM_API_KEY or OPENAI_API_KEY."
             )

@@ -116,7 +116,10 @@ When `working_directory` is set on a session, the classifier enforces filesystem
 
 Tool calls classified as WRITE are sent to the configured evaluator backend.
 `EVALUATOR_BACKEND=llm` uses the OpenAI-compatible evaluator;
-`EVALUATOR_BACKEND=jev` uses TypeSafe Jev typed questions.
+`EVALUATOR_BACKEND=jev` uses TypeSafe Jev typed questions. Setting a dedicated
+`DECISIONS_API_KEY` selects native Decisions as primary L1 regardless of that
+legacy selector. The Jev client remains available for parent/child alignment
+when `EVALUATOR_BACKEND=jev`; Decisions does not replace it there.
 
 ### Evaluation Context
 
@@ -156,12 +159,38 @@ approval or an uncertain critical denial. Since Jev does not generate prose,
 Intaris creates factual audit text from the selected labels, probabilities,
 and exact returned model version.
 
+The native Decisions backend asks a predicate for alignment and choices for
+risk and disposition, using the same full context and untrusted-data boundaries.
+It requires exactly those named answers and complete finite choice
+distributions. Its provisional confidence floor is 0.8: alignment confidence
+is `max(p, 1-p)`; choice confidence is the lesser of the reported confidence
+and the probability of the selected label. Refusal or any score below the floor
+maps to high-risk escalation for review, not to approval. Malformed responses
+fail the evaluation. This threshold needs calibration on representative calls;
+the model supplies labels and scores, not generated rationale. Backend/model,
+scores and allowlisted nonnegative token counts (input/output tokens, cached/
+cache-write input details, reasoning output details) are recorded as
+non-sensitive metadata; unknown provider usage fields are omitted. Choice
+distributions must sum to 1 within 1e-6, an Intaris validation policy, not a
+guarantee of the Decisions API contract. Explicit escalations
+survive the decision matrix; existing `maximum_outcome` caps still apply.
+
 ### Timeout
 
 Default: 4000ms (`LLM_TIMEOUT_MS` or `JEV_TIMEOUT_MS`). Must be under
-the 5-second circuit breaker in client integrations. If the configured
-evaluator times out, the evaluation fails and the tool call is blocked
-(fail-closed). There is no silent cross-provider fallback.
+the 5-second circuit breaker in client integrations. With Decisions,
+`DECISIONS_TIMEOUT_MS` defaults to 2000ms; `LLM_TIMEOUT_MS` is a cooperative
+budget for primary plus optional legacy fallback. Only network failures
+(including server disconnects), timeouts, HTTP 429 and 5xx
+trigger fallback when a generative LLM key is configured and time remains.
+Provider 4xx, malformed answers, refusals and low confidence never trigger
+fallback. Without an LLM fallback, transient failures return HTTP 503;
+protocol errors return 500. These failures never authorize the tool call.
+The primary is allocated at most half the budget with fallback configured;
+per-phase HTTP timeouts are inactivity limits, not hard wall-clock bounds.
+The shared deadline is checked after the primary response and when allocating
+remaining time for fallback, not by interrupting an in-flight request; half
+the time is not guaranteed to remain for fallback. Jev does not use this fallback.
 
 ## Decision Matrix
 

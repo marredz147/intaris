@@ -9,6 +9,7 @@ import pytest
 from intaris.config import (
     Config,
     DBConfig,
+    DecisionsConfig,
     JevConfig,
     LLMConfig,
     SearchConfig,
@@ -32,6 +33,19 @@ class TestConfigDefaults:
         assert config.base_url == "https://api.typesafe.ai"
         assert config.timeout_ms == 4000
         assert config.minimum_confidence == 0.6
+
+    def test_decisions_defaults_do_not_inherit_shared_settings(self, monkeypatch):
+        monkeypatch.delenv("DECISIONS_API_KEY", raising=False)
+        monkeypatch.delenv("DECISIONS_MODEL", raising=False)
+        monkeypatch.delenv("DECISIONS_BASE_URL", raising=False)
+        monkeypatch.setenv("LLM_API_KEY", "shared")
+        monkeypatch.setenv("LLM_BASE_URL", "https://elsewhere.test/v1")
+        config = DecisionsConfig()
+        assert not config.enabled
+        assert config.model == ""
+        assert config.base_url == "https://api.openai.com/v1"
+        assert config.timeout_ms == 2000
+        assert config.minimum_confidence == 0.8
 
     def test_db_defaults(self):
         config = DBConfig()
@@ -68,6 +82,49 @@ class TestConfigValidation:
                     fresh.validate()
         finally:
             os.environ.update(env_backup)
+
+    def test_decisions_only_credentials(self, monkeypatch):
+        monkeypatch.setenv("DECISIONS_API_KEY", "dedicated")
+        monkeypatch.setenv("DECISIONS_MODEL", "any-model")
+        config = Config(llm=LLMConfig(api_key=""))
+        assert config.decisions.enabled
+        assert config.decisions.model == "any-model"
+        config.analysis.enabled = False
+        config.validate()
+
+    def test_decisions_requires_model(self):
+        config = Config(
+            llm=LLMConfig(api_key=""),
+            decisions=DecisionsConfig(api_key="dedicated", model=""),
+        )
+        with pytest.raises(ValueError, match="DECISIONS_MODEL"):
+            config.validate()
+
+    @pytest.mark.parametrize(
+        "settings",
+        [
+            {"timeout_ms": 1},
+            {"minimum_confidence": float("nan")},
+            {"minimum_confidence": 1.1},
+            {"base_url": "not-a-url"},
+        ],
+    )
+    def test_active_decisions_settings(self, settings):
+        config = Config(
+            llm=LLMConfig(api_key="key"),
+            decisions=DecisionsConfig(
+                api_key="dedicated", model="arbitrary", **settings
+            ),
+        )
+        with pytest.raises(ValueError, match="DECISIONS_"):
+            config.validate()
+
+    def test_inactive_decisions_settings_ignored(self):
+        config = Config(
+            llm=LLMConfig(api_key="key"),
+            decisions=DecisionsConfig(model="", timeout_ms=1),
+        )
+        config.validate()
 
     def test_timeout_too_low(self):
         config = Config(llm=LLMConfig())
