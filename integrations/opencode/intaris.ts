@@ -28,7 +28,7 @@
  *   INTARIS_INTENTION            - Session intention override (default: auto-generated)
  *   INTARIS_ALLOW_PATHS          - Comma-separated parent directories to allow reads from (e.g., ~/src)
  *   INTARIS_CHECKPOINT_INTERVAL  - Evaluate calls between checkpoints (default: 25, 0=disabled)
- *   INTARIS_ESCALATION_TIMEOUT   - Max seconds to wait for escalation approval (default: 0=no timeout)
+ *   INTARIS_ESCALATION_TIMEOUT   - Max seconds to wait for human approval (default: 0=no timeout)
  *   INTARIS_SESSION_RECORDING    - Enable session recording (default: false)
  *   INTARIS_RECORDING_FLUSH_SIZE - Events per recording batch (default: 50)
  *   INTARIS_RECORDING_FLUSH_MS   - Recording flush interval in ms (default: 10000)
@@ -270,18 +270,20 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
     tool: string,
     callId: string,
     reason: string,
+    denied: boolean = false,
+    stillActive?: () => boolean,
   ): Promise<void> {
     await client.app
       .log({
         body: {
           service: "intaris",
           level: "warn",
-          message: `ESCALATED ${tool} (${callId}): ${reason}. Waiting for approval in Intaris UI...`,
+          message: `${denied ? "DENIED" : "ESCALATED"} ${tool} (${callId}): ${reason}. Waiting for approval in Intaris UI...`,
         },
       })
       .catch(() => {})
     showToast(
-      `Tool "${tool}" escalated — approve or deny in Intaris UI.\n${reason}`,
+      `Tool "${tool}" ${denied ? "denied" : "escalated"} — approve or deny in Intaris UI (audit ID: ${callId}).\n${reason}`,
       "warning",
       10000,
     )
@@ -292,9 +294,12 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
     let lastReminderAt = startTime
 
     while (true) {
+      if (denied && !stillActive?.()) {
+        throw new Error(`[intaris] Denial wait cancelled: session removed (${callId})`)
+      }
       if (escalationTimeoutMs > 0 && Date.now() - startTime > escalationTimeoutMs) {
         throw new Error(
-          `[intaris] ESCALATION TIMEOUT (${callId}): ${reason}\n` +
+          `[intaris] ${denied ? "DENIAL" : "ESCALATION"} TIMEOUT (${callId}): ${reason}\n` +
             `No response within ${rawEscalationTimeout}s. Approve or deny in the Intaris UI.`,
         )
       }
@@ -307,12 +312,12 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
             body: {
               service: "intaris",
               level: "warn",
-              message: `Still waiting for escalation approval for ${tool} (${callId})... ${waitSec}s elapsed`,
+              message: `Still waiting for approval for ${tool} (${callId})... ${waitSec}s elapsed`,
             },
           })
           .catch(() => {})
         showToast(
-          `Still waiting for approval of "${tool}"... (${waitSec}s)`,
+          `Still waiting for approval of "${tool}" (${callId})... (${waitSec}s)`,
           "info",
         )
         lastReminderAt = now
@@ -321,31 +326,50 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
       const delay = pollBackoffMs[Math.min(pollAttempt, pollBackoffMs.length - 1)]
       await new Promise((resolve) => setTimeout(resolve, delay))
       pollAttempt++
+      if (denied && !stillActive?.()) {
+        throw new Error(`[intaris] Denial wait cancelled: session removed (${callId})`)
+      }
+      if (denied && escalationTimeoutMs > 0 && Date.now() - startTime > escalationTimeoutMs) {
+        throw new Error(`[intaris] DENIAL TIMEOUT (${callId}): ${reason}`)
+      }
 
-      const { data: auditRecord } = await callApi(
+      const { data: auditRecord, error: pollError } = await callApi(
         "GET",
         `/api/v1/audit/${encodeURIComponent(callId)}`,
         null,
         5000,
       )
 
+      if (denied && !stillActive?.()) {
+        throw new Error(`[intaris] Denial wait cancelled: session removed (${callId})`)
+      }
+      if (denied && escalationTimeoutMs > 0 && Date.now() - startTime > escalationTimeoutMs) {
+        throw new Error(`[intaris] DENIAL TIMEOUT (${callId}): ${reason}`)
+      }
+      if (denied && (pollError || !auditRecord || auditRecord.call_id !== callId ||
+          (auditRecord.decision !== "deny" && auditRecord.decision !== "escalate"))) {
+        throw new Error(`[intaris] Denial approval check failed (${callId}): ${pollError || "invalid audit record"}`)
+      }
       if (!auditRecord) continue
+      if (denied && auditRecord.user_decision === "approve" && auditRecord.resolved_by !== "user") {
+        throw new Error(`[intaris] Denial approval is not authorized (${callId})`)
+      }
 
-      if (auditRecord.user_decision === "approve") {
+      if (auditRecord.user_decision === "approve" && (!denied || auditRecord.resolved_by === "user")) {
         await client.app
           .log({
             body: {
               service: "intaris",
               level: "info",
-              message: `Escalation approved: ${tool} (${callId})`,
+              message: `${denied ? "Denial override" : "Escalation"} approved: ${tool} (${callId})`,
             },
           })
           .catch(() => {})
-        showToast(`Tool "${tool}" approved — proceeding`, "success")
+        showToast(`Tool "${tool}" approved${denied ? " — re-evaluating" : " — proceeding"}`, "success")
         return
       }
 
-      if (auditRecord.user_decision === "deny") {
+      if (auditRecord.user_decision === "deny" && (!denied || auditRecord.resolved_by === "user")) {
         const denyNote = auditRecord.user_note
           ? ` — ${auditRecord.user_note}`
           : ""
@@ -1214,6 +1238,10 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
       if (typeof args.error === "string" && args.error.includes("unavailable tool")) {
         return
       }
+      const originalArgs = JSON.stringify(args)
+      const originalTool = tool
+      const unchangedInvocation = () =>
+        input.tool === originalTool && JSON.stringify(_output.args || {}) === originalArgs
 
       const state = getOrCreateState(sessionID)
 
@@ -1261,7 +1289,7 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
         {
           session_id: intarisSessionId,
           tool,
-          args: _output.args || {},
+          args: JSON.parse(originalArgs),
           ...(intentionPending && { intention_pending: true }),
         },
         60000,
@@ -1468,6 +1496,28 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
         }
 
         const reason = result.reasoning || "Tool call denied by safety evaluation"
+        if (!result.session_status && (result.path === "critical" || result.path === "llm") &&
+            typeof result.call_id === "string" && result.call_id) {
+          const stillActive = () => sessions.get(sessionID) === state
+          await waitForEscalationResolution(tool, result.call_id, reason, true, stillActive)
+          if (!stillActive() || !unchangedInvocation()) {
+            throw new Error(`[intaris] Denied invocation changed while waiting (${result.call_id})`)
+          }
+          const { data: reResult } = await callApi(
+            "POST",
+            "/api/v1/evaluate",
+            { session_id: intarisSessionId, tool: originalTool, args: JSON.parse(originalArgs) },
+            60000,
+          )
+          if (!stillActive() || !unchangedInvocation() || !reResult || reResult.decision !== "approve" ||
+              typeof reResult.call_id !== "string" || !reResult.call_id ||
+              typeof reResult.path !== "string" ||
+              (reResult.session_status != null && reResult.session_status !== "active")) {
+            throw new Error(`[intaris] Denial override re-evaluation did not approve unchanged tool call (${result.call_id})`)
+          }
+          if (input.callID) state.toolCallAuditIds.set(input.callID, reResult.call_id)
+          return
+        }
         showToast(`Tool "${tool}" denied: ${reason}`, "error")
         throw new Error(
           `[intaris] DENIED: ${reason}`,

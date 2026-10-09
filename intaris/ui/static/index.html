@@ -1148,6 +1148,9 @@
                 <template x-if="expandedRecord?.reasoning">
                   <div class="mb-3">
                     <div class="text-xs text-muted mb-1">Reasoning</div>
+                    <div x-show="expandedRecord.decision === 'deny' && ['llm', 'critical'].includes(expandedRecord.evaluation_path)"
+                         class="text-xs text-muted mb-1"
+                         x-text="'Original decision: ' + (expandedRecord.evaluation_path === 'llm' ? 'Denied by model' : 'Denied by policy')"></div>
                     <div class="text-sm bg-brand-elevated rounded p-3" x-text="expandedRecord.reasoning"></div>
                   </div>
                 </template>
@@ -1409,7 +1412,7 @@
               <div class="card cursor-pointer" @click="toggleDenialExpand(item)">
                 <div class="flex items-center justify-between">
                   <div class="flex items-center gap-3">
-                    <span class="badge badge-deny">deny</span>
+                    <span class="badge badge-deny" x-text="item.decision === 'deny' && item.evaluation_path === 'llm' ? 'Denied by model' : item.decision === 'deny' && item.evaluation_path === 'critical' ? 'Denied by policy' : 'deny'"></span>
                     <span class="font-mono text-sm" x-text="item.tool"></span>
                     <span :class="riskBadgeClass(item.risk)" x-text="item.risk" x-show="item.risk"></span>
                     <span class="text-xs text-muted px-1.5 py-0.5 rounded bg-surface-tertiary" x-text="item.evaluation_path"></span>
