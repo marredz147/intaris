@@ -350,7 +350,12 @@ class LLMClient:
             "messages": messages,
         }
 
-        if "temperature" not in self._param_fixes:
+        effective_effort = reasoning_effort or self._reasoning_effort
+        if "temperature" not in self._param_fixes and effective_effort in (
+            None,
+            "",
+            "none",
+        ):
             params["temperature"] = temperature
 
         if "max_tokens" in self._param_fixes:
@@ -361,7 +366,6 @@ class LLMClient:
         if response_format:
             params["response_format"] = response_format
 
-        effective_effort = reasoning_effort or self._reasoning_effort
         if effective_effort and "reasoning_effort" not in self._param_fixes:
             params["reasoning_effort"] = effective_effort
 

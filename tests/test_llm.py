@@ -337,6 +337,47 @@ def _parameter_client(monkeypatch, create, *, reasoning_effort=None):
 
 
 class TestParameterAdaptation:
+    @pytest.mark.parametrize(
+        ("configured", "override", "expected_effort", "has_temperature"),
+        [
+            (None, None, None, True),
+            ("none", None, "none", True),
+            ("low", None, "low", False),
+            (None, "high", "high", False),
+            ("low", "none", "none", True),
+            ("low", "", "low", False),
+        ],
+    )
+    def test_temperature_with_effective_reasoning_effort(
+        self, monkeypatch, configured, override, expected_effort, has_temperature
+    ):
+        calls = []
+
+        def create(**params):
+            calls.append(params)
+            return _make_response("ok")
+
+        client = _parameter_client(monkeypatch, create, reasoning_effort=configured)
+        assert client.generate([], reasoning_effort=override, temperature=0.4) == "ok"
+        assert ("temperature" in calls[0]) is has_temperature
+        if has_temperature:
+            assert calls[0]["temperature"] == 0.4
+        assert calls[0].get("reasoning_effort") == expected_effort
+
+    def test_cached_temperature_omission_with_no_reasoning_effort(self, monkeypatch):
+        calls = []
+
+        def create(**params):
+            calls.append(params.copy())
+            if "temperature" in params:
+                raise _ParameterError("temperature")
+            return _make_response("ok")
+
+        client = _parameter_client(monkeypatch, create)
+        assert client.generate([]) == "ok"
+        assert client.generate([]) == "ok"
+        assert ["temperature" in call for call in calls] == [True, False, False]
+
     def test_rejected_reasoning_effort_omitted_on_retry_and_next_call(
         self, monkeypatch
     ):
