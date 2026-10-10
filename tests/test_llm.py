@@ -7,6 +7,8 @@ and edge cases in _validate_keys().
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
@@ -308,6 +310,235 @@ def _make_response(content: str):
             )
         ]
     )
+
+
+class _ParameterError(Exception):
+    def __init__(
+        self,
+        param: str | None,
+        code: str = "unsupported_parameter",
+        message: str = "provider rejected request",
+    ):
+        super().__init__(message)
+        self.body = {"error": {"param": param, "code": code, "message": message}}
+
+
+def _parameter_client(monkeypatch, create, *, reasoning_effort=None):
+    class _FakeOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=create))
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("intaris.llm.OpenAI", _FakeOpenAI)
+    monkeypatch.setattr("intaris.llm.BadRequestError", _ParameterError)
+    return LLMClient(LLMConfig(api_key="mock", reasoning_effort=reasoning_effort))
+
+
+class TestParameterAdaptation:
+    @pytest.mark.parametrize(
+        ("configured", "override", "expected_effort", "has_temperature"),
+        [
+            (None, None, None, True),
+            ("none", None, "none", True),
+            ("low", None, "low", False),
+            (None, "high", "high", False),
+            ("low", "none", "none", True),
+            ("low", "", "low", False),
+        ],
+    )
+    def test_temperature_with_effective_reasoning_effort(
+        self, monkeypatch, configured, override, expected_effort, has_temperature
+    ):
+        calls = []
+
+        def create(**params):
+            calls.append(params)
+            return _make_response("ok")
+
+        client = _parameter_client(monkeypatch, create, reasoning_effort=configured)
+        assert client.generate([], reasoning_effort=override, temperature=0.4) == "ok"
+        assert ("temperature" in calls[0]) is has_temperature
+        if has_temperature:
+            assert calls[0]["temperature"] == 0.4
+        assert calls[0].get("reasoning_effort") == expected_effort
+
+    def test_cached_temperature_omission_with_no_reasoning_effort(self, monkeypatch):
+        calls = []
+
+        def create(**params):
+            calls.append(params.copy())
+            if "temperature" in params:
+                raise _ParameterError("temperature")
+            return _make_response("ok")
+
+        client = _parameter_client(monkeypatch, create)
+        assert client.generate([]) == "ok"
+        assert client.generate([]) == "ok"
+        assert ["temperature" in call for call in calls] == [True, False, False]
+
+    def test_rejected_reasoning_effort_omitted_on_retry_and_next_call(
+        self, monkeypatch
+    ):
+        calls = []
+
+        def create(**params):
+            calls.append(params.copy())
+            if "reasoning_effort" in params:
+                raise _ParameterError("reasoning_effort")
+            return _make_response("ok")
+
+        client = _parameter_client(monkeypatch, create, reasoning_effort="low")
+        assert client.generate([], reasoning_effort="high") == "ok"
+        assert client.generate([], reasoning_effort="high") == "ok"
+        assert ["reasoning_effort" in call for call in calls] == [True, False, False]
+
+    def test_rejected_max_tokens_replaced_on_retry_and_next_call(self, monkeypatch):
+        calls = []
+
+        def create(**params):
+            calls.append(params.copy())
+            if "max_tokens" in params:
+                raise _ParameterError("max_tokens")
+            return _make_response("ok")
+
+        client = _parameter_client(monkeypatch, create)
+        assert client.generate([], max_tokens=20) == "ok"
+        assert client.generate([], max_tokens=30) == "ok"
+        assert [call.get("max_tokens") for call in calls] == [20, None, None]
+        assert [call.get("max_completion_tokens") for call in calls] == [None, 20, 30]
+
+    def test_concurrent_stale_params_apply_cached_fix(self, monkeypatch):
+        first_entered = Event()
+        release_first = Event()
+        calls = []
+
+        def create(**params):
+            calls.append(params.copy())
+            if "max_tokens" in params:
+                if not first_entered.is_set():
+                    first_entered.set()
+                    assert release_first.wait(5)
+                raise _ParameterError("max_tokens")
+            return _make_response("ok")
+
+        client = _parameter_client(monkeypatch, create)
+        schema = {"name": "x", "schema": {"type": "object"}}
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(
+                client.generate, [], max_tokens=20, json_schema=schema
+            )
+            try:
+                assert first_entered.wait(5)
+                assert client.generate([], max_tokens=30, json_schema=schema) == "ok"
+            finally:
+                release_first.set()
+            assert first.result(timeout=5) == "ok"
+        assert [call.get("max_tokens") for call in calls] == [20, 30, None, None]
+        assert sorted(
+            call["max_completion_tokens"]
+            for call in calls
+            if "max_completion_tokens" in call
+        ) == [20, 30]
+        assert all(call["response_format"]["type"] == "json_schema" for call in calls)
+        assert client._supports_structured is True
+
+    def test_unrelated_400_does_not_disable_structured_output(self, monkeypatch):
+        calls = []
+
+        def create(**params):
+            calls.append(params)
+            raise _ParameterError("messages", code="invalid_request_error")
+
+        client = _parameter_client(monkeypatch, create)
+        for _ in range(2):
+            with pytest.raises(_ParameterError):
+                client.generate(
+                    [], json_schema={"name": "x", "schema": {"type": "object"}}
+                )
+        assert client._supports_structured is None
+        assert [call["response_format"]["type"] for call in calls] == [
+            "json_schema",
+            "json_schema",
+        ]
+
+    @pytest.mark.parametrize(
+        ("param", "code", "message"),
+        [
+            (
+                "messages",
+                "unsupported_value",
+                "Unsupported messages value in json_schema request",
+            ),
+            (
+                "response_format.json_schema.schema",
+                "invalid_json_schema",
+                "Unsupported schema keyword in json_schema",
+            ),
+        ],
+    )
+    def test_unrelated_or_invalid_schema_error_does_not_fall_back(
+        self, monkeypatch, param, code, message
+    ):
+        calls = []
+
+        def create(**params):
+            calls.append(params)
+            raise _ParameterError(param, code=code, message=message)
+
+        client = _parameter_client(monkeypatch, create)
+        with pytest.raises(_ParameterError):
+            client.generate([], json_schema={"name": "x", "schema": {"type": "object"}})
+        assert client._supports_structured is None
+        assert len(calls) == 1
+        assert calls[0]["response_format"]["type"] == "json_schema"
+
+    def test_explicit_unsupported_format_message_without_metadata_falls_back(
+        self, monkeypatch
+    ):
+        calls = []
+
+        def create(**params):
+            calls.append(params)
+            if params["response_format"]["type"] == "json_schema":
+                raise _ParameterError(
+                    None,
+                    code="invalid_request_error",
+                    message="json_schema not supported",
+                )
+            return _make_response('{"ok": true}')
+
+        client = _parameter_client(monkeypatch, create)
+        assert (
+            client.generate([], json_schema={"name": "x", "schema": {"type": "object"}})
+            == '{"ok": true}'
+        )
+        assert [call["response_format"]["type"] for call in calls] == [
+            "json_schema",
+            "json_object",
+        ]
+
+    @pytest.mark.parametrize("code", ["unsupported_parameter", "not_supported"])
+    def test_explicit_unsupported_schema_falls_back_and_caches(self, monkeypatch, code):
+        calls = []
+
+        def create(**params):
+            calls.append(params.copy())
+            if params["response_format"]["type"] == "json_schema":
+                raise _ParameterError("response_format", code=code)
+            return _make_response('{"ok": true}')
+
+        client = _parameter_client(monkeypatch, create)
+        schema = {"name": "x", "schema": {"type": "object"}}
+        assert client.generate([], json_schema=schema) == '{"ok": true}'
+        assert client.generate([], json_schema=schema) == '{"ok": true}'
+        assert client._supports_structured is False
+        assert [call["response_format"]["type"] for call in calls] == [
+            "json_schema",
+            "json_object",
+            "json_object",
+        ]
 
 
 class TestTransientLLMFailures:
