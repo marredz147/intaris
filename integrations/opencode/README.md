@@ -53,6 +53,7 @@ export INTARIS_CHECKPOINT_INTERVAL=25      # optional, defaults to 25 (0=disable
 | `INTARIS_INTENTION` | (auto) | Session intention override. Default: `"OpenCode coding session in <cwd>"` |
 | `INTARIS_ALLOW_PATHS` | (empty) | Comma-separated parent directories to allow reads from without LLM evaluation. Supports `~` expansion. E.g., `~/src` allows reads from all projects under `~/src/`. |
 | `INTARIS_CHECKPOINT_INTERVAL` | `25` | Number of evaluate calls between periodic checkpoints. Set to `0` to disable checkpoints. Each checkpoint consumes one rate limit slot. |
+| `INTARIS_ESCALATION_TIMEOUT` | `0` | Seconds to wait for human approval of an escalation or overridable denial (`0` waits indefinitely). |
 
 ### 2. Install the Plugin
 
@@ -69,6 +70,7 @@ cp intaris.ts .opencode/plugins/
 ```
 
 Local plugins are loaded automatically -- no config entry needed.
+After updating an existing plugin installation, copy the new `intaris.ts` into that installation and restart OpenCode to load it.
 
 ### 3. Verify
 
@@ -78,6 +80,16 @@ Run OpenCode with `--print-logs` and look for:
 [intaris] Plugin initialized
 [intaris] Session created: oc-<session-id>
 ```
+
+### Testing the plugin hook
+
+The executable hook regression requires built-in, unflagged TypeScript stripping: **Node.js 22.18+ (22.x), 23.6+ (23.x), or 24+**. Run from the repository root:
+
+```bash
+node --test integrations/opencode/denial-approval.test.mjs
+```
+
+The focused Python test invokes this command when a compatible Node is available; otherwise it explicitly skips the hook regression. No JavaScript dependencies or build step are needed.
 
 ## Setup -- MCP Proxy (Approach B)
 
@@ -137,7 +149,7 @@ See [OpenCode Permissions](https://opencode.ai/docs/permissions/) for details.
    - Ensures an Intaris session exists (lazy creation for resumed sessions)
    - Calls `POST /api/v1/evaluate` with the tool name and arguments
    - **approve**: tool executes normally
-   - **deny**: throws an error with reasoning (blocks execution)
+   - **deny**: for tool-level critical/LLM denials with an audit ID, waits for an explicit human decision in the Intaris UI. The original denial remains a denial in the audit log; no decision is posted by the plugin. A human denial ends the wait; a judge denial may still be overridden by a human. Once a human approves, the plugin re-evaluates the original unchanged tool and arguments, and executes only if that fresh evaluation approves. Missing authorization, changed arguments, re-evaluation failure or any non-approval blocks execution even with `INTARIS_FAIL_OPEN=true`. Session status denials do not enter this ordinary denial wait (suspended sessions keep their separate reactivation flow).
    - **escalate**: polls only when `/evaluate` still returns unresolved escalation
    - Tracks per-decision statistics (approve/deny/escalate counts)
    - Sends periodic checkpoints via `POST /api/v1/checkpoint` (every N calls)
@@ -146,6 +158,8 @@ See [OpenCode Permissions](https://opencode.ai/docs/permissions/) for details.
    - `POST /api/v1/session/{id}/agent-summary` with session statistics
 
 During normal inactivity, the plugin uses `session.idle` to transition parent sessions to `idle` rather than `completed`. Child sessions still complete when they become idle.
+
+While waiting on a tool-level denial, OpenCode keeps that tool call pending; the toast includes its audit ID for locating it in the Intaris UI. A judge-denied escalation may retain `decision=escalate` in the audit record; only a later human approval releases the wait. The wait uses the escalation polling backoff and `INTARIS_ESCALATION_TIMEOUT`. If it times out, the session is deleted, or the audit check fails, the original tool does not execute. Restarting OpenCode with an updated plugin is required to use this behavior.
 
 ### MCP Proxy Flow
 

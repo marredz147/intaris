@@ -316,7 +316,7 @@ function approvalsTab() {
         await IntarisAPI.resolveDecision(callId, decision, note);
         Alpine.store('notify').success(
           decision === 'approve'
-            ? 'Denial overridden — retry will be approved'
+            ? 'Denial overridden — matching call approved'
             : 'Denial confirmed'
         );
         this.denials = this.denials.filter(d => d.call_id !== callId);

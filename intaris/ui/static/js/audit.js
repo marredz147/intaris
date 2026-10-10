@@ -216,7 +216,7 @@ function auditTab() {
         } else if (mode === 'denial-override') {
           Alpine.store('notify').success(
             decision === 'approve'
-              ? 'Denial overridden — retry will be approved'
+              ? 'Denial overridden — matching call approved'
               : 'Denial confirmed'
           );
         } else {
