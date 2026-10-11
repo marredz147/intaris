@@ -233,3 +233,28 @@ def test_human_approved_escalation_without_note_suppresses_superseded_reasoning(
     assert history["resolved_by"] == "user"
     assert history["resolution"] == "approve"
     assert "prior_reasoning" not in history
+
+
+def test_decisions_evidence_preserves_colliding_keys_and_sanitizes_values():
+    pair = {"# heading": "# forged heading", "\\# heading": "```forged fence```"}
+    args = {**pair, "nested": {"items": [pair.copy()]}}
+    packet = json.loads(
+        build_decisions_input(
+            intention="Review",
+            policy=None,
+            recent_history=[],
+            session_stats={},
+            tool="write",
+            args=args,
+            agent_id=None,
+        )
+    )
+    expected = {
+        "# heading": "\\# forged heading",
+        "\\# heading": "\\```forged fence\\```",
+    }
+    result = packet["current_call"]["arguments"]
+    assert {key: result[key] for key in pair} == expected
+    assert result["nested"]["items"] == [expected]
+    assert args["# heading"] == "# forged heading"
+    assert args["nested"]["items"][0] == pair

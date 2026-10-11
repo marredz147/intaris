@@ -481,9 +481,7 @@ def _decisions_data(value: Any) -> Any:
     if isinstance(value, str):
         return sanitize_for_prompt(value)
     if isinstance(value, dict):
-        return {
-            sanitize_for_prompt(str(k)): _decisions_data(v) for k, v in value.items()
-        }
+        return {k: _decisions_data(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [_decisions_data(item) for item in value]
     if value is None or isinstance(value, (bool, int, float)):
