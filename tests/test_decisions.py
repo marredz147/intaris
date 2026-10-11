@@ -101,6 +101,11 @@ def test_request_contract(root, expected):
     assert result.metadata["model"] == "reported"
     assert result.metadata["requested_model"] == "any/custom-model"
     assert result.metadata["usage"] == {"input_tokens": 10, "output_tokens": 3}
+    assert result.metadata["prompt_version"] == "decisions-v2"
+    assert result.metadata["risk_choice"] == "low"
+    assert result.metadata["risk_provider_confidence"] == 0.99
+    assert result.metadata["decision_choice"] == "approve"
+    assert result.metadata["decision_provider_confidence"] == 0.97
     instance.close()
     instance.close()
     with pytest.raises(DecisionsError, match="closed"):
@@ -140,6 +145,8 @@ def test_refusal_validates_other_answers():
     result = instance.evaluate(system_prompt="rules", user_prompt="context")
     assert (result.aligned, result.risk, result.decision) == (False, "high", "escalate")
     assert result.metadata["status"] == "refusal"
+    assert result.metadata["risk_choice"] == "low"
+    assert result.metadata["decision_choice"] == "approve"
     data["answers"][1]["confidence"] = float("nan")
     with pytest.raises(DecisionsProtocolError):
         instance.evaluate(system_prompt="rules", user_prompt="context")
@@ -152,6 +159,37 @@ def test_low_confidence_escalates():
     result = instance.evaluate(system_prompt="rules", user_prompt="context")
     assert (result.aligned, result.risk, result.decision) == (False, "high", "escalate")
     assert result.metadata["status"] == "low_confidence"
+    assert result.metadata["risk_choice"] == "low"
+    assert result.metadata["decision_choice"] == "approve"
+
+
+def test_selected_choices_and_raw_confidences_survive_non_argmax():
+    data = payload()
+    data["answers"][1]["choice"] = "medium"
+    data["answers"][2]["choice"] = "deny"
+    instance = client(
+        lambda request: httpx.Response(200, json=data), minimum_confidence=0.01
+    )
+    result = instance.evaluate(system_prompt="rules", user_prompt="context")
+    assert (result.risk, result.decision) == ("medium", "deny")
+    assert result.metadata["risk_choice"] == "medium"
+    assert result.metadata["decision_choice"] == "deny"
+    assert result.metadata["risk_provider_confidence"] == 0.99
+    assert result.metadata["decision_provider_confidence"] == 0.97
+    assert result.metadata["risk_confidence"] == 0.02
+    assert result.metadata["decision_confidence"] == 0.02
+    assert result.metadata["minimum_confidence"] == 0.02
+
+
+def test_refused_choice_has_no_selected_metadata():
+    data = payload()
+    data["answers"][1] = {"name": "risk", "type": "refusal"}
+    instance = client(lambda request: httpx.Response(200, json=data))
+    result = instance.evaluate(system_prompt="rules", user_prompt="context")
+    assert result.metadata["status"] == "refusal"
+    assert result.metadata["risk_choice"] is None
+    assert result.metadata["risk_provider_confidence"] is None
+    assert result.metadata["decision_choice"] == "approve"
 
 
 @pytest.mark.parametrize(

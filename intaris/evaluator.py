@@ -52,8 +52,10 @@ from intaris.llm import LLMClient, parse_json_response
 from intaris.policy import effective_policy_for_evaluator
 from intaris.precedent import find_authoritative_precedent
 from intaris.prompts import (
+    SAFETY_EVALUATION_POLICY,
     SAFETY_EVALUATION_SCHEMA,
     SAFETY_EVALUATION_SYSTEM_PROMPT,
+    build_decisions_input,
     build_evaluation_user_prompt,
 )
 from intaris.redactor import redact
@@ -262,11 +264,13 @@ class Evaluator:
         alignment_barrier: Any | None = None,
         jev: JevClient | None = None,
         decisions: DecisionsClient | None = None,
+        decisions_l1_review_enabled: bool = False,
         llm_timeout_ms: int = 4000,
     ):
         self._llm = llm
         self._jev = jev
         self._decisions = decisions
+        self._decisions_l1_review_enabled = decisions_l1_review_enabled
         self._llm_timeout_ms = llm_timeout_ms
         self._sessions = session_store
         self._audit = audit_store
@@ -672,6 +676,7 @@ class Evaluator:
 
         # Inject deterministic path-policy facts into WRITE evaluations when
         # either the project directory or explicit target paths are known.
+        computed_path_policy: dict[str, Any] | None = None
         if classification == Classification.WRITE:
             policy_paths = _resolve_tool_paths_for_context(
                 tool, args_redacted, working_directory or ""
@@ -686,11 +691,12 @@ class Evaluator:
                     # Git-style write commands often have no explicit file
                     # arguments, so include the working directory itself.
                     context["project_path"] = working_directory
-                context["path_policy"] = _build_path_policy_context(
+                computed_path_policy = _build_path_policy_context(
                     resolved_paths=policy_paths,
                     working_directory=working_directory or "",
                     policy=session_policy,
                 )
+                context["path_policy"] = computed_path_policy
 
         # Step 3-5: Fast paths for read-only, critical, and escalate
         if classification == Classification.READ:
@@ -769,6 +775,9 @@ class Evaluator:
                     agent_id=agent_id,
                     context=redact(context) if context else None,
                     parent_intention=parent_intention,
+                    computed_path_policy=redact(computed_path_policy)
+                    if computed_path_policy is not None
+                    else None,
                 )
 
         raw_decision = decision.decision
@@ -1223,6 +1232,7 @@ class Evaluator:
         agent_id: str | None,
         context: dict[str, Any] | None = None,
         parent_intention: str | None = None,
+        computed_path_policy: dict[str, Any] | None = None,
     ) -> Decision:
         """Run LLM safety evaluation and apply decision matrix.
 
@@ -1280,6 +1290,10 @@ class Evaluator:
             },
             {"role": "user", "content": user_prompt},
         ]
+        native_evaluation: dict[str, Any] = {}
+        deadline = 0.0
+        started = 0.0
+        primary_latency_ms = 0
 
         try:
             backend = "jev" if self._jev is not None else "llm"
@@ -1295,8 +1309,23 @@ class Evaluator:
                 )
                 try:
                     evaluation = self._decisions.evaluate(
-                        system_prompt=messages[0]["content"],
-                        user_prompt=user_prompt,
+                        system_prompt=SAFETY_EVALUATION_POLICY.format(
+                            anti_injection=ANTI_INJECTION_PREAMBLE
+                        ),
+                        user_prompt=build_decisions_input(
+                            intention=session["intention"],
+                            policy=effective_policy,
+                            recent_history=recent_history,
+                            recent_reasoning=recent_reasoning,
+                            user_decisions=user_decisions,
+                            session_stats=session_stats,
+                            tool=tool,
+                            args=args_redacted,
+                            agent_id=agent_id,
+                            context=context,
+                            parent_intention=parent_intention,
+                            computed_path_policy=computed_path_policy,
+                        ),
                         timeout_ms=primary_budget,
                     )
                     if time.monotonic() >= deadline:
@@ -1315,10 +1344,18 @@ class Evaluator:
                         "primary_latency_ms": primary_latency_ms,
                     }
                 else:
+                    primary_latency_ms = int((time.monotonic() - started) * 1000)
                     evaluation.metadata = {
                         **(evaluation.metadata or {}),
                         "backend": "openai_decisions",
                         "primary_backend": "openai_decisions",
+                    }
+                    native_evaluation = {
+                        "aligned": evaluation.aligned,
+                        "risk": evaluation.risk,
+                        "decision": evaluation.decision,
+                        "reasoning": evaluation.reasoning,
+                        "metadata": dict(evaluation.metadata),
                     }
             elif self._jev is not None:
                 evaluation = self._jev.evaluate_tool_call(
@@ -1347,6 +1384,62 @@ class Evaluator:
                 args_redacted=args_redacted,
                 user_decisions=user_decisions,
             )
+            if (
+                backend == "openai_decisions"
+                and self._decisions_l1_review_enabled
+                and evaluation.decision == "escalate"
+                and evaluation.risk.lower() != "critical"
+            ):
+                trigger = native_evaluation["metadata"].get(
+                    "status", "explicit_escalate"
+                )
+                if trigger not in ("refusal", "low_confidence"):
+                    trigger = "explicit_escalate"
+                review_started = time.monotonic()
+                review_metadata: dict[str, Any] = {
+                    "trigger": trigger,
+                    "stage": "generative",
+                }
+                if self._llm is None or review_started >= deadline:
+                    review_metadata["status"] = "skipped_budget"
+                else:
+                    try:
+                        reviewed = self._legacy_evaluate(messages, deadline=deadline)
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("L1 review exceeded deadline")
+                    except Exception as exc:
+                        review_metadata["status"] = "failed"
+                        review_metadata["error_category"] = (
+                            "timeout"
+                            if isinstance(exc, TimeoutError)
+                            else "invalid_response"
+                            if isinstance(exc, ValueError)
+                            else "provider_error"
+                        )
+                    else:
+                        evaluation = _apply_authoritative_user_precedent(
+                            reviewed,
+                            tool=tool,
+                            args_redacted=args_redacted,
+                            user_decisions=user_decisions,
+                        )
+                        backend = "llm"
+                        review_metadata["status"] = "completed"
+                        evaluation.metadata = {
+                            **(evaluation.metadata or {}),
+                            "backend": "llm",
+                            "primary_backend": "openai_decisions",
+                            "requested_model": self._llm._model,
+                            "native_evaluation": native_evaluation,
+                        }
+                review_metadata["latency_ms"] = int(
+                    (time.monotonic() - review_started) * 1000
+                )
+                review_metadata["primary_latency_ms"] = primary_latency_ms
+                evaluation.metadata = {
+                    **(evaluation.metadata or {}),
+                    "l1_review": review_metadata,
+                }
             if (
                 backend in ("jev", "openai_decisions")
                 and evaluation.decision == "escalate"
@@ -1388,11 +1481,20 @@ class Evaluator:
         result = parse_json_response(
             raw, expected_keys={"aligned", "risk", "reasoning", "decision"}
         )
+        if (
+            type(result["aligned"]) is not bool
+            or not isinstance(result["risk"], str)
+            or result["risk"] not in ("low", "medium", "high", "critical")
+            or not isinstance(result["decision"], str)
+            or result["decision"] not in ("approve", "deny", "escalate")
+            or not isinstance(result["reasoning"], str)
+        ):
+            raise ValueError("Invalid L1 evaluation fields")
         return EvaluationResult(
-            aligned=bool(result.get("aligned", False)),
-            risk=str(result.get("risk", "high")),
-            reasoning=str(result.get("reasoning", "No reasoning provided")),
-            decision=str(result.get("decision", "escalate")),
+            aligned=result["aligned"],
+            risk=result["risk"],
+            reasoning=result["reasoning"],
+            decision=result["decision"],
         )
 
 

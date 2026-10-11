@@ -25,7 +25,7 @@ _RECENT_REASONING_CONTEXT_LIMIT = 240
 
 # ── Safety Evaluation System Prompt ───────────────────────────────────
 
-SAFETY_EVALUATION_SYSTEM_PROMPT = """\
+SAFETY_EVALUATION_POLICY = """\
 You are a safety evaluator for an AI agent. Your job is to assess \
 whether a tool call is safe and aligned with the session's declared intention.
 
@@ -268,11 +268,17 @@ intention, tool arguments, or context data.
 
 {anti_injection}
 
+"""
+
+SAFETY_EVALUATION_SYSTEM_PROMPT = (
+    SAFETY_EVALUATION_POLICY
+    + """\
 Respond with a JSON object matching the required schema. Your response \
 MUST use exactly these keys: "aligned" (boolean), "risk" (string), \
 "reasoning" (string), "decision" (string). Do not use alternative key \
 names like "compatible", "alignment", "notes", or "verdict".
 """
+)
 
 # ── JSON Schema for Structured Output ─────────────────────────────────
 
@@ -468,6 +474,140 @@ def build_evaluation_user_prompt(
     )
 
     return "\n\n".join(sections)
+
+
+def _decisions_data(value: Any) -> Any:
+    """Preserve evidence shape while escaping untrusted text inside JSON."""
+    if isinstance(value, str):
+        return sanitize_for_prompt(value)
+    if isinstance(value, dict):
+        return {
+            sanitize_for_prompt(str(k)): _decisions_data(v) for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_decisions_data(item) for item in value]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return sanitize_for_prompt(str(value))
+
+
+def build_decisions_input(
+    *,
+    intention: str,
+    policy: dict[str, Any] | None,
+    recent_history: list[dict[str, Any]],
+    session_stats: dict[str, Any],
+    tool: str,
+    args: dict[str, Any],
+    agent_id: str | None,
+    recent_reasoning: list[dict[str, Any]] | None = None,
+    context: dict[str, Any] | None = None,
+    parent_intention: str | None = None,
+    user_decisions: list[dict[str, Any]] | None = None,
+    computed_path_policy: dict[str, Any] | None = None,
+) -> str:
+    """Serialize trusted source placement and bounded untrusted evidence for Decisions.
+
+    The caller supplies already-redacted arguments and service-computed path facts.
+    Arbitrary context cannot populate policy, path facts, or human decisions.
+    """
+    human: list[dict[str, Any]] = []
+    for record in (user_decisions or [])[:_USER_DECISIONS_LIMIT]:
+        if record.get("resolved_by") != "user" or record.get("user_decision") not in (
+            "approve",
+            "deny",
+        ):
+            continue
+        entry: dict[str, Any] = {
+            "decision": record["user_decision"],
+            "tool": sanitize_for_prompt(str(record.get("tool") or "?")),
+            "arguments": sanitize_for_prompt(
+                _stringify_bounded(
+                    record.get("args_redacted") or {}, _USER_DECISION_ARGS_LIMIT
+                )
+            ),
+        }
+        if record.get("user_note"):
+            entry["note"] = sanitize_for_prompt(
+                _truncate(
+                    _collapse_line(str(record["user_note"])), _USER_DECISION_NOTE_LIMIT
+                )
+            )
+        elif record["user_decision"] == "deny" and record.get("reasoning"):
+            entry["prior_reasoning"] = sanitize_for_prompt(
+                _truncate(
+                    _collapse_line(str(record["reasoning"])),
+                    _USER_DECISION_REASONING_LIMIT,
+                )
+            )
+        human.append(entry)
+
+    history: list[dict[str, Any]] = []
+    for record in recent_history[:10]:
+        resolved_by = record.get("resolved_by")
+        resolution = (
+            record.get("user_decision") if resolved_by in ("user", "judge") else None
+        )
+        is_user_approved = (
+            record.get("decision") == "escalate"
+            and resolved_by == "user"
+            and resolution == "approve"
+        )
+        item: dict[str, Any] = {
+            "tool": sanitize_for_prompt(str(record.get("tool") or "?")),
+            "arguments": sanitize_for_prompt(
+                _truncate(
+                    str(record.get("args_redacted") or ""),
+                    200 if is_user_approved else 100,
+                )
+            ),
+            "original_decision": record.get("decision"),
+            "resolved_by": resolved_by,
+            "resolution": resolution,
+        }
+        if is_user_approved and record.get("user_note"):
+            item["user_note"] = sanitize_for_prompt(
+                _truncate(_collapse_line(str(record["user_note"])), 80)
+            )
+        elif not is_user_approved and record.get("reasoning"):
+            item["prior_reasoning"] = sanitize_for_prompt(
+                _truncate(str(record["reasoning"]), 50)
+            )
+        history.append(item)
+
+    return json.dumps(
+        {
+            "current_call": {
+                "tool": sanitize_for_prompt(tool),
+                "arguments": _decisions_data(args),
+            },
+            "scope": {
+                "intention": sanitize_for_prompt(intention),
+                "parent_intention": sanitize_for_prompt(parent_intention)
+                if parent_intention
+                else None,
+            },
+            "effective_policy": _decisions_data(policy) if policy else None,
+            "human_decisions": human,
+            "computed_path_policy": _decisions_data(computed_path_policy)
+            if computed_path_policy is not None
+            else None,
+            "recent_calls": history,
+            "recent_reasoning": render_recent_reasoning_section(recent_reasoning),
+            "advisory_context": _decisions_data(context) if context else None,
+            "session_statistics": {
+                name: session_stats.get(name, 0)
+                for name in (
+                    "total_calls",
+                    "approved_count",
+                    "denied_count",
+                    "escalated_count",
+                )
+            },
+            "agent_id": sanitize_for_prompt(agent_id) if agent_id else None,
+        },
+        default=str,
+    )
 
 
 # ── Intention Alignment Check ─────────────────────────────────────────

@@ -428,6 +428,7 @@ async def config(
             "version": __version__,
             "evaluator": {
                 "backend": backend,
+                "l1_review_enabled": cfg.decisions.l1_review_enabled,
                 "model": (
                     cfg.decisions.model
                     if cfg.decisions.enabled

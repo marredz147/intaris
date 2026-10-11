@@ -46,6 +46,7 @@ class TestConfigDefaults:
         assert config.base_url == "https://api.openai.com/v1"
         assert config.timeout_ms == 2000
         assert config.minimum_confidence == 0.8
+        assert config.l1_review_enabled is False
 
     def test_db_defaults(self):
         config = DBConfig()
@@ -99,6 +100,35 @@ class TestConfigValidation:
         )
         with pytest.raises(ValueError, match="DECISIONS_MODEL"):
             config.validate()
+
+    @pytest.mark.parametrize(
+        "native_key,llm_key,llm_model,valid",
+        [
+            ("", "key", "model", False),
+            ("dedicated", "", "model", False),
+            ("dedicated", "key", " ", False),
+            ("dedicated", "key", "model", True),
+        ],
+    )
+    def test_decisions_l1_review_requirements(
+        self, native_key, llm_key, llm_model, valid
+    ):
+        config = Config(
+            llm=LLMConfig(api_key=llm_key, model=llm_model),
+            decisions=DecisionsConfig(
+                api_key=native_key, model="native", l1_review_enabled=True
+            ),
+        )
+        config.analysis.enabled = False
+        if valid:
+            config.validate()
+        else:
+            with pytest.raises(ValueError, match="DECISIONS_L1_REVIEW_ENABLED"):
+                config.validate()
+
+    def test_decisions_l1_review_env(self, monkeypatch):
+        monkeypatch.setenv("DECISIONS_L1_REVIEW_ENABLED", "true")
+        assert DecisionsConfig().l1_review_enabled is True
 
     @pytest.mark.parametrize(
         "settings",

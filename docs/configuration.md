@@ -59,6 +59,7 @@ JWT validation requires:
 | `DECISIONS_MODEL` | (unset) | Required when `DECISIONS_API_KEY` is set. No default or model allowlist; the endpoint must support this model and the Decisions contract. |
 | `DECISIONS_TIMEOUT_MS` | `2000` | Primary Decisions request timeout, minimum 500ms. When legacy LLM fallback is available, primary gets at most half `LLM_TIMEOUT_MS`. |
 | `DECISIONS_MINIMUM_CONFIDENCE` | `0.8` | Provisional threshold; calibrate for the chosen provider. |
+| `DECISIONS_L1_REVIEW_ENABLED` | `false` | Opt in to generative L1 review of valid non-critical native escalations only. Requires dedicated Decisions credentials and a generative API key and nonblank model. |
 | `JEV_API_KEY` | (required for Jev) | Jev provider API key. Falls back to `TYPESAFE_API_KEY` only for the native TypeSafe endpoint; OpenRouter requires an explicit key. |
 | `JEV_BASE_URL` | `https://api.typesafe.ai` | TypeSafe API base URL; set `https://openrouter.ai/api` for OpenRouter's decisions API. |
 | `JEV_MODEL` | `jev-1.13.0` | Pinned Jev model; OpenRouter: `typesafe/jev-1.13-20260917`. |
@@ -100,6 +101,20 @@ wall-clock limits; a response that arrives past the deadline is checked after
 the phase, not interrupted mid-request. Half the budget is therefore not
 guaranteed to remain available for fallback.
 No cross-provider fallback is available without a generative LLM key.
+
+With `DECISIONS_L1_REVIEW_ENABLED=true`, a valid native explicit escalation,
+low-confidence classification, or typed refusal receives one generative L1 review
+only if it remains escalated after final human precedent and time remains. Native
+approvals/denials (including those escalated only by the decision matrix), critical
+risks, fast/classifier/policy/alignment gates and native transport/protocol failures
+do not trigger review. Review reuses the existing evaluation prompt and the same
+absolute `LLM_TIMEOUT_MS` deadline, without an added request budget or retry. The
+native request retains its existing primary allowance of at most the lesser of
+`DECISIONS_TIMEOUT_MS` and half that budget when a generative key is configured;
+this does not guarantee remaining time for review. A failed, invalid or late review
+leaves the native escalation authoritative. Only the final escalation reaches the
+existing judge. Successful review metadata identifies the generative backend and
+nests the original native classification and usage under `native_evaluation`.
 
 Example native L1 setup (supply credentials through your secret mechanism):
 

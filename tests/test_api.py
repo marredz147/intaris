@@ -2484,6 +2484,67 @@ class TestEvaluate:
         assert data["reasoning"] == "Judge approved"
         assert data["risk"] == "low"
 
+    @pytest.mark.parametrize("review_decision", ["approve", "escalate"])
+    def test_reviewed_decisions_dispatch_judge_only_for_final_escalation(
+        self, client_no_auth, review_decision
+    ):
+        from intaris.decision import EvaluationResult
+        from intaris.server import _get_evaluator
+
+        client = client_no_auth
+        headers = {"X-User-Id": "review-user"}
+        _create_session(client, "review-session", headers).raise_for_status()
+        evaluator = _get_evaluator()
+        evaluator._decisions_l1_review_enabled = True
+        evaluator._decisions = Mock(_timeout_ms=2000)
+        evaluator._decisions.evaluate.return_value = EvaluationResult(
+            aligned=False,
+            risk="high",
+            reasoning="Native escalation",
+            decision="escalate",
+            metadata={"status": "classified"},
+        )
+        evaluator._llm = Mock(_model="review-model")
+        evaluator._llm.generate.return_value = json.dumps(
+            {
+                "aligned": review_decision == "approve",
+                "risk": "low",
+                "reasoning": "Reviewed",
+                "decision": review_decision,
+            }
+        )
+        judge = SimpleNamespace(
+            is_enabled=True,
+            review_for_evaluate=AsyncMock(
+                return_value=SimpleNamespace(
+                    decision="escalate",
+                    reasoning="Judge deferred",
+                    risk="low",
+                    record={},
+                    notification_event_type=None,
+                )
+            ),
+        )
+        _set_app_state(client, "judge_reviewer", judge)
+        response = client.post(
+            "/api/v1/evaluate",
+            json={
+                "session_id": "review-session",
+                "tool": "write",
+                "args": {"filePath": "docs/a.md", "content": "text"},
+            },
+            headers=headers,
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["decision"] == review_decision
+        assert (
+            response.json()["evaluation_metadata"]["l1_review"]["status"] == "completed"
+        )
+        if review_decision == "approve":
+            judge.review_for_evaluate.assert_not_awaited()
+        else:
+            judge.review_for_evaluate.assert_awaited_once()
+
     def test_evaluate_waits_for_judge_auto_deny(self, client_no_auth, monkeypatch):
         """Judge-enabled escalations return final denial inline."""
         from intaris.judge import JudgeEffectiveOutcome
@@ -3554,11 +3615,25 @@ class TestConfig:
         assert evaluator["model"] == "provider-model"
         assert evaluator["timeout_ms"] == 2000
         assert evaluator["minimum_confidence"] == 0.8
+        assert evaluator["l1_review_enabled"] is False
         assert evaluator["fallback_available"] is with_fallback
         assert evaluator["budget_ms"] == 4000
         assert evaluator["base_url"] == "custom"
         assert "private.example" not in json.dumps(data)
         assert "dedicated-secret" not in json.dumps(data)
+
+    def test_decisions_l1_review_config(self, env_no_auth, monkeypatch):
+        from intaris.server import create_app
+
+        monkeypatch.setenv("DECISIONS_API_KEY", "dedicated-secret")
+        monkeypatch.setenv("DECISIONS_MODEL", "native-model")
+        monkeypatch.setenv("LLM_API_KEY", "generative-secret")
+        monkeypatch.setenv("DECISIONS_L1_REVIEW_ENABLED", "true")
+        with TestClient(create_app()) as client:
+            response = client.get("/api/v1/config", headers={"X-User-Id": "user-cfg"})
+        assert response.status_code == 200
+        assert response.json()["evaluator"]["l1_review_enabled"] is True
+        assert "generative-secret" not in response.text
 
     def test_legacy_and_jev_config_selection(self, client_no_auth):
         from intaris.server import _get_config
