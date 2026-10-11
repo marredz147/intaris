@@ -135,6 +135,7 @@ def _get_evaluator(alignment_barrier=None):
             alignment_barrier=alignment_barrier,
             jev=_get_jev_client(),
             decisions=_get_decisions_client(),
+            decisions_l1_review_enabled=cfg.decisions.l1_review_enabled,
             llm_timeout_ms=cfg.llm.timeout_ms,
         )
     return _evaluator

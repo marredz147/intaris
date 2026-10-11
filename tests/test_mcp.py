@@ -6,6 +6,8 @@ import asyncio
 import json
 import os
 import tempfile
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from mcp.types import CallToolResult, TextContent
@@ -1219,6 +1221,83 @@ class _MCPProxySessionStore:
 
 
 class TestMCPProxyEvaluatorArgumentCompaction:
+    @pytest.mark.parametrize("review_decision", ["approve", "escalate"])
+    def test_rest_review_dispatches_judge_only_for_final_escalation(
+        self, review_decision
+    ):
+        from intaris.decision import EvaluationResult
+        from intaris.evaluator import Evaluator
+        from intaris.mcp.proxy import MCPProxy
+
+        async def exercise():
+            sessions = MagicMock()
+            sessions.get.return_value = {
+                "user_id": TEST_USER,
+                "session_id": "sess-1",
+                "intention": "Send messages",
+                "status": "active",
+                "policy": None,
+            }
+            audit = MagicMock()
+            audit.get_recent.return_value = []
+            audit.get_user_decisions.return_value = []
+            audit.find_approved_escalation.return_value = None
+            native = MagicMock(_timeout_ms=2000)
+            native.evaluate.return_value = EvaluationResult(
+                aligned=False,
+                risk="high",
+                reasoning="Native escalation",
+                decision="escalate",
+                metadata={"status": "classified"},
+            )
+            llm = MagicMock(_model="review-model")
+            llm.generate.return_value = json.dumps(
+                {
+                    "aligned": review_decision == "approve",
+                    "risk": "low",
+                    "reasoning": "Reviewed",
+                    "decision": review_decision,
+                }
+            )
+            evaluator = Evaluator(
+                llm=llm,
+                decisions=native,
+                decisions_l1_review_enabled=True,
+                session_store=sessions,
+                audit_store=audit,
+            )
+            conn_mgr = _MCPProxyConnectionManager()
+            proxy = MCPProxy(
+                connection_manager=conn_mgr,
+                evaluator=evaluator,
+                session_store=None,
+                audit_store=None,
+                server_store=_MCPProxyServerStore(),
+            )
+            reviewer = SimpleNamespace(is_enabled=True, review_and_resolve=AsyncMock())
+            proxy.set_judge_reviewer(reviewer)
+            result = await proxy.call_tool_rest(
+                user_id=TEST_USER,
+                agent_id="agent",
+                session_id="sess-1",
+                server_name="googleworkspace",
+                tool_name="send_gmail_message",
+                arguments={"to": "recipient@example.test"},
+            )
+            await asyncio.sleep(0)
+            assert native.evaluate.call_count == 1
+            assert llm.generate.call_count == 1
+            if review_decision == "approve":
+                assert result["isError"] is False
+                reviewer.review_and_resolve.assert_not_awaited()
+                assert len(conn_mgr.client.calls) == 1
+            else:
+                assert result["decision"] == "escalate"
+                reviewer.review_and_resolve.assert_awaited_once()
+                assert conn_mgr.client.calls == []
+
+        asyncio.run(exercise())
+
     def test_compacts_large_base64_payloads_for_evaluator(self):
         from intaris.mcp.proxy import _compact_evaluator_args
 

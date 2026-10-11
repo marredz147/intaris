@@ -158,6 +158,9 @@ class DecisionsConfig:
     minimum_confidence: float = field(
         default_factory=lambda: _env_float("DECISIONS_MINIMUM_CONFIDENCE", 0.8)
     )
+    l1_review_enabled: bool = field(
+        default_factory=lambda: _env_bool("DECISIONS_L1_REVIEW_ENABLED", False)
+    )
 
     @property
     def enabled(self) -> bool:
@@ -731,6 +734,15 @@ class Config:
                     "JEV_APPROVAL_RISK_CONFIDENCE requires JEV_DECISION_QUESTION=false."
                 )
 
+        if self.decisions.l1_review_enabled:
+            if not self.decisions.enabled:
+                raise ValueError(
+                    "DECISIONS_L1_REVIEW_ENABLED requires DECISIONS_API_KEY."
+                )
+            if not self.llm.api_key or not self.llm.model.strip():
+                raise ValueError(
+                    "DECISIONS_L1_REVIEW_ENABLED requires a generative LLM API key and nonblank LLM_MODEL."
+                )
         if self.decisions.enabled:
             if not self.decisions.model.strip():
                 raise ValueError(

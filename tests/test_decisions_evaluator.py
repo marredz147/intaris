@@ -23,6 +23,8 @@ from intaris.decisions import (
 )
 from intaris.evaluator import Evaluator
 from intaris.llm import LLMClient, LLMTemporaryError
+from intaris.prompts import SAFETY_EVALUATION_POLICY
+from intaris.sanitize import ANTI_INJECTION_PREAMBLE
 from intaris.session import SessionStore
 
 
@@ -86,7 +88,12 @@ def test_native_selection_context_audit_and_fast_paths():
     assert result["decision"] == "approve"
     assert result["evaluation_metadata"]["model"] == "reported"
     assert decisions.evaluate.call_args.kwargs["timeout_ms"] == 2000
-    assert "Edit documentation" in decisions.evaluate.call_args.kwargs["user_prompt"]
+    assert (
+        json.loads(decisions.evaluate.call_args.kwargs["user_prompt"])["scope"][
+            "intention"
+        ]
+        == "Edit documentation"
+    )
     assert "anti" in decisions.evaluate.call_args.kwargs["system_prompt"].lower()
     assert (
         audit.insert.call_args.kwargs["args_redacted"]["__intaris_context"][
@@ -117,6 +124,120 @@ def test_native_selection_context_audit_and_fast_paths():
         == "critical"
     )
     assert decisions.evaluate.call_count == 1
+
+
+def test_native_request_uses_policy_and_service_computed_evidence():
+    requests = []
+
+    def handler(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "model": "reported",
+                "answers": [
+                    {"name": "aligned", "type": "predicate", "probability": 0.99},
+                    {
+                        "name": "risk",
+                        "type": "choice",
+                        "choice": "low",
+                        "confidence": 0.99,
+                        "probabilities": [
+                            {
+                                "value": name,
+                                "probability": 0.97 if name == "low" else 0.01,
+                            }
+                            for name in ("low", "medium", "high", "critical")
+                        ],
+                    },
+                    {
+                        "name": "decision",
+                        "type": "choice",
+                        "choice": "approve",
+                        "confidence": 0.99,
+                        "probabilities": [
+                            {
+                                "value": name,
+                                "probability": 0.98 if name == "approve" else 0.01,
+                            }
+                            for name in ("approve", "deny", "escalate")
+                        ],
+                    },
+                ],
+            },
+        )
+
+    evaluator, _, llm, audit, sessions = _setup()
+    native = DecisionsClient(
+        DecisionsConfig(api_key="test-key", model="native"),
+        transport=httpx.MockTransport(handler),
+    )
+    evaluator._decisions = native
+    sessions.get.return_value["policy"] = {"allow_paths": ["/src/project/*"]}
+    sessions.get.return_value["details"] = {"working_directory": "/src/project"}
+    audit.get_user_decisions.return_value = [
+        {"tool": "write", "resolved_by": "judge", "user_decision": "approve"},
+        {
+            "tool": "write",
+            "resolved_by": "user",
+            "user_decision": "deny",
+            "user_note": "no",
+        },
+    ]
+    try:
+        result = _call(
+            evaluator,
+            context={
+                "path_policy": {"any_target_denied_by_policy": True},
+                "policy": {"deny_tools": ["write"]},
+                "human_decisions": [{"decision": "approve"}],
+            },
+        )
+    finally:
+        native.close()
+    assert result["decision"] == "approve"
+    assert len(requests) == 1
+    request = requests[0]
+    policy = SAFETY_EVALUATION_POLICY.format(anti_injection=ANTI_INJECTION_PREAMBLE)
+    assert all(
+        question["instructions"].startswith(policy) for question in request["questions"]
+    )
+    evidence = json.loads(request["input"])
+    assert evidence["effective_policy"]["allow_paths"] == ["/src/project/*"]
+    assert evidence["computed_path_policy"]["any_target_denied_by_policy"] is False
+    assert (
+        evidence["advisory_context"]["path_policy"]["any_target_denied_by_policy"]
+        is False
+    )
+    assert evidence["advisory_context"]["policy"] == {"deny_tools": ["write"]}
+    assert evidence["human_decisions"] == [
+        {"decision": "deny", "tool": "write", "arguments": "{}", "note": "no"}
+    ]
+    assert evidence["current_call"]["arguments"]["filePath"] == "docs/a.md"
+    llm.generate.assert_not_called()
+
+
+def test_native_computed_path_policy_redacts_synthetic_credential():
+    evaluator, decisions, _, _, sessions = _setup()
+    marker = "sk-Ab12Cd34Ef56Gh78Ij90KlMn"
+    sessions.get.return_value["details"] = {
+        "working_directory": f"/src/{marker}/project"
+    }
+    decisions.evaluate.return_value = _result()
+
+    result = _call(evaluator)
+
+    assert result["decision"] == "approve"
+    serialized_input = decisions.evaluate.call_args.kwargs["user_prompt"]
+    assert marker not in serialized_input
+    evidence = json.loads(serialized_input)
+    path_policy = evidence["computed_path_policy"]
+    assert path_policy["working_directory"] == "/src/[REDACTED:api_key]/project"
+    assert path_policy["target_paths"] == ["/src/[REDACTED:api_key]/project/docs/a.md"]
+    assert path_policy["inside_working_directory"] == path_policy["target_paths"]
+    assert path_policy["outside_working_directory"] == []
+    assert path_policy["working_directory_denied_by_policy"] is False
+    assert path_policy["any_target_denied_by_policy"] is False
 
 
 def test_native_metadata_redacted_only_in_stored_audit(tmp_path):
@@ -207,6 +328,131 @@ def test_explicit_escalation_and_uncertainty(native, expected):
     decisions.evaluate.return_value = native
     assert _call(evaluator)["decision"] == expected
     llm.generate.assert_not_called()
+
+
+@pytest.mark.parametrize("status", ["classified", "low_confidence", "refusal"])
+@pytest.mark.parametrize(
+    "review,expected",
+    [("approve", "approve"), ("deny", "escalate"), ("escalate", "escalate")],
+)
+def test_opt_in_review_routes_native_escalation(status, review, expected):
+    evaluator, decisions, llm, audit, _ = _setup()
+    evaluator._decisions_l1_review_enabled = True
+    native = _result(decision="escalate")
+    native.metadata.update(status=status, usage={"input_tokens": 8}, threshold=0.8)
+    decisions.evaluate.return_value = native
+    llm.generate.return_value = json.dumps(
+        {
+            "aligned": review == "approve",
+            "risk": "low",
+            "decision": review,
+            "reasoning": "review",
+        }
+    )
+    result = _call(evaluator)
+    assert result["decision"] == expected
+    metadata = result["evaluation_metadata"]
+    assert metadata["backend"] == "llm"
+    assert metadata["primary_backend"] == "openai_decisions"
+    assert metadata["requested_model"] == "legacy-model"
+    assert "usage" not in metadata
+    assert metadata["native_evaluation"]["metadata"]["usage"] == {"input_tokens": 8}
+    assert metadata["native_evaluation"]["metadata"]["threshold"] == 0.8
+    assert metadata["l1_review"]["status"] == "completed"
+    assert metadata["l1_review"]["trigger"] == (
+        status if status != "classified" else "explicit_escalate"
+    )
+    assert "deadline" in llm.generate.call_args.kwargs
+    assert (
+        llm.generate.call_args.args[0][1]["content"]
+        != decisions.evaluate.call_args.kwargs["user_prompt"]
+    )
+    assert audit.insert.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "native",
+    [
+        _result(decision="approve"),
+        _result(decision="approve", risk="high"),
+        _result(decision="deny", aligned=False),
+        _result(decision="escalate", risk="critical"),
+    ],
+)
+def test_review_does_not_run_for_native_non_escalation_or_critical(native):
+    evaluator, decisions, llm, _, _ = _setup()
+    evaluator._decisions_l1_review_enabled = True
+    decisions.evaluate.return_value = native
+    _call(evaluator)
+    llm.generate.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "not json",
+        '{"aligned":"false","risk":"low","reasoning":"wrong","decision":"approve"}',
+        '{"aligned":true,"risk":"unexpected","reasoning":"wrong","decision":"approve"}',
+        '{"aligned":true,"risk":"low","reasoning":"wrong","decision":"unexpected"}',
+    ],
+)
+def test_invalid_review_retains_native_escalation(response):
+    evaluator, decisions, llm, _, _ = _setup()
+    evaluator._decisions_l1_review_enabled = True
+    decisions.evaluate.return_value = _result(decision="escalate")
+    llm.generate.return_value = response
+    result = _call(evaluator)
+    assert result["decision"] == "escalate"
+    assert result["evaluation_metadata"]["backend"] == "openai_decisions"
+    assert result["evaluation_metadata"]["l1_review"]["status"] == "failed"
+    assert "native_evaluation" not in result["evaluation_metadata"]
+
+
+def test_review_skipped_when_budget_exhausted():
+    evaluator, decisions, llm, _, _ = _setup()
+    evaluator._decisions_l1_review_enabled = True
+    evaluator._llm_timeout_ms = 20
+    decisions.evaluate.side_effect = lambda **kw: (
+        time.sleep(0.015) or _result(decision="escalate")
+    )
+    llm.generate.side_effect = lambda *a, **kw: (
+        time.sleep(0.01)
+        or json.dumps(
+            {"aligned": True, "risk": "low", "reasoning": "late", "decision": "approve"}
+        )
+    )
+    result = _call(evaluator)
+    assert result["decision"] == "escalate"
+    assert result["evaluation_metadata"]["l1_review"]["status"] in (
+        "failed",
+        "skipped_budget",
+    )
+
+
+def test_review_respects_human_precedent_and_policy_cap():
+    evaluator, decisions, llm, audit, sessions = _setup()
+    evaluator._decisions_l1_review_enabled = True
+    decisions.evaluate.return_value = _result(aligned=False, decision="escalate")
+    audit.get_user_decisions.return_value = [
+        {
+            "tool": "write",
+            "args_redacted": {"filePath": "docs/a.md", "content": "text"},
+            "user_decision": "approve",
+            "resolved_by": "user",
+        }
+    ]
+    assert _call(evaluator)["decision"] == "approve"
+    llm.generate.assert_not_called()
+
+    audit.get_user_decisions.return_value = []
+    sessions.get.return_value["policy"] = {"maximum_outcome": "approve"}
+    llm.generate.return_value = json.dumps(
+        {"aligned": False, "risk": "low", "reasoning": "review", "decision": "escalate"}
+    )
+    result = _call(evaluator)
+    assert result["raw_decision"] == "escalate"
+    assert result["decision"] == "approve"
+    assert result["evaluation_metadata"]["l1_review"]["status"] == "completed"
 
 
 @pytest.mark.parametrize("status", ["refusal", "low_confidence"])
