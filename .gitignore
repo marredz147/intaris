@@ -16,6 +16,8 @@ env/
 *.db
 /data/
 node_modules/
+**/.tmp/
+integrations/opencode/dist/
 package-lock.json
 runs
 

@@ -7,7 +7,7 @@ from pathlib import Path
 
 def test_opencode_policy_includes_temp_allow_paths() -> None:
     """OpenCode should match other integrations by allowing OS temp dirs."""
-    source = Path("integrations/opencode/intaris.ts").read_text()
+    source = Path("integrations/opencode/src/core.ts").read_text()
 
     assert 'globPatternsFor("/tmp")' in source
     assert 'globPatternsFor("/var/tmp")' in source
@@ -22,7 +22,7 @@ def test_opencode_policy_resolves_macos_private_symlinks() -> None:
     and include the result too, or reads/writes under the resolved path
     (e.g. Claude Code's own tool scratchpad) get flagged as out-of-policy.
     """
-    source = Path("integrations/opencode/intaris.ts").read_text()
+    source = Path("integrations/opencode/src/core.ts").read_text()
 
     assert "realpathSync" in source
     assert "globPatternsFor(tmpDir)" in source
