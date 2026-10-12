@@ -1,0 +1,20 @@
+{
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bun test ./intaris.test.ts",
+    "typecheck": "tsc --noEmit --target ES2022 --module ESNext --moduleResolution Bundler --types node --strict --skipLibCheck ./intaris.ts",
+    "build:v1": "bun build ./intaris.ts --target=bun --external effect --external @opencode/schema/tool --outfile=dist/v1/intaris.js",
+    "build:v2": "bun build ./intaris.ts --target=bun --external effect --external @opencode/schema/tool --outfile=dist/v2/index.js"
+  },
+  "dependencies": {
+    "@opencode/schema": "2.0.26",
+    "effect": "4.0.0-rc.112"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "1.18.29",
+    "@opencode/plugin": "2.0.26",
+    "@types/node": "22.20.5",
+    "typescript": "5.9.3"
+  }
+}
