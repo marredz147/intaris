@@ -256,6 +256,38 @@ test("cancelled escalation cannot admit a late approval or a stale nested call",
   })))
 })
 
+test("failed and non-shutdown interrupted executions idle the session; shutdown does not", async () => {
+  const fx = fixture()
+  const queue = await Effect.runPromise(Queue.unbounded<any>())
+  ;(fx.ctx.event as any).subscribe = () => Stream.fromQueue(queue)
+  await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    yield* entry.effect(fx.ctx as any)
+    for (const id of ["fa", "in", "sh"]) {
+      yield* Queue.offer(queue, { type: "session.created", durable: { aggregateID: id }, data: { title: "T" } })
+    }
+    yield* Effect.promise(async () => {
+      for (let n = 0; n < 100; n++) {
+        if (["fa", "in", "sh"].every(id => fx.requests.some((r: any) => r.path === "/api/v1/intention" && r.body?.session_id === `oc-${id}`))) return
+        await new Promise(resolve => setTimeout(resolve, 2))
+      }
+    })
+    yield* Queue.offer(queue, { type: "session.execution.failed", data: { sessionID: "fa", error: { type: "error", message: "boom" } } })
+    yield* Queue.offer(queue, { type: "session.execution.interrupted", data: { sessionID: "in", reason: "user" } })
+    yield* Queue.offer(queue, { type: "session.execution.interrupted", data: { sessionID: "sh", reason: "shutdown" } })
+    yield* Effect.promise(async () => {
+      for (let n = 0; n < 100; n++) {
+        const idle = (id: string) => fx.requests.some((r: any) => r.path === `/api/v1/session/oc-${id}/status` && r.body?.status === "idle")
+        if (idle("fa") && idle("in")) return
+        await new Promise(resolve => setTimeout(resolve, 2))
+      }
+    })
+    const idle = (id: string) => fx.requests.some((r: any) => r.path === `/api/v1/session/oc-${id}/status` && r.body?.status === "idle")
+    expect(idle("fa")).toBe(true)
+    expect(idle("in")).toBe(true)
+    expect(idle("sh")).toBe(false)
+  })))
+})
+
 test("child idle then resumed with same user ID refreshes metadata and user context", async () => {
   const fx = fixture()
   const queue = await Effect.runPromise(Queue.unbounded<any>())

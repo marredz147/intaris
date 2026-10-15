@@ -1757,7 +1757,15 @@ export default {
             for (const family of families.values()) if (family.sessionID === data.sessionID) await end(family)
             await hooks.event({ event: { type: "session.deleted", properties: { info: { id: data.sessionID } } } })
           }
-          if (event.type === "session.execution.succeeded") await hooks.event({ event: { type: "session.idle", properties: { sessionID: data.sessionID } } })
+          // succeeded, failed and user/superseded/inactivity interruptions are
+          // all terminal for the running execution — mirror them to idle so
+          // failed or cancelled runs do not leave sessions active. shutdown
+          // keeps the session resumable.
+          if (event.type === "session.execution.succeeded"
+            || event.type === "session.execution.failed"
+            || (event.type === "session.execution.interrupted" && data.reason !== "shutdown")) {
+            await hooks.event({ event: { type: "session.idle", properties: { sessionID: data.sessionID } } })
+          }
           if (event.type === "session.text.ended") {
             await hooks.event({ event: { type: "message.updated", properties: { info: { id: data.assistantMessageID, role: "assistant", sessionID: data.sessionID } } } })
             await hooks.event({ event: { type: "message.part.updated", properties: { part: { messageID: data.assistantMessageID, sessionID: data.sessionID, type: "text", text: data.text } } } })
