@@ -140,6 +140,9 @@ const IntarisPlugin = async (
     if (!ready) {
       ready = options.sessionInfo(sessionId)
       metadataReady.set(state, ready)
+      // A rejected lookup must not poison the cache: evict it so a later
+      // call retries instead of re-awaiting the rejected promise forever.
+      ready.catch(() => { if (metadataReady.get(state) === ready) metadataReady.delete(state) })
     }
     const cancel = () => { if (metadataReady.get(state) === ready) metadataReady.delete(state) }
     signal?.addEventListener("abort", cancel, { once: true })
@@ -441,6 +444,7 @@ const IntarisPlugin = async (
         for (const key of sessions.keys()) {
           if (count >= excess) break
           sessions.delete(key)
+          options?.onStateRemoved(key)
           count++
         }
       }
