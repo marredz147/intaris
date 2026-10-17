@@ -70,6 +70,12 @@ cp intaris.ts .opencode/plugins/
 
 Local plugins are loaded automatically -- no config entry needed.
 
+### OpenCode V2 (2.0.26) candidate
+
+The same `intaris.ts` now exposes a single default module with a V1 `server` and V2 `effect` entry. Do not install two copies. From this directory, `bun install`, `bun run typecheck`, `bun run test`, then `bun run build:v1` or `bun run build:v2` use project-local pinned dependencies. The V1 single-file artifact is `dist/v1/intaris.js`; the V2 directory artifact is `dist/v2/index.js`. V2 needs `effect@4.0.0-rc.112` and `@opencode/schema@2.0.26` resolvable from that artifact; these dependencies load only when its V2 entry runs. Local V2 plugin paths must point to the artifact **directory**, not an individual TypeScript file. Confirm the packaged entry resolves in the target host before adopting it.
+
+In V2, native `shell` is evaluated as `bash` (with its original name retained in arguments); MCP/custom names remain unchanged. CodeMode's synthetic outer `execute` evaluates its code and input **once**, then matching nested tool calls share that approval while the outer execution remains active — so per-tool deny policies (`deny_tools`, `deny_commands`) and critical command patterns are **not** re-checked for nested calls; enforce such controls outside CodeMode. When session recording is enabled, the plugin records one overall result, including script errors and interruption. This does not mediate CodeMode's separate HTTP requests or provide a sandbox. Keep OpenCode's own role-specific permissions; do not treat plugin load status as evaluator health. V1's legacy hooks and environment-key route are unchanged.
+
 ### 3. Verify
 
 Run OpenCode with `--print-logs` and look for:
