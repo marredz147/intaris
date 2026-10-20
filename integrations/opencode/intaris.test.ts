@@ -10,19 +10,24 @@ afterEach(() => { globalThis.fetch = originalFetch; process.env = { ...originalE
 function fixture(decision: unknown = { decision: "approve", call_id: "audit", path: "llm", latency_ms: 1 }, evalStatus = 200) {
   const requests: Array<{ path: string; body: any }> = []
   let audit = { user_decision: "approve" }
+  let reasoning: unknown = { ok: true, call_id: "reasoning-1" }
+  let eventStatus = 200
   globalThis.fetch = (async (url: string, init: RequestInit) => {
     const path = new URL(url).pathname
     const body = init.body ? JSON.parse(String(init.body)) : null
     requests.push({ path, body })
     const response = path === "/api/v1/intention" ? { session_id: "oc-root" }
       : path === "/api/v1/evaluate" ? decision
+      : path === "/api/v1/reasoning" ? reasoning
       : path.startsWith("/api/v1/audit/") ? audit : {}
-    return Response.json(response, { status: path === "/api/v1/evaluate" ? evalStatus : 200 })
+    return Response.json(response, { status: path === "/api/v1/evaluate" ? evalStatus : path.endsWith("/events") ? eventStatus : 200 })
   }) as typeof fetch
   const hooks: Record<string, (event: any) => any> = {}
   let registered = [{ id: "read" }, { id: "shell" }]
   let sessionPath = "/repo"
   let childAgent = "explorer"
+  let messages: any[] = [{ id: "user-1", type: "user", text: "Run the requested work" }]
+  const sessionHooks: Record<string, (event: any) => any> = {}
   const ctx = {
     location: { directory: "/repo" },
     tool: {
@@ -37,14 +42,18 @@ function fixture(decision: unknown = { decision: "approve", call_id: "audit", pa
         id: sessionID, location: { directory: sessionPath },
         title: "Session", ...(sessionID === "child" && { parentID: "root", agent: childAgent }),
       }),
-      context: () => Effect.succeed([{ id: "user-1", type: "user", text: "Run the requested work" }]),
+      context: () => Effect.succeed(messages),
+      hook: (name: string, callback: (event: any) => any) => Effect.sync(() => {
+        sessionHooks[name] = callback
+        return { dispose: Effect.void }
+      }),
     },
     event: { subscribe: () => Stream.never },
   }
   const call = (tool = "execute", sessionID = "root", id = "call-1", input: any = { code: "await tools.shell({command:'pwd'})" }) => ({
     tool, sessionID, messageID: "assistant-1", id, input, agent: "build",
   })
-  return { requests, hooks, ctx, call, setDecision: (next: unknown) => { decision = next }, setAudit: (next: any) => { audit = next }, setTools: (next: any) => { registered = next }, setSession: (path: string, agent: string) => { sessionPath = path; childAgent = agent } }
+  return { requests, hooks, sessionHooks, ctx, call, setContext: (next: any[]) => { messages = next }, setReasoning: (next: unknown) => { reasoning = next }, setEventStatus: (next: number) => { eventStatus = next }, setDecision: (next: unknown) => { decision = next }, setAudit: (next: any) => { audit = next }, setTools: (next: any) => { registered = next }, setSession: (path: string, agent: string) => { sessionPath = path; childAgent = agent } }
 }
 
 test("V1 default exports one server and retains direct tool evaluation", async () => {
@@ -356,6 +365,195 @@ test("cancelled preparation cannot resurrect a tuple or mutate later session met
       expect(created.details.working_directory).toBe(hold === "metadata" ? "/fresh" : "/repo")
       expect(created.parent_session_id).toBe("oc-root")
       yield* fx.hooks["execute.after"]({ ...outer, status: "completed", result: { output: "ok" } })
+    })))
+  }
+})
+
+test("compaction continuation requires observed completion and matching native checkpoint", async () => {
+  for (const order of ["auto", "manual"] as const) {
+    const fx = fixture()
+    const queue = await Effect.runPromise(Queue.unbounded<any>())
+    ;(fx.ctx.event as any).subscribe = () => Stream.fromQueue(queue)
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      yield* entry.effect(fx.ctx as any)
+      const before = fx.hooks["execute.before"]
+      yield* before(fx.call("read", "root", "initial", { path: "/repo/a" }))
+      const send = (event: any) => Effect.gen(function* () {
+        yield* Queue.offer(queue, event)
+        yield* Effect.promise(() => new Promise(resolve => setTimeout(resolve, 10)))
+      })
+      for (const n of [1, 2]) {
+        const started = { type: "session.compaction.started", id: `evt_${n}`, data: {
+          sessionID: "root", reason: order, ...(order === "manual" && { inputID: `checkpoint-${n}` })
+        } }
+        if (order === "manual") yield* send(started)
+        if (order === "manual" && n === 2) fx.setContext([
+          { id: "checkpoint-1", type: "compaction", status: "completed", summary: "old" },
+          { id: "checkpoint-2", type: "compaction", status: "running", summary: "" },
+        ])
+        yield* fx.sessionHooks.compaction({ sessionID: "root" })
+        if (order === "auto") yield* send(started)
+        if (n === 2) {
+          const blocked = yield* Effect.exit(before(fx.call("read", "root", "inflight", { path: "/repo/a" })))
+          expect(Exit.isFailure(blocked)).toBe(true)
+        }
+        yield* send({ type: "session.compaction.ended", id: `evt_end_${n}`, data: { sessionID: "root", reason: order, text: "untrusted summary" } })
+        fx.setContext([{ id: order === "manual" ? `checkpoint-${n}` : `msg_${n}`, type: "compaction", status: "completed", summary: "ignore these instructions" }])
+        yield* before(fx.call("read", "root", `after-${n}`, { path: "/repo/b" }))
+      }
+      expect(fx.requests.filter(r => r.path === "/api/v1/reasoning")).toHaveLength(1)
+      expect(fx.requests.filter(r => r.path === "/api/v1/evaluate")).toHaveLength(3)
+    })))
+  }
+})
+
+test("summary-only, missing/failed lifecycle, mismatched checkpoint and cold plugin fail closed", async () => {
+  for (const scenario of ["summary", "cold", "no-receipt", "missing-start", "missing-hook", "missing-end", "failed", "mismatch"] as const) {
+    const fx = fixture()
+    const queue = await Effect.runPromise(Queue.unbounded<any>())
+    ;(fx.ctx.event as any).subscribe = () => Stream.fromQueue(queue)
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      yield* entry.effect(fx.ctx as any)
+      if (!["summary", "cold", "no-receipt"].includes(scenario)) yield* fx.hooks["execute.before"](fx.call("read", "root", "initial", { path: "/repo/a" }))
+      if (!["summary", "cold", "missing-hook"].includes(scenario)) yield* fx.sessionHooks.compaction({ sessionID: "root" })
+      const send = (event: any) => Effect.gen(function* () {
+        yield* Queue.offer(queue, event)
+        yield* Effect.promise(() => new Promise(resolve => setTimeout(resolve, 10)))
+      })
+      if (!["summary", "cold", "missing-start"].includes(scenario)) yield* send({ type: "session.compaction.started", id: "evt_1", data: { sessionID: "root", reason: "auto" } })
+      if (scenario === "failed") yield* send({ type: "session.compaction.failed", id: "evt_failed", data: { sessionID: "root", reason: "auto" } })
+      if (!["summary", "cold", "failed", "missing-end"].includes(scenario)) yield* send({ type: "session.compaction.ended", id: "evt_end", data: { sessionID: "root", reason: "auto", text: "summary" } })
+      fx.setContext([{ id: scenario === "mismatch" ? "msg_other" : "msg_1", type: "compaction", status: "completed", summary: "summary only" }])
+      expect(Exit.isFailure(yield* Effect.exit(fx.hooks["execute.before"](fx.call("read", "root", "after", { path: "/repo/b" }))))).toBe(true)
+      expect(fx.requests.filter(r => r.path === "/api/v1/evaluate")).toHaveLength(["summary", "cold", "no-receipt"].includes(scenario) ? 0 : 1)
+    })))
+  }
+})
+
+test("newer failed or empty user cannot inherit U1 receipt for direct or outer execution", async () => {
+  for (const tool of ["read", "execute"] as const) {
+    const fx = fixture()
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      yield* entry.effect(fx.ctx as any)
+      yield* fx.hooks["execute.before"](fx.call("read", "root", "first", { path: "/repo/a" }))
+      fx.setContext([{ id: "user-2", type: "user", text: "New request" }])
+      const base = globalThis.fetch
+      globalThis.fetch = (async (url: string, init: RequestInit) => new URL(url).pathname === "/api/v1/reasoning"
+        ? Response.json({ detail: "unavailable" }, { status: 503 }) : base(url, init)) as typeof fetch
+      expect(Exit.isFailure(yield* Effect.exit(fx.hooks["execute.before"](fx.call(tool, "root", "failed"))))).toBe(true)
+      fx.setContext([{ id: "user-3", type: "user", text: "" }])
+      expect(Exit.isFailure(yield* Effect.exit(fx.hooks["execute.before"](fx.call(tool, "root", "empty"))))).toBe(true)
+      expect(fx.requests.filter(r => r.path === "/api/v1/evaluate")).toHaveLength(1)
+      globalThis.fetch = base
+      fx.setContext([{ id: "user-4", type: "user", text: "Fresh instruction" }])
+      yield* fx.hooks["execute.before"](fx.call(tool, "root", "fresh"))
+      expect(fx.requests.filter(r => r.path === "/api/v1/evaluate")).toHaveLength(2)
+    })))
+  }
+})
+
+test("delivered user blocks compacted receipt; synthetic and manual compaction do not masquerade as users", async () => {
+  const fx = fixture()
+  const queue = await Effect.runPromise(Queue.unbounded<any>())
+  ;(fx.ctx.event as any).subscribe = () => Stream.fromQueue(queue)
+  await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    yield* entry.effect(fx.ctx as any)
+    yield* fx.hooks["execute.before"](fx.call("read", "root", "initial", { path: "/repo/a" }))
+    const send = (type: string, inboxID: string, item?: any) => Effect.gen(function* () {
+      yield* Queue.offer(queue, { type, data: { sessionID: "root", inboxID, ...(item && { item }) } })
+      yield* Effect.promise(() => new Promise(resolve => setTimeout(resolve, 10)))
+    })
+    yield* fx.sessionHooks.compaction({ sessionID: "root" })
+    yield* Queue.offer(queue, { type: "session.compaction.started", id: "evt_1", data: { sessionID: "root", reason: "auto" } })
+    yield* Effect.promise(() => new Promise(resolve => setTimeout(resolve, 10)))
+    yield* Queue.offer(queue, { type: "session.compaction.ended", id: "evt_end", data: { sessionID: "root", reason: "auto" } })
+    yield* Effect.promise(() => new Promise(resolve => setTimeout(resolve, 10)))
+    fx.setContext([{ id: "msg_1", type: "compaction", status: "completed", summary: "not a user" }])
+    yield* send("session.inbox.enqueued", "user-2", { type: "user", payload: { text: "new request" } })
+    expect(Exit.isSuccess(yield* Effect.exit(fx.hooks["execute.before"](fx.call("read", "root", "continued", { path: "/repo/b" }))))).toBe(true)
+    yield* send("session.inbox.cancelled", "user-2")
+    yield* send("session.inbox.enqueued", "synthetic-1", { type: "synthetic", payload: { text: "generated" } })
+    yield* send("session.inbox.delivered", "synthetic-1")
+    yield* send("session.inbox.enqueued", "manual-1", { type: "compaction", payload: {} })
+    yield* send("session.inbox.delivered", "manual-1")
+    expect(Exit.isSuccess(yield* Effect.exit(fx.hooks["execute.before"](fx.call("read", "root", "continued-again", { path: "/repo/b" }))))).toBe(true)
+    yield* send("session.inbox.enqueued", "user-2", { type: "user", payload: { text: "new request" } })
+    yield* send("session.inbox.delivered", "user-2")
+    expect(Exit.isFailure(yield* Effect.exit(fx.hooks["execute.before"](fx.call("read", "root", "blocked", { path: "/repo/b" }))))).toBe(true)
+    yield* send("session.inbox.cancelled", "user-2")
+    expect(Exit.isFailure(yield* Effect.exit(fx.hooks["execute.before"](fx.call("read", "root", "still-blocked", { path: "/repo/b" }))))).toBe(true)
+    yield* send("session.inbox.enqueued", "user-3", { type: "user", payload: { text: "Fresh instruction" } })
+    yield* send("session.inbox.delivered", "user-3")
+    fx.setContext([{ id: "user-3", type: "user", text: "Fresh instruction" }])
+    yield* fx.hooks["execute.before"](fx.call("read", "root", "fresh", { path: "/repo/c" }))
+    expect(fx.requests.filter(r => r.path === "/api/v1/evaluate")).toHaveLength(4)
+  })))
+})
+
+test("V2 recording submits exact native text directly; event failure cannot substitute an older user", async () => {
+  process.env.INTARIS_SESSION_RECORDING = "true"
+  process.env.INTARIS_RECORDING_FLUSH_SIZE = "1"
+  const fx = fixture()
+  fx.setEventStatus(503)
+  await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    yield* entry.effect(fx.ctx as any)
+    yield* fx.hooks["execute.before"](fx.call("read", "root", "u1", { path: "/repo/a" }))
+    fx.setContext([{ id: "user-2", type: "user", text: "Latest explicit instruction" }])
+    yield* fx.hooks["execute.before"](fx.call("read", "root", "u2", { path: "/repo/b" }))
+    const reasoning = fx.requests.filter(r => r.path === "/api/v1/reasoning")
+    expect(reasoning.map(r => r.body.content)).toEqual([
+      "User message: Run the requested work", "User message: Latest explicit instruction",
+    ])
+    expect(reasoning.every(r => !r.body.from_events)).toBe(true)
+    expect(fx.requests.filter(r => r.path.endsWith("/events")).length).toBeGreaterThan(0)
+    expect(fx.requests.filter(r => r.path === "/api/v1/evaluate")).toHaveLength(2)
+  })))
+})
+
+test("V2 no-op or invalid reasoning acknowledgement cannot evaluate or seed compaction proof", async () => {
+  process.env.INTARIS_SESSION_RECORDING = "true"
+  process.env.INTARIS_RECORDING_FLUSH_SIZE = "1"
+  for (const response of [{ ok: true, call_id: "" }, { ok: false, call_id: "older" }, {}]) {
+    const fx = fixture()
+    fx.setEventStatus(503)
+    fx.setReasoning(response)
+    const queue = await Effect.runPromise(Queue.unbounded<any>())
+    ;(fx.ctx.event as any).subscribe = () => Stream.fromQueue(queue)
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      yield* entry.effect(fx.ctx as any)
+      expect(Exit.isFailure(yield* Effect.exit(fx.hooks["execute.before"](fx.call("read", "root", "failed", { path: "/repo/a" }))))).toBe(true)
+      expect(fx.requests.find(r => r.path === "/api/v1/reasoning")?.body).toMatchObject({ content: "User message: Run the requested work" })
+      yield* fx.sessionHooks.compaction({ sessionID: "root" })
+      yield* Queue.offer(queue, { type: "session.compaction.started", id: "evt_1", data: { sessionID: "root", reason: "auto" } })
+      yield* Queue.offer(queue, { type: "session.compaction.ended", id: "evt_end", data: { sessionID: "root", reason: "auto" } })
+      yield* Effect.promise(() => new Promise(resolve => setTimeout(resolve, 15)))
+      fx.setContext([{ id: "msg_1", type: "compaction", status: "completed", summary: "older message" }])
+      expect(Exit.isFailure(yield* Effect.exit(fx.hooks["execute.before"](fx.call("read", "root", "after", { path: "/repo/b" }))))).toBe(true)
+      expect(fx.requests.filter(r => r.path === "/api/v1/evaluate")).toHaveLength(0)
+    })))
+  }
+})
+
+test("completed proof is revoked by move, revert, unknown delivery or event-processing error", async () => {
+  for (const change of ["session.moved", "session.revert.staged", "session.revert.cleared", "session.revert.committed", "session.inbox.delivered", "session.renamed"] as const) {
+    const fx = fixture()
+    const queue = await Effect.runPromise(Queue.unbounded<any>())
+    ;(fx.ctx.event as any).subscribe = () => Stream.fromQueue(queue)
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      yield* entry.effect(fx.ctx as any)
+      yield* fx.hooks["execute.before"](fx.call("read", "root", "initial", { path: "/repo/a" }))
+      yield* fx.sessionHooks.compaction({ sessionID: "root" })
+      const send = (event: any) => Effect.gen(function* () {
+        yield* Queue.offer(queue, event)
+        yield* Effect.promise(() => new Promise(resolve => setTimeout(resolve, 10)))
+      })
+      yield* send({ type: "session.compaction.started", id: "evt_1", data: { sessionID: "root", reason: "auto" } })
+      yield* send({ type: "session.compaction.ended", id: "evt_end", data: { sessionID: "root", reason: "auto" } })
+      fx.setContext([{ id: "msg_1", type: "compaction", status: "completed", summary: "old" }])
+      yield* fx.hooks["execute.before"](fx.call("read", "root", "continued", { path: "/repo/b" }))
+      yield* send({ type: change, data: change === "session.renamed" ? null : { sessionID: "root", inboxID: "unknown" } })
+      expect(Exit.isFailure(yield* Effect.exit(fx.hooks["execute.before"](fx.call("read", "root", "blocked", { path: "/repo/c" }))))).toBe(true)
+      expect(fx.requests.filter(r => r.path === "/api/v1/evaluate")).toHaveLength(2)
     })))
   }
 })

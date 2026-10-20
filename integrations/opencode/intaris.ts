@@ -89,6 +89,7 @@ const IntarisPlugin = async (
     sessionInfo: (id: string) => Promise<{ directory: string; parentID?: string; title?: string; agent?: string }>
     onDispose: (dispose: () => void) => void
     onStateRemoved: (id: string) => void
+    onReceiptLookup: (lookup: (id: string, messageID: string) => boolean) => void
   },
 ) => {
   // -- Configuration --------------------------------------------------------
@@ -132,6 +133,11 @@ const IntarisPlugin = async (
   const MAX_SESSIONS = 100
   const MAX_RECENT_TOOLS = 10
   const sessions = new Map<string, SessionState>()
+  options?.onReceiptLookup((id, messageID) => {
+    const state = sessions.get(id)
+    return !!state && !state.reasoningError && state.reasoningSentForMessageId === messageID
+      && (!state.pendingUserMessageId || state.pendingUserMessageId === messageID)
+  })
   type ResolvedSession = { directory: string; parentID?: string; title?: string; agent?: string }
   const metadataReady = new WeakMap<SessionState, Promise<ResolvedSession>>()
   async function loadSessionInfo(sessionId: string, state: SessionState, signal?: AbortSignal): Promise<void> {
@@ -652,6 +658,7 @@ const IntarisPlugin = async (
       messageID?: string
       sessionID?: string
     },
+    v2 = false,
   ): Promise<void> {
     if (!state.intarisSessionId || !userText) return
 
@@ -667,7 +674,7 @@ const IntarisPlugin = async (
 
     let reasoningResult: ApiResult
 
-    if (sessionRecording) {
+    if (sessionRecording && !v2) {
       // When session recording is enabled, record the user message
       // event first, flush synchronously to ensure it's in the event
       // store, then trigger reasoning with from_events=true to avoid
@@ -711,7 +718,8 @@ const IntarisPlugin = async (
         30000,
       )
     } else {
-      // Without recording, send the content directly via /reasoning.
+      // V2 submits the selected native user's text directly: event-store
+      // resolution can acknowledge an older message (or return a 200 no-op).
       reasoningResult = await callApi(
         "POST",
         "/api/v1/reasoning",
@@ -736,13 +744,14 @@ const IntarisPlugin = async (
       })
     }
 
-    if (reasoningResult.error) {
+    if (reasoningResult.error || (v2 && (reasoningResult.data?.ok !== true
+      || typeof reasoningResult.data.call_id !== "string" || !reasoningResult.data.call_id.trim()))) {
       state.reasoningError = true
       await client.app.log({
         body: {
           service: "intaris",
           level: "error",
-          message: `Intaris: /reasoning failed — ${reasoningResult.error} (status=${reasoningResult.status}, contextLen=${assistantContext ? assistantContext.length : 0})`,
+          message: `Intaris: /reasoning failed — ${reasoningResult.error || "no acknowledgement"} (status=${reasoningResult.status}, contextLen=${assistantContext ? assistantContext.length : 0})`,
         },
       }).catch(() => {})
       return
@@ -1263,6 +1272,7 @@ const IntarisPlugin = async (
         tool: string; sessionID: string; callID: string
         signal?: AbortSignal
         codeMode?: { onApproved: (auditId: string) => void }
+        userMessageID?: string
       },
       _output: { args: any },
     ) => {
@@ -1302,9 +1312,15 @@ const IntarisPlugin = async (
           state,
           state.pendingUserText,
           state.pendingUserMessageId || undefined,
+          undefined,
+          !!input.userMessageID,
         )
       }
-      if (input.codeMode && state.reasoningError) throw new Error("[intaris] User intention submission failed")
+      if (input.userMessageID && (state.reasoningError
+        || state.reasoningSentForMessageId !== input.userMessageID
+        || (state.pendingUserMessageId && state.pendingUserMessageId !== input.userMessageID))) {
+        throw new Error("[intaris] User intention submission failed; provide a fresh user instruction")
+      }
 
       // Record tool call event (before evaluation, fire-and-forget)
       recordEvent(sessionID, {
@@ -1623,6 +1639,12 @@ export default {
     }
     const families = new Map<string, Family>()
     const seenUsers = new Map<string, string>()
+    const deliveredUsers = new Map<string, string>()
+    const inbox = new Map<string, Map<string, string>>()
+    const proofs = new Map<string, { acknowledgedUserID: string; completedCheckpointID: string }>()
+    const compactions = new Map<string, { checkpointID?: string; candidateID?: string; prepared: boolean; invalid: boolean }>()
+    const revoke = (id: string) => { proofs.delete(id); compactions.delete(id) }
+    let acknowledgedUser = (_id: string, _messageID: string) => false
     const key = (call: Call) => `${call.sessionID}\0${call.messageID}\0${call.id}`
     const client = {
       app: { log: async () => ({}) },
@@ -1632,6 +1654,7 @@ export default {
 
     return Effect.gen(function* () {
       const { Tool } = yield* Effect.promise(() => import("@opencode/schema/tool"))
+      const { SessionMessage } = yield* Effect.promise(() => import("@opencode/schema/session-message"))
       const hooks = yield* Effect.promise(() => IntarisPlugin(
         { client, worktree: ctx.location.directory, directory: ctx.location.directory } as unknown as Parameters<Plugin>[0],
         {
@@ -1642,10 +1665,32 @@ export default {
             agent: info.agent,
           })),
           onDispose: cleanup => { dispose = cleanup },
-          onStateRemoved: id => { seenUsers.delete(id) },
+          onStateRemoved: id => { seenUsers.delete(id); deliveredUsers.delete(id); inbox.delete(id); revoke(id) },
+          onReceiptLookup: lookup => { acknowledgedUser = lookup },
         },
       ))
-      yield* Effect.addFinalizer(() => Effect.sync(() => { dispose(); families.clear() }))
+      yield* Effect.addFinalizer(() => Effect.sync(() => { dispose(); families.clear(); deliveredUsers.clear(); inbox.clear(); proofs.clear(); compactions.clear() }))
+
+      yield* ctx.session.hook("compaction", input => Effect.tryPromise({
+        try: async () => {
+          const id = input.sessionID
+          const context = await Effect.runPromise(ctx.session.context({ sessionID: id }))
+          const user = context.filter(message => message.type === "user").at(-1)
+          const checkpoint = context.filter(message => message.type === "compaction" && message.status === "completed").at(-1)
+          const previous = proofs.get(id)
+          const candidate = user?.type === "user" ? user.id
+            : checkpoint?.type === "compaction" && previous?.completedCheckpointID === checkpoint.id
+              ? previous.acknowledgedUserID : undefined
+          const flight = compactions.get(id) || { prepared: false, invalid: false }
+          flight.candidateID = candidate && (!deliveredUsers.has(id) || deliveredUsers.get(id) === candidate)
+            && acknowledgedUser(id, candidate) ? candidate : undefined
+          flight.prepared = true
+          if (!flight.candidateID) flight.invalid = true
+          compactions.set(id, flight)
+          proofs.delete(id)
+        },
+        catch: () => { proofs.clear(); compactions.clear(); return undefined },
+      }).pipe(Effect.ignore))
 
       function end(family: Family, result?: { output?: unknown; isError: boolean; metadata?: Record<string, unknown> }) {
         if (family.done) return Promise.resolve()
@@ -1694,8 +1739,22 @@ export default {
             const context = await Effect.runPromise(ctx.session.context({ sessionID: event.sessionID }))
             checkLive()
             const user = context.filter(message => message.type === "user").at(-1)
-            if (!user || user.type !== "user") throw new Error("[intaris] No admitted user context")
-            if (seenUsers.get(event.sessionID) !== user.id) {
+            const checkpoint = context.filter(message => message.type === "compaction" && message.status === "completed").at(-1)
+            const latestCompaction = context.filter(message => message.type === "compaction").at(-1)
+            if (user?.type === "user") {
+              proofs.delete(event.sessionID)
+            }
+            const proof = proofs.get(event.sessionID)
+            const selectedID = user?.type === "user" ? user.id
+              : !compactions.has(event.sessionID) && latestCompaction?.type === "compaction"
+                && latestCompaction.status === "completed" && checkpoint?.type === "compaction"
+                && proof?.completedCheckpointID === checkpoint.id && acknowledgedUser(event.sessionID, proof.acknowledgedUserID)
+                ? proof.acknowledgedUserID : undefined
+            if (!selectedID || (deliveredUsers.has(event.sessionID) && deliveredUsers.get(event.sessionID) !== selectedID)) {
+              proofs.delete(event.sessionID)
+              throw new Error("[intaris] No admitted user context; provide a fresh user instruction")
+            }
+            if (user?.type === "user" && seenUsers.get(event.sessionID) !== user.id) {
               await hooks.event({ event: { type: "message.updated", properties: { info: { sessionID: event.sessionID, id: user.id, role: "user" } } } })
               checkLive()
               await hooks.event({ event: { type: "message.part.updated", properties: { part: { sessionID: event.sessionID, messageID: user.id, type: "text", text: user.text } } } })
@@ -1713,7 +1772,7 @@ export default {
             }
             checkLive()
             await hooks["tool.execute.before"](
-              { tool, sessionID: event.sessionID, callID: event.id, signal,
+              { tool, sessionID: event.sessionID, callID: event.id, signal, userMessageID: selectedID,
                 ...(pending && { codeMode: { onApproved: () => { checkLive(); pending!.approved = true } } }) },
               { args },
             )
@@ -1754,8 +1813,49 @@ export default {
           if (event.type === "session.renamed") await hooks.event({ event: { type: "session.updated", properties: { info: { id: data.sessionID, title: data.title } } } })
           if (event.type === "session.deleted") {
             seenUsers.delete(data.sessionID)
+            deliveredUsers.delete(data.sessionID)
+            inbox.delete(data.sessionID)
+            revoke(data.sessionID)
             for (const family of families.values()) if (family.sessionID === data.sessionID) await end(family)
             await hooks.event({ event: { type: "session.deleted", properties: { info: { id: data.sessionID } } } })
+          }
+          if (event.type === "session.inbox.enqueued") {
+            const pending = inbox.get(data.sessionID) || new Map<string, string>()
+            if (pending.size >= 100) pending.clear() // Uncorrelated delivery will fail closed.
+            pending.set(data.inboxID, data.item.type)
+            inbox.set(data.sessionID, pending)
+          }
+          if (event.type === "session.inbox.delivered") {
+            const pending = inbox.get(data.sessionID)
+            const type = pending?.get(data.inboxID)
+            pending?.delete(data.inboxID)
+            if (type === "user") {
+              deliveredUsers.set(data.sessionID, data.inboxID)
+              revoke(data.sessionID)
+            } else if (type !== "synthetic" && type !== "compaction") {
+              revoke(data.sessionID) // Move or uncorrelated delivery changes the view.
+            }
+          }
+          if (event.type === "session.inbox.cancelled") inbox.get(data.sessionID)?.delete(data.inboxID)
+          if (event.type === "session.moved" || event.type === "session.revert.staged"
+            || event.type === "session.revert.cleared" || event.type === "session.revert.committed") revoke(data.sessionID)
+          if (event.type === "session.compaction.started") {
+            const id = data.sessionID
+            const checkpointID = data.inputID || SessionMessage.ID.fromEvent(event.id)
+            const flight = compactions.get(id) || { prepared: false, invalid: false }
+            if (flight.checkpointID) flight.invalid = true
+            flight.checkpointID = checkpointID
+            compactions.set(id, flight)
+          }
+          if (event.type === "session.compaction.failed" || event.type === "session.compaction.ended") {
+            const id = data.sessionID
+            const flight = compactions.get(id)
+            revoke(id)
+            if (event.type === "session.compaction.ended" && flight?.prepared && !flight.invalid
+              && flight.checkpointID && flight.candidateID && acknowledgedUser(id, flight.candidateID)
+              && (!deliveredUsers.has(id) || deliveredUsers.get(id) === flight.candidateID)) {
+              proofs.set(id, { acknowledgedUserID: flight.candidateID, completedCheckpointID: flight.checkpointID })
+            }
           }
           // succeeded, failed and user/superseded/inactivity interruptions are
           // all terminal for the running execution — mirror them to idle so
@@ -1771,8 +1871,8 @@ export default {
             await hooks.event({ event: { type: "message.part.updated", properties: { part: { messageID: data.assistantMessageID, sessionID: data.sessionID, type: "text", text: data.text } } } })
           }
         },
-        catch: () => undefined,
-      }).pipe(Effect.ignore)).pipe(Effect.forkScoped)
+        catch: () => { proofs.clear(); compactions.clear(); return undefined },
+      }).pipe(Effect.ignore)).pipe(Effect.ensuring(Effect.sync(() => { proofs.clear(); compactions.clear() })), Effect.forkScoped)
     })
   },
 }
