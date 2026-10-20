@@ -713,13 +713,8 @@ const IntarisPlugin = async (
         },
       })
 
-      // Await the flush directly instead of using the fire-and-forget
-      // flushRecordingBuffer helper — the /reasoning call depends on
-      // the events being persisted server-side.
-      if (state.intarisSessionId && state.recordingBuffer.length > 0) {
-        const events = state.recordingBuffer.splice(0)
-        await uploadRecording(sessionId, state, events).catch(() => {})
-      }
+      // Wait for buffered events and any auto-flushed upload already in flight.
+      await flushRecordingBuffer(sessionId)
 
       reasoningResult = await callApi(
         "POST",
@@ -1395,6 +1390,7 @@ const IntarisPlugin = async (
         || (state.pendingUserMessageId && state.pendingUserMessageId !== input.userMessageID))) {
         throw new Error("[intaris] User intention submission failed; provide a fresh user instruction")
       }
+      if (input.userMessageID) state.isIdle = false
 
       // Record tool call event (before evaluation, fire-and-forget)
       recordEvent(sessionID, {
@@ -1717,7 +1713,21 @@ export default {
     const inbox = new Map<string, Map<string, string>>()
     const proofs = new Map<string, { acknowledgedUserID: string; completedCheckpointID: string }>()
     const compactions = new Map<string, { checkpointID?: string; candidateID?: string; prepared: boolean; invalid: boolean }>()
-    const revoke = (id: string) => { proofs.delete(id); compactions.delete(id) }
+    const lookupTokens = new Map<string, Set<object>>()
+    const lookup = (id: string) => {
+      const tokens = lookupTokens.get(id) || new Set<object>()
+      const token = {}
+      tokens.add(token)
+      lookupTokens.set(id, tokens)
+      return {
+        current: () => lookupTokens.get(id) === tokens && tokens.has(token),
+        finish: () => {
+          tokens.delete(token)
+          if (tokens.size === 0 && lookupTokens.get(id) === tokens) lookupTokens.delete(id)
+        },
+      }
+    }
+    const revoke = (id: string) => { lookupTokens.delete(id); proofs.delete(id); compactions.delete(id) }
     let acknowledgedUser = (_id: string, _messageID: string) => false
     let admitUser = (_id: string, _messageID: string, _text: string, _signal: AbortSignal, _prepare: (current: () => boolean) => Promise<void>): Promise<void> => Promise.reject(new Error("[intaris] User admission unavailable"))
     const key = (call: Call) => `${call.sessionID}\0${call.messageID}\0${call.id}`
@@ -1745,27 +1755,35 @@ export default {
           onAdmission: admit => { admitUser = admit },
         },
       ))
-      yield* Effect.addFinalizer(() => Effect.sync(() => { dispose(); families.clear(); deliveredUsers.clear(); inbox.clear(); proofs.clear(); compactions.clear() }))
+      yield* Effect.addFinalizer(() => Effect.sync(() => { dispose(); families.clear(); deliveredUsers.clear(); inbox.clear(); lookupTokens.clear(); proofs.clear(); compactions.clear() }))
 
       yield* ctx.session.hook("compaction", input => Effect.tryPromise({
         try: async () => {
           const id = input.sessionID
-          const context = await Effect.runPromise(ctx.session.context({ sessionID: id }))
-          const user = context.filter(message => message.type === "user").at(-1)
-          const checkpoint = context.filter(message => message.type === "compaction" && message.status === "completed").at(-1)
-          const previous = proofs.get(id)
-          const candidate = user?.type === "user" ? user.id
-            : checkpoint?.type === "compaction" && previous?.completedCheckpointID === checkpoint.id
-              ? previous.acknowledgedUserID : undefined
-          const flight = compactions.get(id) || { prepared: false, invalid: false }
-          flight.candidateID = candidate && (!deliveredUsers.has(id) || deliveredUsers.get(id) === candidate)
-            && acknowledgedUser(id, candidate) ? candidate : undefined
-          flight.prepared = true
-          if (!flight.candidateID) flight.invalid = true
-          compactions.set(id, flight)
-          proofs.delete(id)
+          const pending = lookup(id)
+          try {
+            const context = await Effect.runPromise(ctx.session.context({ sessionID: id }))
+            if (!pending.current()) return
+            const user = context.filter(message => message.type === "user").at(-1)
+            const checkpoint = context.filter(message => message.type === "compaction" && message.status === "completed").at(-1)
+            const previous = proofs.get(id)
+            const candidate = user?.type === "user" ? user.id
+              : checkpoint?.type === "compaction" && previous?.completedCheckpointID === checkpoint.id
+                ? previous.acknowledgedUserID : undefined
+            const flight = compactions.get(id) || { prepared: false, invalid: false }
+            flight.candidateID = candidate && (!deliveredUsers.has(id) || deliveredUsers.get(id) === candidate)
+              && acknowledgedUser(id, candidate) ? candidate : undefined
+            flight.prepared = true
+            if (!flight.candidateID) flight.invalid = true
+            compactions.set(id, flight)
+            proofs.delete(id)
+          } catch {
+            if (pending.current()) revoke(id)
+          } finally {
+            pending.finish()
+          }
         },
-        catch: () => { proofs.clear(); compactions.clear(); return undefined },
+        catch: () => undefined,
       }).pipe(Effect.ignore))
 
       function end(family: Family, result?: { output?: unknown; isError: boolean; metadata?: Record<string, unknown> }) {
@@ -1812,25 +1830,35 @@ export default {
           }
           try {
             checkLive()
-            const context = await Effect.runPromise(ctx.session.context({ sessionID: event.sessionID }))
-            checkLive()
-            const user = context.filter(message => message.type === "user").at(-1)
-            const checkpoint = context.filter(message => message.type === "compaction" && message.status === "completed").at(-1)
-            const latestCompaction = context.filter(message => message.type === "compaction").at(-1)
-            if (user?.type === "user") {
-              proofs.delete(event.sessionID)
+            const pendingLookup = lookup(event.sessionID)
+            let user: { id: string; text: string } | undefined
+            let selectedID: string
+            try {
+              const context = await Effect.runPromise(ctx.session.context({ sessionID: event.sessionID }))
+              if (!pendingLookup.current()) throw new Error("[intaris] Session context changed; provide a fresh user instruction")
+              checkLive()
+              const latestUser = context.filter(message => message.type === "user").at(-1)
+              const checkpoint = context.filter(message => message.type === "compaction" && message.status === "completed").at(-1)
+              const latestCompaction = context.filter(message => message.type === "compaction").at(-1)
+              if (latestUser?.type === "user") {
+                user = { id: latestUser.id, text: latestUser.text }
+                proofs.delete(event.sessionID)
+              }
+              const proof = proofs.get(event.sessionID)
+              const candidate = user ? user.id
+                : !compactions.has(event.sessionID) && latestCompaction?.type === "compaction"
+                  && latestCompaction.status === "completed" && checkpoint?.type === "compaction"
+                  && proof?.completedCheckpointID === checkpoint.id && acknowledgedUser(event.sessionID, proof.acknowledgedUserID)
+                  ? proof.acknowledgedUserID : undefined
+              if (!candidate || (deliveredUsers.has(event.sessionID) && deliveredUsers.get(event.sessionID) !== candidate)) {
+                proofs.delete(event.sessionID)
+                throw new Error("[intaris] No admitted user context; provide a fresh user instruction")
+              }
+              selectedID = candidate
+            } finally {
+              pendingLookup.finish()
             }
-            const proof = proofs.get(event.sessionID)
-            const selectedID = user?.type === "user" ? user.id
-              : !compactions.has(event.sessionID) && latestCompaction?.type === "compaction"
-                && latestCompaction.status === "completed" && checkpoint?.type === "compaction"
-                && proof?.completedCheckpointID === checkpoint.id && acknowledgedUser(event.sessionID, proof.acknowledgedUserID)
-                ? proof.acknowledgedUserID : undefined
-            if (!selectedID || (deliveredUsers.has(event.sessionID) && deliveredUsers.get(event.sessionID) !== selectedID)) {
-              proofs.delete(event.sessionID)
-              throw new Error("[intaris] No admitted user context; provide a fresh user instruction")
-            }
-            if (user?.type === "user") {
+            if (user) {
               // Install ownership before any event or network await; other tools
               // for this native ID join the same recording/reasoning operation.
               const admission = admitUser(event.sessionID, user.id, user.text, signal, async current => {
@@ -1955,8 +1983,8 @@ export default {
             await hooks.event({ event: { type: "message.part.updated", properties: { part: { messageID: data.assistantMessageID, sessionID: data.sessionID, type: "text", text: data.text } } } })
           }
         },
-        catch: () => { proofs.clear(); compactions.clear(); return undefined },
-      }).pipe(Effect.ignore)).pipe(Effect.ensuring(Effect.sync(() => { proofs.clear(); compactions.clear() })), Effect.forkScoped)
+        catch: () => { lookupTokens.clear(); proofs.clear(); compactions.clear(); return undefined },
+      }).pipe(Effect.ignore)).pipe(Effect.ensuring(Effect.sync(() => { lookupTokens.clear(); proofs.clear(); compactions.clear() })), Effect.forkScoped)
     })
   },
 }

@@ -1008,3 +1008,261 @@ test("retired idle-resume cannot record its old user into a replacement's active
     expect(expectedSeq).toBe(userSeq)
   })))
 })
+
+test("V1 size-triggered recording flush settles before event-derived reasoning", async () => {
+  process.env.INTARIS_SESSION_RECORDING = "true"
+  process.env.INTARIS_RECORDING_FLUSH_SIZE = "1"
+  const fx = fixture()
+  const base = globalThis.fetch
+  let uploadStarted!: () => void
+  let releaseUpload!: () => void
+  const started = new Promise<void>(resolve => { uploadStarted = resolve })
+  let recordedUser = false
+  globalThis.fetch = (async (url: string, init: RequestInit) => {
+    const path = new URL(url).pathname
+    if (path.endsWith("/events")) {
+      const events = JSON.parse(String(init.body)) as Array<{ type: string; data: { role?: string } }>
+      if (events.some(event => event.type === "message" && event.data.role === "user")) {
+        uploadStarted()
+        await new Promise<void>(resolve => { releaseUpload = resolve })
+        recordedUser = true
+      }
+    }
+    if (path === "/api/v1/reasoning") {
+      const reply = await base(url, init)
+      return recordedUser ? reply : Response.json({ ok: true, call_id: "" })
+    }
+    return base(url, init)
+  }) as typeof fetch
+  const hooks = await entry.server({ client: { app: { log: async () => ({}) }, tui: { showToast: async () => ({}) } }, worktree: "/repo", directory: "/repo" } as any)
+  await hooks.event({ event: { type: "session.created", properties: { info: { id: "root" } } } })
+  const message = hooks["chat.message"]({ sessionID: "root", messageID: "user-1" }, { parts: [{ type: "text", text: "Fresh request" }] })
+  await started
+  const beforeUploadSettles = fx.requests.filter(r => r.path === "/api/v1/reasoning").length
+  releaseUpload()
+  await message
+  const reasoning = fx.requests.filter(r => r.path === "/api/v1/reasoning")
+  expect(beforeUploadSettles).toBe(0)
+  expect(reasoning).toHaveLength(1)
+  expect(reasoning[0].body).toMatchObject({ session_id: "oc-root", content: "", from_events: true })
+  expect(recordedUser).toBe(true)
+})
+
+test("checkpoint-only continuation clears root idle so subsequent completion emits idle again", async () => {
+  const fx = fixture()
+  const queue = await Effect.runPromise(Queue.unbounded<any>())
+  ;(fx.ctx.event as any).subscribe = () => Stream.fromQueue(queue)
+  const base = globalThis.fetch
+  let firstIdle!: () => void
+  const idle = new Promise<void>(resolve => { firstIdle = resolve })
+  const statuses: string[] = []
+  let serverActive = true
+  globalThis.fetch = (async (url: string, init: RequestInit) => {
+    if (new URL(url).pathname === "/api/v1/session/oc-root/status") {
+      const status = JSON.parse(String(init.body)).status
+      statuses.push(status)
+      serverActive = status === "active"
+      if (status === "idle" && statuses.filter(value => value === "idle").length === 1) firstIdle()
+    }
+    if (new URL(url).pathname === "/api/v1/evaluate") serverActive = true
+    return base(url, init)
+  }) as typeof fetch
+  await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    yield* entry.effect(fx.ctx as any)
+    yield* fx.hooks["execute.before"](fx.call("read", "root", "initial", { path: "/repo/a" }))
+    yield* Queue.offer(queue, { type: "session.execution.succeeded", data: { sessionID: "root" } })
+    yield* Effect.promise(() => idle)
+    yield* Queue.offer(queue, { type: "session.inbox.enqueued", data: { sessionID: "root", inboxID: "manual-1", item: { type: "compaction", payload: {} } } })
+    yield* Queue.offer(queue, { type: "session.inbox.delivered", data: { sessionID: "root", inboxID: "manual-1" } })
+    yield* Queue.offer(queue, { type: "session.compaction.started", id: "evt_manual", data: { sessionID: "root", reason: "manual", inputID: "checkpoint-1" } })
+    yield* Effect.promise(() => new Promise<void>(resolve => setImmediate(resolve)))
+    yield* fx.sessionHooks.compaction({ sessionID: "root" })
+    yield* Queue.offer(queue, { type: "session.compaction.ended", id: "evt_end", data: { sessionID: "root", reason: "manual", text: "summary" } })
+    yield* Effect.promise(() => new Promise<void>(resolve => setImmediate(resolve)))
+    fx.setContext([{ id: "checkpoint-1", type: "compaction", status: "completed", summary: "not an instruction" }])
+    yield* fx.hooks["execute.before"](fx.call("read", "root", "continued", { path: "/repo/b" }))
+    expect(serverActive).toBe(true)
+    yield* Queue.offer(queue, { type: "session.execution.succeeded", data: { sessionID: "root" } })
+    yield* Effect.promise(() => new Promise<void>(resolve => setImmediate(resolve)))
+    expect(fx.requests.filter(r => r.path === "/api/v1/evaluate")).toHaveLength(2)
+    expect(statuses.filter(status => status === "idle")).toHaveLength(2)
+  })))
+})
+
+test("move during deferred compaction context cannot re-install revoked user proof", async () => {
+  const fx = fixture()
+  const queue = await Effect.runPromise(Queue.unbounded<any>())
+  ;(fx.ctx.event as any).subscribe = () => Stream.fromQueue(queue)
+  await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    yield* entry.effect(fx.ctx as any)
+    yield* fx.hooks["execute.before"](fx.call("read", "root", "initial", { path: "/repo/a" }))
+    const context = fx.ctx.session.context
+    let lookupStarted!: () => void
+    let releaseLookup!: () => void
+    const started = new Promise<void>(resolve => { lookupStarted = resolve })
+    let first = true
+    fx.ctx.session.context = () => {
+      if (!first) return context()
+      first = false
+      return Effect.promise(() => new Promise<any[]>(resolve => {
+        releaseLookup = () => resolve([{ id: "user-1", type: "user", text: "Run the requested work" }])
+        lookupStarted()
+      }))
+    }
+    const hook = yield* Effect.forkChild(fx.sessionHooks.compaction({ sessionID: "root" }))
+    yield* Effect.promise(() => started)
+    yield* Queue.offer(queue, { type: "session.moved", data: { sessionID: "root", location: { directory: "/repo" }, projectID: "project" } })
+    yield* Effect.promise(() => new Promise<void>(resolve => setImmediate(resolve)))
+    releaseLookup()
+    yield* Fiber.join(hook)
+    yield* Queue.offer(queue, { type: "session.compaction.started", id: "evt_1", data: { sessionID: "root", reason: "auto" } })
+    yield* Queue.offer(queue, { type: "session.compaction.ended", id: "evt_end", data: { sessionID: "root", reason: "auto", text: "summary" } })
+    yield* Effect.promise(() => new Promise<void>(resolve => setImmediate(resolve)))
+    fx.setContext([{ id: "msg_1", type: "compaction", status: "completed", summary: "not an instruction" }])
+    expect(Exit.isFailure(yield* Effect.exit(fx.hooks["execute.before"](fx.call("read", "root", "blocked", { path: "/repo/b" }))))).toBe(true)
+    expect(fx.requests.filter(r => r.path === "/api/v1/evaluate")).toHaveLength(1)
+    fx.setContext([{ id: "user-2", type: "user", text: "Fresh instruction" }])
+    yield* fx.hooks["execute.before"](fx.call("read", "root", "fresh", { path: "/repo/c" }))
+    expect(fx.requests.filter(r => r.path === "/api/v1/evaluate")).toHaveLength(2)
+  })))
+})
+
+test("stale compaction lookup success or failure cannot erase a newly completed proof", async () => {
+  for (const outcome of ["success", "failure"] as const) {
+    const fx = fixture()
+    const queue = await Effect.runPromise(Queue.unbounded<any>())
+    ;(fx.ctx.event as any).subscribe = () => Stream.fromQueue(queue)
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      yield* entry.effect(fx.ctx as any)
+      yield* fx.hooks["execute.before"](fx.call("read", "root", "initial", { path: "/repo/a" }))
+      const context = fx.ctx.session.context
+      let lookupStarted!: () => void
+      let finishLookup!: () => void
+      const started = new Promise<void>(resolve => { lookupStarted = resolve })
+      let first = true
+      fx.ctx.session.context = () => {
+        if (!first) return context()
+        first = false
+        return Effect.promise(() => new Promise<any[]>((resolve, reject) => {
+          finishLookup = () => outcome === "success"
+            ? resolve([{ id: "user-1", type: "user", text: "Run the requested work" }])
+            : reject(new Error("stale context failed"))
+          lookupStarted()
+        }))
+      }
+      const stale = yield* Effect.forkChild(fx.sessionHooks.compaction({ sessionID: "root" }))
+      yield* Effect.promise(() => started)
+      yield* Queue.offer(queue, { type: "session.moved", data: { sessionID: "root", location: { directory: "/repo" }, projectID: "project" } })
+      yield* Effect.promise(() => new Promise<void>(resolve => setImmediate(resolve)))
+      yield* fx.sessionHooks.compaction({ sessionID: "root" })
+      yield* Queue.offer(queue, { type: "session.compaction.started", id: "evt_fresh", data: { sessionID: "root", reason: "auto" } })
+      yield* Queue.offer(queue, { type: "session.compaction.ended", id: "evt_end", data: { sessionID: "root", reason: "auto", text: "summary" } })
+      yield* Effect.promise(() => new Promise<void>(resolve => setImmediate(resolve)))
+      finishLookup()
+      yield* Fiber.join(stale)
+      fx.setContext([{ id: "msg_fresh", type: "compaction", status: "completed", summary: "not an instruction" }])
+      yield* fx.hooks["execute.before"](fx.call("read", "root", "continued", { path: "/repo/b" }))
+      expect(fx.requests.filter(r => r.path === "/api/v1/evaluate")).toHaveLength(2)
+    })))
+  }
+})
+
+test("old lookup from a removed session ID stays stale after a replacement proves its user", async () => {
+  const fx = fixture()
+  const queue = await Effect.runPromise(Queue.unbounded<any>())
+  ;(fx.ctx.event as any).subscribe = () => Stream.fromQueue(queue)
+  const base = globalThis.fetch
+  let removed!: () => void
+  const deleted = new Promise<void>(resolve => { removed = resolve })
+  globalThis.fetch = (async (url: string, init: RequestInit) => {
+    if (new URL(url).pathname === "/api/v1/session/oc-root/agent-summary") removed()
+    return base(url, init)
+  }) as typeof fetch
+  await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    yield* entry.effect(fx.ctx as any)
+    yield* fx.hooks["execute.before"](fx.call("read", "root", "initial", { path: "/repo/a" }))
+    const context = fx.ctx.session.context
+    let lookupStarted!: () => void
+    let finishLookup!: () => void
+    const started = new Promise<void>(resolve => { lookupStarted = resolve })
+    let first = true
+    fx.ctx.session.context = () => {
+      if (!first) return context()
+      first = false
+      return Effect.promise(() => new Promise<any[]>(resolve => {
+        finishLookup = () => resolve([{ id: "user-1", type: "user", text: "old" }])
+        lookupStarted()
+      }))
+    }
+    const stale = yield* Effect.forkChild(fx.sessionHooks.compaction({ sessionID: "root" }))
+    yield* Effect.promise(() => started)
+    yield* Queue.offer(queue, { type: "session.deleted", data: { sessionID: "root" } })
+    yield* Effect.promise(() => deleted)
+    yield* Effect.promise(() => new Promise<void>(resolve => setImmediate(resolve)))
+    fx.setContext([{ id: "user-2", type: "user", text: "Fresh instruction" }])
+    yield* fx.hooks["execute.before"](fx.call("read", "root", "new", { path: "/repo/b" }))
+    yield* fx.sessionHooks.compaction({ sessionID: "root" })
+    yield* Queue.offer(queue, { type: "session.compaction.started", id: "evt_new", data: { sessionID: "root", reason: "auto" } })
+    yield* Queue.offer(queue, { type: "session.compaction.ended", id: "evt_end", data: { sessionID: "root", reason: "auto", text: "summary" } })
+    yield* Effect.promise(() => new Promise<void>(resolve => setImmediate(resolve)))
+    finishLookup()
+    yield* Fiber.join(stale)
+    fx.setContext([{ id: "msg_new", type: "compaction", status: "completed", summary: "not an instruction" }])
+    yield* fx.hooks["execute.before"](fx.call("read", "root", "continued", { path: "/repo/c" }))
+    expect(fx.requests.filter(r => r.path === "/api/v1/evaluate")).toHaveLength(3)
+  })))
+})
+
+test("finishing one current context lookup does not revoke another independent tool lookup", async () => {
+  const fx = fixture()
+  let started!: () => void
+  const bothStarted = new Promise<void>(resolve => { started = resolve })
+  const releases: Array<() => void> = []
+  fx.ctx.session.context = () => Effect.promise(() => new Promise<any[]>(resolve => {
+    releases.push(() => resolve([{ id: "user-1", type: "user", text: "Run the requested work" }]))
+    if (releases.length === 2) started()
+  }))
+  await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    yield* entry.effect(fx.ctx as any)
+    const first = yield* Effect.forkChild(fx.hooks["execute.before"](fx.call("read", "root", "one", { path: "/repo/a" })))
+    const second = yield* Effect.forkChild(fx.hooks["execute.before"](fx.call("read", "root", "two", { path: "/repo/b" })))
+    yield* Effect.promise(() => bothStarted)
+    releases[0]()
+    expect(Exit.isSuccess(yield* Fiber.await(first))).toBe(true)
+    releases[1]()
+    expect(Exit.isSuccess(yield* Fiber.await(second))).toBe(true)
+    expect(fx.requests.filter(r => r.path === "/api/v1/reasoning")).toHaveLength(1)
+    expect(fx.requests.filter(r => r.path === "/api/v1/evaluate")).toHaveLength(2)
+  })))
+})
+
+test("tool lookup begun before a move cannot evaluate its stale typed user context", async () => {
+  const fx = fixture()
+  const queue = await Effect.runPromise(Queue.unbounded<any>())
+  ;(fx.ctx.event as any).subscribe = () => Stream.fromQueue(queue)
+  let started!: () => void
+  let release!: () => void
+  const waiting = new Promise<void>(resolve => { started = resolve })
+  const context = fx.ctx.session.context
+  let first = true
+  fx.ctx.session.context = () => {
+    if (!first) return context()
+    first = false
+    return Effect.promise(() => new Promise<any[]>(resolve => {
+      release = () => resolve([{ id: "user-1", type: "user", text: "stale" }])
+      started()
+    }))
+  }
+  await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    yield* entry.effect(fx.ctx as any)
+    const stale = yield* Effect.forkChild(fx.hooks["execute.before"](fx.call("read", "root", "stale", { path: "/repo/a" })))
+    yield* Effect.promise(() => waiting)
+    yield* Queue.offer(queue, { type: "session.moved", data: { sessionID: "root", location: { directory: "/repo" }, projectID: "project" } })
+    yield* Effect.promise(() => new Promise<void>(resolve => setImmediate(resolve)))
+    release()
+    expect(Exit.isFailure(yield* Fiber.await(stale))).toBe(true)
+    expect(fx.requests.filter(r => r.path === "/api/v1/evaluate")).toHaveLength(0)
+    yield* fx.hooks["execute.before"](fx.call("read", "root", "fresh", { path: "/repo/b" }))
+    expect(fx.requests.filter(r => r.path === "/api/v1/evaluate")).toHaveLength(1)
+  })))
+})
