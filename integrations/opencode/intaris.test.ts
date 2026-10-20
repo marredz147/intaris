@@ -1154,6 +1154,8 @@ test("stale compaction lookup success or failure cannot erase a newly completed 
       yield* Effect.promise(() => started)
       yield* Queue.offer(queue, { type: "session.moved", data: { sessionID: "root", location: { directory: "/repo" }, projectID: "project" } })
       yield* Effect.promise(() => new Promise<void>(resolve => setImmediate(resolve)))
+      fx.setContext([{ id: "user-2", type: "user", text: "Fresh instruction" }])
+      yield* fx.hooks["execute.before"](fx.call("read", "root", "fresh-user", { path: "/repo/fresh" }))
       yield* fx.sessionHooks.compaction({ sessionID: "root" })
       yield* Queue.offer(queue, { type: "session.compaction.started", id: "evt_fresh", data: { sessionID: "root", reason: "auto" } })
       yield* Queue.offer(queue, { type: "session.compaction.ended", id: "evt_end", data: { sessionID: "root", reason: "auto", text: "summary" } })
@@ -1162,7 +1164,7 @@ test("stale compaction lookup success or failure cannot erase a newly completed 
       yield* Fiber.join(stale)
       fx.setContext([{ id: "msg_fresh", type: "compaction", status: "completed", summary: "not an instruction" }])
       yield* fx.hooks["execute.before"](fx.call("read", "root", "continued", { path: "/repo/b" }))
-      expect(fx.requests.filter(r => r.path === "/api/v1/evaluate")).toHaveLength(2)
+      expect(fx.requests.filter(r => r.path === "/api/v1/evaluate")).toHaveLength(3)
     })))
   }
 })
@@ -1263,6 +1265,158 @@ test("tool lookup begun before a move cannot evaluate its stale typed user conte
     expect(Exit.isFailure(yield* Fiber.await(stale))).toBe(true)
     expect(fx.requests.filter(r => r.path === "/api/v1/evaluate")).toHaveLength(0)
     yield* fx.hooks["execute.before"](fx.call("read", "root", "fresh", { path: "/repo/b" }))
+    expect(fx.requests.filter(r => r.path === "/api/v1/evaluate")).toHaveLength(1)
+  })))
+})
+
+for (const change of ["delivered user", "committed revert"] as const) {
+  test(`${change} revokes an in-flight old reasoning admission`, async () => {
+    const fx = fixture()
+    const queue = await Effect.runPromise(Queue.unbounded<any>())
+    ;(fx.ctx.event as any).subscribe = () => Stream.fromQueue(queue)
+    const base = globalThis.fetch
+    let reasoningStarted!: () => void
+    let releaseOld!: () => void
+    const started = new Promise<void>(resolve => { reasoningStarted = resolve })
+    let first = true
+    globalThis.fetch = (async (url: string, init: RequestInit) => {
+      if (new URL(url).pathname === "/api/v1/reasoning" && first) {
+        first = false
+        const response = await base(url, init)
+        reasoningStarted()
+        await new Promise<void>(resolve => { releaseOld = resolve })
+        return response
+      }
+      return base(url, init)
+    }) as typeof fetch
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      yield* entry.effect(fx.ctx as any)
+      const old = yield* Effect.forkChild(fx.hooks["execute.before"](fx.call("read", "root", "old", { path: "/repo/a" })))
+      yield* Effect.promise(() => started)
+      if (change === "delivered user") {
+        yield* Queue.offer(queue, { type: "session.inbox.enqueued", data: { sessionID: "root", inboxID: "user-2", item: { type: "user", payload: { text: "Fresh instruction" } } } })
+        yield* Queue.offer(queue, { type: "session.inbox.delivered", data: { sessionID: "root", inboxID: "user-2" } })
+      } else {
+        yield* Queue.offer(queue, { type: "session.revert.committed", data: { sessionID: "root", to: "msg_before_user" } })
+      }
+      yield* Effect.promise(() => new Promise<void>(resolve => setImmediate(resolve)))
+      releaseOld()
+      expect(Exit.isFailure(yield* Fiber.await(old))).toBe(true)
+      expect(fx.requests.filter(r => r.path === "/api/v1/evaluate")).toHaveLength(0)
+
+      yield* fx.sessionHooks.compaction({ sessionID: "root" })
+      yield* Queue.offer(queue, { type: "session.compaction.started", id: "evt_1", data: { sessionID: "root", reason: "auto" } })
+      yield* Queue.offer(queue, { type: "session.compaction.ended", id: "evt_end", data: { sessionID: "root", reason: "auto", text: "summary" } })
+      yield* Effect.promise(() => new Promise<void>(resolve => setImmediate(resolve)))
+      fx.setContext([{ id: "msg_1", type: "compaction", status: "completed", summary: "not a user" }])
+      expect(Exit.isFailure(yield* Effect.exit(fx.hooks["execute.before"](fx.call("read", "root", "summary", { path: "/repo/b" }))))).toBe(true)
+      expect(fx.requests.filter(r => r.path === "/api/v1/evaluate")).toHaveLength(0)
+
+      if (change === "committed revert") {
+        fx.setContext([{ id: "user-1", type: "user", text: "Run the requested work" }])
+        yield* fx.hooks["execute.before"](fx.call("read", "root", "same-id-retry", { path: "/repo/retry" }))
+        expect(fx.requests.filter(r => r.path === "/api/v1/reasoning")).toHaveLength(2)
+      }
+      fx.setContext([{ id: "user-2", type: "user", text: "Fresh instruction" }])
+      yield* fx.hooks["execute.before"](fx.call("read", "root", "fresh", { path: "/repo/c" }))
+      expect(fx.requests.filter(r => r.path === "/api/v1/evaluate")).toHaveLength(change === "committed revert" ? 2 : 1)
+    })))
+  })
+}
+
+test("reverting a cached V2 receipt requires another reasoning submission for the same native ID", async () => {
+  const fx = fixture()
+  const queue = await Effect.runPromise(Queue.unbounded<any>())
+  ;(fx.ctx.event as any).subscribe = () => Stream.fromQueue(queue)
+  await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    yield* entry.effect(fx.ctx as any)
+    yield* fx.hooks["execute.before"](fx.call("read", "root", "before", { path: "/repo/a" }))
+    yield* Queue.offer(queue, { type: "session.revert.committed", data: { sessionID: "root", to: "msg_before_user" } })
+    yield* Effect.promise(() => new Promise<void>(resolve => setImmediate(resolve)))
+    yield* fx.hooks["execute.before"](fx.call("read", "root", "after", { path: "/repo/b" }))
+    expect(fx.requests.filter(r => r.path === "/api/v1/reasoning")).toHaveLength(2)
+    expect(fx.requests.filter(r => r.path === "/api/v1/evaluate")).toHaveLength(2)
+  })))
+})
+
+test("revert during pending approval cannot grant CodeMode outer execution", async () => {
+  const fx = fixture()
+  const queue = await Effect.runPromise(Queue.unbounded<any>())
+  ;(fx.ctx.event as any).subscribe = () => Stream.fromQueue(queue)
+  const base = globalThis.fetch
+  let evaluating!: () => void
+  let release!: () => void
+  const started = new Promise<void>(resolve => { evaluating = resolve })
+  globalThis.fetch = (async (url: string, init: RequestInit) => {
+    if (new URL(url).pathname === "/api/v1/evaluate") {
+      evaluating()
+      await new Promise<void>(resolve => { release = resolve })
+    }
+    return base(url, init)
+  }) as typeof fetch
+  await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    yield* entry.effect(fx.ctx as any)
+    const outer = yield* Effect.forkChild(fx.hooks["execute.before"](fx.call()))
+    yield* Effect.promise(() => started)
+    yield* Queue.offer(queue, { type: "session.revert.committed", data: { sessionID: "root", to: "msg_before_user" } })
+    yield* Effect.promise(() => new Promise<void>(resolve => setImmediate(resolve)))
+    release()
+    expect(Exit.isFailure(yield* Fiber.await(outer))).toBe(true)
+    expect(fx.requests.filter(r => r.path === "/api/v1/evaluate")).toHaveLength(1)
+  })))
+})
+
+test("revoked CodeMode family cannot authorize nested calls after its outer approval", async () => {
+  const fx = fixture()
+  const queue = await Effect.runPromise(Queue.unbounded<any>())
+  ;(fx.ctx.event as any).subscribe = () => Stream.fromQueue(queue)
+  let approved!: () => void
+  let finish!: () => void
+  const ready = new Promise<void>(resolve => { approved = resolve })
+  const active = new Promise<void>(resolve => { finish = resolve })
+  await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    yield* entry.effect(fx.ctx as any)
+    const outer = fx.call()
+    const owner = yield* Effect.forkChild(Effect.gen(function* () {
+      yield* fx.hooks["execute.before"](outer)
+      approved()
+      yield* Effect.promise(() => active)
+    }))
+    yield* Effect.promise(() => ready)
+    yield* Queue.offer(queue, { type: "session.revert.committed", data: { sessionID: "root", to: "msg_before_user" } })
+    yield* Effect.promise(() => new Promise<void>(resolve => setImmediate(resolve)))
+    const nested = yield* Effect.forkChild(fx.hooks["execute.before"](fx.call("shell", "root", "call-1", { command: "pwd" })))
+    expect(Exit.isFailure(yield* Fiber.await(nested))).toBe(true)
+    expect(fx.requests.filter(r => r.path === "/api/v1/evaluate")).toHaveLength(1)
+    finish()
+    yield* Fiber.join(owner)
+  })))
+})
+
+test("suspension reactivation after revert cannot issue a second evaluation", async () => {
+  const fx = fixture({ decision: "deny", session_status: "suspended", call_id: "suspended", path: "fast", latency_ms: 1 })
+  const queue = await Effect.runPromise(Queue.unbounded<any>())
+  ;(fx.ctx.event as any).subscribe = () => Stream.fromQueue(queue)
+  const base = globalThis.fetch
+  let statusStarted!: () => void
+  let releaseStatus!: () => void
+  const started = new Promise<void>(resolve => { statusStarted = resolve })
+  globalThis.fetch = (async (url: string, init: RequestInit) => {
+    if (new URL(url).pathname === "/api/v1/session/oc-root" && init.method === "GET") {
+      statusStarted()
+      await new Promise<void>(resolve => { releaseStatus = resolve })
+      return Response.json({ status: "active" })
+    }
+    return base(url, init)
+  }) as typeof fetch
+  await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    yield* entry.effect(fx.ctx as any)
+    const call = yield* Effect.forkChild(fx.hooks["execute.before"](fx.call("read", "root", "suspended", { path: "/repo/a" })))
+    yield* Effect.promise(() => started)
+    yield* Queue.offer(queue, { type: "session.revert.committed", data: { sessionID: "root", to: "msg_before_user" } })
+    yield* Effect.promise(() => new Promise<void>(resolve => setImmediate(resolve)))
+    releaseStatus()
+    expect(Exit.isFailure(yield* Fiber.await(call))).toBe(true)
     expect(fx.requests.filter(r => r.path === "/api/v1/evaluate")).toHaveLength(1)
   })))
 })
