@@ -490,13 +490,16 @@ test("delivered user blocks compacted receipt; synthetic and manual compaction d
   })))
 })
 
-test("V2 recording submits exact native text directly; event failure cannot substitute an older user", async () => {
+test("V2 recording fence fails closed on upload failure and retries the same selected native user", async () => {
   process.env.INTARIS_SESSION_RECORDING = "true"
   process.env.INTARIS_RECORDING_FLUSH_SIZE = "1"
   const fx = fixture()
   fx.setEventStatus(503)
   await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
     yield* entry.effect(fx.ctx as any)
+    expect(Exit.isFailure(yield* Effect.exit(fx.hooks["execute.before"](fx.call("read", "root", "failed-u1", { path: "/repo/a" }))))).toBe(true)
+    expect(fx.requests.filter(r => r.path === "/api/v1/reasoning")).toHaveLength(0)
+    fx.setEventStatus(200)
     yield* fx.hooks["execute.before"](fx.call("read", "root", "u1", { path: "/repo/a" }))
     fx.setContext([{ id: "user-2", type: "user", text: "Latest explicit instruction" }])
     yield* fx.hooks["execute.before"](fx.call("read", "root", "u2", { path: "/repo/b" }))
@@ -505,7 +508,7 @@ test("V2 recording submits exact native text directly; event failure cannot subs
       "User message: Run the requested work", "User message: Latest explicit instruction",
     ])
     expect(reasoning.every(r => !r.body.from_events)).toBe(true)
-    expect(fx.requests.filter(r => r.path.endsWith("/events")).length).toBeGreaterThan(0)
+    expect(fx.requests.filter(r => r.path.endsWith("/events")).length).toBeGreaterThan(1)
     expect(fx.requests.filter(r => r.path === "/api/v1/evaluate")).toHaveLength(2)
   })))
 })
@@ -515,7 +518,6 @@ test("V2 no-op or invalid reasoning acknowledgement cannot evaluate or seed comp
   process.env.INTARIS_RECORDING_FLUSH_SIZE = "1"
   for (const response of [{ ok: true, call_id: "" }, { ok: false, call_id: "older" }, {}]) {
     const fx = fixture()
-    fx.setEventStatus(503)
     fx.setReasoning(response)
     const queue = await Effect.runPromise(Queue.unbounded<any>())
     ;(fx.ctx.event as any).subscribe = () => Stream.fromQueue(queue)
@@ -556,4 +558,453 @@ test("completed proof is revoked by move, revert, unknown delivery or event-proc
       expect(fx.requests.filter(r => r.path === "/api/v1/evaluate")).toHaveLength(2)
     })))
   }
+})
+
+test("V2 records the selected user before reasoning so its own recording cannot stale the intention", async () => {
+  process.env.INTARIS_SESSION_RECORDING = "true"
+  process.env.INTARIS_RECORDING_FLUSH_SIZE = "1"
+  const fx = fixture()
+  const base = globalThis.fetch
+  let releaseEvent!: () => void
+  let eventStarted!: () => void
+  let eventSettled!: () => void
+  const started = new Promise<void>(resolve => { eventStarted = resolve })
+  const settled = new Promise<void>(resolve => { eventSettled = resolve })
+  let latestUserSeq = 0
+  let intention = "old intention"
+  let observedSeq = -1
+  let submittedText = ""
+  let evaluations = 0
+  let deferredFirstUserBatch = false
+  globalThis.fetch = (async (url: string, init: RequestInit) => {
+    const path = new URL(url).pathname
+    if (path.endsWith("/events")) {
+      const events = JSON.parse(String(init.body)) as Array<{ type: string; data: { role?: string } }>
+      if (events.some(event => event.type === "message" && event.data.role === "user")) {
+        if (!deferredFirstUserBatch) {
+          deferredFirstUserBatch = true
+          eventStarted()
+          await new Promise<void>(resolve => { releaseEvent = resolve })
+        }
+        latestUserSeq++
+        eventSettled()
+      }
+    }
+    if (path === "/api/v1/reasoning") {
+      observedSeq = latestUserSeq // IntentionBarrier captures the durable user-message revision.
+      submittedText = JSON.parse(String(init.body)).content
+    }
+    if (path === "/api/v1/evaluate") {
+      evaluations++
+      await settled
+      if (observedSeq === latestUserSeq) intention = submittedText
+      return Response.json({ decision: intention === submittedText ? "approve" : "deny", call_id: "eval", path: "llm", latency_ms: 1 })
+    }
+    return base(url, init)
+  }) as typeof fetch
+  await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    yield* entry.effect(fx.ctx as any)
+    const call = yield* Effect.forkChild(fx.hooks["execute.before"](fx.call("read", "root", "ordered", { path: "/repo/a" })))
+    yield* Effect.promise(() => started)
+    const reasoningBeforeRecordingSettles = fx.requests.filter(r => r.path === "/api/v1/reasoning").length
+    releaseEvent()
+    const exit = yield* Fiber.await(call)
+    expect(reasoningBeforeRecordingSettles).toBe(0)
+    expect(Exit.isSuccess(exit)).toBe(true)
+    expect(observedSeq).toBe(latestUserSeq)
+    expect(observedSeq).toBeGreaterThan(0)
+    expect(intention).toBe("User message: Run the requested work")
+    expect(evaluations).toBe(1)
+  })))
+})
+
+test("concurrent V2 tools share a user reasoning submission; a duplicate late failure cannot poison its receipt", async () => {
+  const fx = fixture()
+  const base = globalThis.fetch
+  let releaseFirst!: () => void
+  let releaseDuplicate!: () => void
+  let firstStarted!: () => void
+  const started = new Promise<void>(resolve => { firstStarted = resolve })
+  let secondContextSeen!: () => void
+  const secondContext = new Promise<void>(resolve => { secondContextSeen = resolve })
+  const context = fx.ctx.session.context
+  let contextCalls = 0
+  fx.ctx.session.context = () => {
+    if (++contextCalls === 2) secondContextSeen()
+    return context()
+  }
+  let submissions = 0
+  globalThis.fetch = (async (url: string, init: RequestInit) => {
+    if (new URL(url).pathname === "/api/v1/reasoning") {
+      submissions++
+      if (submissions === 1) {
+        firstStarted()
+        await new Promise<void>(resolve => { releaseFirst = resolve })
+        return Response.json({ ok: true, call_id: "receipt-u1" })
+      }
+      await new Promise<void>(resolve => { releaseDuplicate = resolve })
+      return Response.json({ detail: "duplicate request failed" }, { status: 503 })
+    }
+    return base(url, init)
+  }) as typeof fetch
+  await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    yield* entry.effect(fx.ctx as any)
+    const first = yield* Effect.forkChild(fx.hooks["execute.before"](fx.call("read", "root", "parallel-1", { path: "/repo/a" })))
+    yield* Effect.promise(() => started)
+    const second = yield* Effect.forkChild(fx.hooks["execute.before"](fx.call("read", "root", "parallel-2", { path: "/repo/b" })))
+    yield* Effect.promise(() => secondContext)
+    yield* Effect.promise(() => new Promise<void>(resolve => queueMicrotask(resolve)))
+    releaseFirst()
+    const firstExit = yield* Fiber.await(first)
+    releaseDuplicate?.()
+    const secondExit = yield* Fiber.await(second)
+    const thirdExit = yield* Effect.exit(fx.hooks["execute.before"](fx.call("read", "root", "later", { path: "/repo/c" })))
+    expect(Exit.isSuccess(firstExit)).toBe(true)
+    expect(Exit.isSuccess(secondExit)).toBe(true)
+    expect(Exit.isSuccess(thirdExit)).toBe(true)
+    expect(submissions).toBe(1)
+    expect(fx.requests.filter(r => r.path === "/api/v1/evaluate")).toHaveLength(3)
+  })))
+})
+
+test("V2 user fence waits for an already-inflight earlier recording upload", async () => {
+  process.env.INTARIS_SESSION_RECORDING = "true"
+  process.env.INTARIS_RECORDING_FLUSH_SIZE = "1"
+  const fx = fixture()
+  const queue = await Effect.runPromise(Queue.unbounded<any>())
+  ;(fx.ctx.event as any).subscribe = () => Stream.fromQueue(queue)
+  const base = globalThis.fetch
+  let releasePrior!: () => void
+  let priorStarted!: () => void
+  const started = new Promise<void>(resolve => { priorStarted = resolve })
+  let sessionStarted!: () => void
+  const sessionReady = new Promise<void>(resolve => { sessionStarted = resolve })
+  const uploads: Array<Array<{ type: string; data: { role?: string } }>> = []
+  globalThis.fetch = (async (url: string, init: RequestInit) => {
+    if (new URL(url).pathname === "/api/v1/intention") sessionStarted()
+    if (new URL(url).pathname.endsWith("/events")) {
+      const events = JSON.parse(String(init.body)) as Array<{ type: string; data: { role?: string } }>
+      uploads.push(events)
+      if (uploads.length === 1) {
+        priorStarted()
+        await new Promise<void>(resolve => { releasePrior = resolve })
+      }
+    }
+    return base(url, init)
+  }) as typeof fetch
+  await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    yield* entry.effect(fx.ctx as any)
+    yield* Queue.offer(queue, { type: "session.created", durable: { aggregateID: "root" }, data: { title: "Session" } })
+    yield* Effect.promise(() => sessionReady)
+    yield* Queue.offer(queue, { type: "session.text.ended", data: { sessionID: "root", assistantMessageID: "assistant-previous", text: "previous" } })
+    yield* Effect.promise(() => started)
+    const call = yield* Effect.forkChild(fx.hooks["execute.before"](fx.call("read", "root", "after-inflight", { path: "/repo/a" })))
+    yield* Effect.promise(() => new Promise<void>(resolve => queueMicrotask(resolve)))
+    const beforePriorSettles = { uploads: uploads.length, reasoning: fx.requests.filter(r => r.path === "/api/v1/reasoning").length }
+    releasePrior()
+    expect(Exit.isSuccess(yield* Fiber.await(call))).toBe(true)
+    expect(beforePriorSettles).toEqual({ uploads: 1, reasoning: 0 })
+    expect(uploads.slice(1).flat().filter(event => event.type === "message" && event.data.role === "user").length).toBeGreaterThan(0)
+    expect(fx.requests.filter(r => r.path === "/api/v1/evaluate")).toHaveLength(1)
+  })))
+})
+
+test("newer U2 supersedes an in-flight U1 reasoning response without inheriting its receipt", async () => {
+  const fx = fixture()
+  const context = fx.ctx.session.context
+  let u2ContextSeen!: () => void
+  const u2Context = new Promise<void>(resolve => { u2ContextSeen = resolve })
+  let contextCalls = 0
+  fx.ctx.session.context = () => {
+    if (++contextCalls === 2) u2ContextSeen()
+    return context()
+  }
+  const base = globalThis.fetch
+  let releaseU1!: () => void
+  let u1Started!: () => void
+  const started = new Promise<void>(resolve => { u1Started = resolve })
+  globalThis.fetch = (async (url: string, init: RequestInit) => {
+    if (new URL(url).pathname === "/api/v1/reasoning") {
+      if (JSON.parse(String(init.body)).content === "User message: Run the requested work") {
+        u1Started()
+        await new Promise<void>(resolve => { releaseU1 = resolve })
+      }
+      return Response.json({ ok: true, call_id: "receipt" })
+    }
+    return base(url, init)
+  }) as typeof fetch
+  await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    yield* entry.effect(fx.ctx as any)
+    const u1 = yield* Effect.forkChild(fx.hooks["execute.before"](fx.call("read", "root", "u1", { path: "/repo/a" })))
+    yield* Effect.promise(() => started)
+    fx.setContext([{ id: "user-2", type: "user", text: "Newer instruction" }])
+    const u2 = yield* Effect.forkChild(fx.hooks["execute.before"](fx.call("read", "root", "u2", { path: "/repo/b" })))
+    yield* Effect.promise(() => u2Context)
+    yield* Effect.promise(() => new Promise<void>(resolve => queueMicrotask(resolve)))
+    releaseU1()
+    expect(Exit.isFailure(yield* Fiber.await(u1))).toBe(true)
+    expect(Exit.isSuccess(yield* Fiber.await(u2))).toBe(true)
+    expect(Exit.isSuccess(yield* Effect.exit(fx.hooks["execute.before"](fx.call("read", "root", "later", { path: "/repo/c" }))))).toBe(true)
+    expect(fx.requests.filter(r => r.path === "/api/v1/evaluate")).toHaveLength(2)
+  })))
+})
+
+test("cancelling one V2 tool does not cancel the shared user submission needed by another", async () => {
+  const fx = fixture()
+  const base = globalThis.fetch
+  let release!: () => void
+  let started!: () => void
+  const reasoningStarted = new Promise<void>(resolve => { started = resolve })
+  let submissions = 0
+  globalThis.fetch = (async (url: string, init: RequestInit) => {
+    if (new URL(url).pathname === "/api/v1/reasoning") {
+      submissions++
+      started()
+      await new Promise<void>(resolve => { release = resolve })
+      return Response.json({ ok: true, call_id: "receipt" })
+    }
+    return base(url, init)
+  }) as typeof fetch
+  await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    yield* entry.effect(fx.ctx as any)
+    const cancelled = yield* Effect.forkChild(fx.hooks["execute.before"](fx.call("read", "root", "cancel", { path: "/repo/a" })))
+    yield* Effect.promise(() => reasoningStarted)
+    const surviving = yield* Effect.forkChild(fx.hooks["execute.before"](fx.call("read", "root", "survive", { path: "/repo/b" })))
+    yield* Effect.promise(() => new Promise<void>(resolve => queueMicrotask(resolve)))
+    yield* Fiber.interrupt(cancelled)
+    release()
+    expect(Exit.isSuccess(yield* Fiber.await(surviving))).toBe(true)
+    expect(submissions).toBe(1)
+    expect(fx.requests.filter(r => r.path === "/api/v1/evaluate")).toHaveLength(1)
+  })))
+})
+
+test("a failed shared user submission releases ownership for an ordinary same-ID retry", async () => {
+  const fx = fixture()
+  fx.setReasoning({ ok: true, call_id: "" })
+  await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    yield* entry.effect(fx.ctx as any)
+    expect(Exit.isFailure(yield* Effect.exit(fx.hooks["execute.before"](fx.call("read", "root", "failed", { path: "/repo/a" }))))).toBe(true)
+    expect(fx.requests.filter(r => r.path === "/api/v1/evaluate")).toHaveLength(0)
+    fx.setReasoning({ ok: true, call_id: "receipt-u1" })
+    expect(Exit.isSuccess(yield* Effect.exit(fx.hooks["execute.before"](fx.call("read", "root", "retry", { path: "/repo/b" }))))).toBe(true)
+    expect(fx.requests.filter(r => r.path === "/api/v1/reasoning")).toHaveLength(2)
+    expect(fx.requests.filter(r => r.path === "/api/v1/evaluate")).toHaveLength(1)
+  })))
+})
+
+test("removed session cannot receive a late old admission receipt after same-ID recreation", async () => {
+  const fx = fixture()
+  const queue = await Effect.runPromise(Queue.unbounded<any>())
+  ;(fx.ctx.event as any).subscribe = () => Stream.fromQueue(queue)
+  const base = globalThis.fetch
+  let releaseOld!: () => void
+  let oldStarted!: () => void
+  let deleted!: () => void
+  const started = new Promise<void>(resolve => { oldStarted = resolve })
+  const removed = new Promise<void>(resolve => { deleted = resolve })
+  let submissions = 0
+  globalThis.fetch = (async (url: string, init: RequestInit) => {
+    const path = new URL(url).pathname
+    if (path === "/api/v1/reasoning") {
+      if (++submissions === 1) {
+        oldStarted()
+        await new Promise<void>(resolve => { releaseOld = resolve })
+      }
+      return Response.json({ ok: true, call_id: `receipt-${submissions}` })
+    }
+    if (path === "/api/v1/session/oc-root/agent-summary") deleted()
+    return base(url, init)
+  }) as typeof fetch
+  await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    yield* entry.effect(fx.ctx as any)
+    const old = yield* Effect.forkChild(fx.hooks["execute.before"](fx.call("read", "root", "old", { path: "/repo/a" })))
+    yield* Effect.promise(() => started)
+    yield* Queue.offer(queue, { type: "session.deleted", data: { sessionID: "root" } })
+    yield* Effect.promise(() => removed)
+    yield* Effect.promise(() => new Promise<void>(resolve => queueMicrotask(resolve)))
+    const fresh = yield* Effect.forkChild(fx.hooks["execute.before"](fx.call("read", "root", "fresh", { path: "/repo/b" })))
+    yield* Effect.promise(() => new Promise<void>(resolve => setImmediate(resolve)))
+    expect(submissions).toBe(1)
+    releaseOld()
+    expect(Exit.isFailure(yield* Fiber.await(old))).toBe(true)
+    expect(Exit.isSuccess(yield* Fiber.await(fresh))).toBe(true)
+    expect(submissions).toBe(2)
+    expect(fx.requests.filter(r => r.path === "/api/v1/evaluate")).toHaveLength(1)
+  })))
+})
+
+test("replacement admission waits for retired session's already-issued user recording", async () => {
+  process.env.INTARIS_SESSION_RECORDING = "true"
+  process.env.INTARIS_RECORDING_FLUSH_SIZE = "1"
+  const fx = fixture()
+  const queue = await Effect.runPromise(Queue.unbounded<any>())
+  ;(fx.ctx.event as any).subscribe = () => Stream.fromQueue(queue)
+  const base = globalThis.fetch
+  let releaseOld!: () => void
+  let oldStarted!: () => void
+  let removed!: () => void
+  const started = new Promise<void>(resolve => { oldStarted = resolve })
+  const deleted = new Promise<void>(resolve => { removed = resolve })
+  let userSeq = 0
+  let expectedSeq = -1
+  let reasoningText = ""
+  let refreshed = "old intention"
+  const reasoning: string[] = []
+  let newUserUploads = 0
+  globalThis.fetch = (async (url: string, init: RequestInit) => {
+    const path = new URL(url).pathname
+    if (path.endsWith("/events")) {
+      const events = JSON.parse(String(init.body)) as Array<{ type: string; data: { role?: string; messageID?: string } }>
+      for (const event of events) {
+        if (event.type !== "message" || event.data.role !== "user") continue
+        if (event.data.messageID === "user-2") newUserUploads++
+        if (event.data.messageID === "user-1" && !releaseOld) {
+          oldStarted()
+          await new Promise<void>(resolve => { releaseOld = resolve })
+        }
+        userSeq++
+      }
+    }
+    if (path === "/api/v1/reasoning") {
+      reasoningText = JSON.parse(String(init.body)).content
+      reasoning.push(reasoningText)
+      expectedSeq = userSeq
+    }
+    if (path === "/api/v1/evaluate") {
+      if (expectedSeq === userSeq) refreshed = reasoningText
+      return Response.json({ decision: refreshed === reasoningText ? "approve" : "deny", call_id: "eval", path: "llm", latency_ms: 1 })
+    }
+    if (path === "/api/v1/session/oc-root/agent-summary") removed()
+    return base(url, init)
+  }) as typeof fetch
+  await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    yield* entry.effect(fx.ctx as any)
+    const old = yield* Effect.forkChild(fx.hooks["execute.before"](fx.call("read", "root", "old", { path: "/repo/a" })))
+    yield* Effect.promise(() => started)
+    yield* Queue.offer(queue, { type: "session.deleted", data: { sessionID: "root" } })
+    yield* Effect.promise(() => deleted)
+    yield* Effect.promise(() => new Promise<void>(resolve => queueMicrotask(resolve)))
+    fx.setContext([{ id: "user-2", type: "user", text: "New instruction" }])
+    const fresh = yield* Effect.forkChild(fx.hooks["execute.before"](fx.call("read", "root", "fresh", { path: "/repo/b" })))
+    yield* Effect.promise(() => new Promise<void>(resolve => setImmediate(resolve)))
+    const beforeOldSettles = { reasoning: reasoning.length, uploads: newUserUploads }
+    releaseOld()
+    expect(Exit.isFailure(yield* Fiber.await(old))).toBe(true)
+    expect(Exit.isSuccess(yield* Fiber.await(fresh))).toBe(true)
+    expect(beforeOldSettles).toEqual({ reasoning: 0, uploads: 0 })
+    expect(reasoning).toEqual(["User message: New instruction"])
+    expect(refreshed).toBe("User message: New instruction")
+    expect(expectedSeq).toBe(userSeq)
+  })))
+})
+
+test("child completion uploads its final buffered recording before retiring the state", async () => {
+  process.env.INTARIS_SESSION_RECORDING = "true"
+  process.env.INTARIS_RECORDING_FLUSH_SIZE = "50"
+  const fx = fixture()
+  const queue = await Effect.runPromise(Queue.unbounded<any>())
+  ;(fx.ctx.event as any).subscribe = () => Stream.fromQueue(queue)
+  const base = globalThis.fetch
+  const uploaded: any[] = []
+  let finished!: () => void
+  const completion = new Promise<void>(resolve => { finished = resolve })
+  globalThis.fetch = (async (url: string, init: RequestInit) => {
+    const path = new URL(url).pathname
+    if (path === "/api/v1/session/oc-child/events") {
+      uploaded.push(...JSON.parse(String(init.body)))
+    }
+    if (path === "/api/v1/session/oc-child/agent-summary") finished()
+    return base(url, init)
+  }) as typeof fetch
+  await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    yield* entry.effect(fx.ctx as any)
+    const call = fx.call("read", "child", "last", { path: "/repo/a" })
+    yield* fx.hooks["execute.before"](call)
+    yield* fx.hooks["execute.after"]({ ...call, status: "completed", result: { output: "done" } })
+    yield* Queue.offer(queue, { type: "session.execution.succeeded", data: { sessionID: "child" } })
+    yield* Effect.promise(() => completion)
+    yield* Effect.promise(() => new Promise<void>(resolve => queueMicrotask(resolve)))
+    expect(uploaded.some(event => event.type === "tool_call")).toBe(true)
+    expect(uploaded.some(event => event.type === "tool_result")).toBe(true)
+  })))
+})
+
+test("retired idle-resume cannot record its old user into a replacement's active intention", async () => {
+  process.env.INTARIS_SESSION_RECORDING = "true"
+  process.env.INTARIS_RECORDING_FLUSH_SIZE = "1"
+  const fx = fixture()
+  const queue = await Effect.runPromise(Queue.unbounded<any>())
+  ;(fx.ctx.event as any).subscribe = () => Stream.fromQueue(queue)
+  const base = globalThis.fetch
+  let idleSeen!: () => void
+  let resumeSeen!: () => void
+  let releaseResume!: () => void
+  let deleted!: () => void
+  let newerReasoningSeen!: () => void
+  let releaseNewer!: () => void
+  const idle = new Promise<void>(resolve => { idleSeen = resolve })
+  const resuming = new Promise<void>(resolve => { resumeSeen = resolve })
+  const removed = new Promise<void>(resolve => { deleted = resolve })
+  const newerReasoning = new Promise<void>(resolve => { newerReasoningSeen = resolve })
+  let userSeq = 0
+  let expectedSeq = -1
+  let latestIntention = "old intention"
+  let proposed = ""
+  let lateOldRecords = 0
+  globalThis.fetch = (async (url: string, init: RequestInit) => {
+    const path = new URL(url).pathname
+    const body = init.body ? JSON.parse(String(init.body)) : null
+    if (path.endsWith("/events")) {
+      for (const event of body as Array<{ type: string; data: { role?: string; messageID?: string } }>) {
+        if (event.type === "message" && event.data.role === "user") {
+          if (event.data.messageID === "user-old") lateOldRecords++
+          userSeq++
+        }
+      }
+    }
+    if (path === "/api/v1/session/oc-root/status" && body.status === "idle") idleSeen()
+    if (path === "/api/v1/session/oc-root/status" && body.status === "active") {
+      resumeSeen()
+      await new Promise<void>(resolve => { releaseResume = resolve })
+    }
+    if (path === "/api/v1/session/oc-root/agent-summary") deleted()
+    if (path === "/api/v1/reasoning") {
+      expectedSeq = userSeq
+      proposed = body.content
+      if (body.content === "User message: New instruction") {
+        newerReasoningSeen()
+        await new Promise<void>(resolve => { releaseNewer = resolve })
+      }
+    }
+    if (path === "/api/v1/evaluate") {
+      if (expectedSeq === userSeq) latestIntention = proposed
+      return Response.json({ decision: latestIntention === proposed ? "approve" : "deny", call_id: "eval", path: "llm", latency_ms: 1 })
+    }
+    return base(url, init)
+  }) as typeof fetch
+  await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    yield* entry.effect(fx.ctx as any)
+    yield* fx.hooks["execute.before"](fx.call("read", "root", "baseline", { path: "/repo/a" }))
+    yield* Queue.offer(queue, { type: "session.execution.succeeded", data: { sessionID: "root" } })
+    yield* Effect.promise(() => idle)
+    fx.setContext([{ id: "user-old", type: "user", text: "Superseded instruction" }])
+    const old = yield* Effect.forkChild(fx.hooks["execute.before"](fx.call("read", "root", "old", { path: "/repo/b" })))
+    yield* Effect.promise(() => resuming)
+    yield* Queue.offer(queue, { type: "session.deleted", data: { sessionID: "root" } })
+    yield* Effect.promise(() => removed)
+    yield* Effect.promise(() => new Promise<void>(resolve => queueMicrotask(resolve)))
+    fx.setContext([{ id: "user-new", type: "user", text: "New instruction" }])
+    const fresh = yield* Effect.forkChild(fx.hooks["execute.before"](fx.call("read", "root", "new", { path: "/repo/c" })))
+    yield* Effect.promise(() => newerReasoning)
+    releaseResume()
+    expect(Exit.isFailure(yield* Fiber.await(old))).toBe(true)
+    yield* Effect.promise(() => new Promise<void>(resolve => setImmediate(resolve)))
+    const oldRecordsAfterNewReasoning = lateOldRecords
+    releaseNewer()
+    expect(Exit.isSuccess(yield* Fiber.await(fresh))).toBe(true)
+    expect(oldRecordsAfterNewReasoning).toBe(0)
+    expect(latestIntention).toBe("User message: New instruction")
+    expect(expectedSeq).toBe(userSeq)
+  })))
 })

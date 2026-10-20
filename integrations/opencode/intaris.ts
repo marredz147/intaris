@@ -69,8 +69,13 @@ interface SessionState {
   pendingUserMessageId: string | null
   pendingUserText: string
   reasoningSentForMessageId: string | null
+  v2Admission?: { id: string; text: string; promise: Promise<void>; predecessor: Promise<void>; controller: AbortController; waiters: number; startedWork: boolean }
+  v2SelectedUserID?: string
+  v2AdmissionTail: Promise<void>
   // Recording buffer
   recordingBuffer: RecordingEvent[]
+  recordingTail: Promise<void>
+  recordingFailed: boolean
   toolCallAuditIds: Map<string, string>
 }
 
@@ -90,6 +95,7 @@ const IntarisPlugin = async (
     onDispose: (dispose: () => void) => void
     onStateRemoved: (id: string) => void
     onReceiptLookup: (lookup: (id: string, messageID: string) => boolean) => void
+    onAdmission: (admit: (id: string, messageID: string, text: string, signal: AbortSignal, prepare: (current: () => boolean) => Promise<void>) => Promise<void>) => void
   },
 ) => {
   // -- Configuration --------------------------------------------------------
@@ -133,9 +139,18 @@ const IntarisPlugin = async (
   const MAX_SESSIONS = 100
   const MAX_RECENT_TOOLS = 10
   const sessions = new Map<string, SessionState>()
+  const sessionIO = new Map<string, Promise<void>>()
+  function retainIO(sessionId: string, request: Promise<unknown>): void {
+    const earlier = sessionIO.get(sessionId) || Promise.resolve()
+    const fence = Promise.all([earlier, request]).then(() => {}, () => {})
+    sessionIO.set(sessionId, fence)
+    void fence.then(() => { if (sessionIO.get(sessionId) === fence) sessionIO.delete(sessionId) })
+  }
+  let disposed = false
+  options?.onDispose(() => { disposed = true; sessions.clear() })
   options?.onReceiptLookup((id, messageID) => {
     const state = sessions.get(id)
-    return !!state && !state.reasoningError && state.reasoningSentForMessageId === messageID
+    return !!state && state.v2SelectedUserID === messageID && !state.reasoningError && state.reasoningSentForMessageId === messageID
       && (!state.pendingUserMessageId || state.pendingUserMessageId === messageID)
   })
   type ResolvedSession = { directory: string; parentID?: string; title?: string; agent?: string }
@@ -439,7 +454,10 @@ const IntarisPlugin = async (
         pendingUserMessageId: null,
         pendingUserText: "",
         reasoningSentForMessageId: null,
+        v2AdmissionTail: sessionIO.get(sessionId) || Promise.resolve(),
         recordingBuffer: [],
+        recordingTail: sessionIO.get(sessionId) || Promise.resolve(),
+        recordingFailed: false,
         toolCallAuditIds: new Map(),
       }
       sessions.set(sessionId, state)
@@ -659,8 +677,10 @@ const IntarisPlugin = async (
       sessionID?: string
     },
     v2 = false,
+    isCurrent?: () => boolean,
   ): Promise<void> {
     if (!state.intarisSessionId || !userText) return
+    if (v2 && !isCurrent?.()) throw new Error("[intaris] User admission superseded")
 
     const effectiveMessageId = messageId || input?.messageID || null
     if (effectiveMessageId && state.reasoningSentForMessageId === effectiveMessageId) {
@@ -698,13 +718,7 @@ const IntarisPlugin = async (
       // the events being persisted server-side.
       if (state.intarisSessionId && state.recordingBuffer.length > 0) {
         const events = state.recordingBuffer.splice(0)
-        await callApi(
-          "POST",
-          `/api/v1/session/${encodeURIComponent(state.intarisSessionId)}/events`,
-          events,
-          5000,
-          { "X-Intaris-Source": "opencode" },
-        ).catch(() => {})
+        await uploadRecording(sessionId, state, events).catch(() => {})
       }
 
       reasoningResult = await callApi(
@@ -720,7 +734,19 @@ const IntarisPlugin = async (
     } else {
       // V2 submits the selected native user's text directly: event-store
       // resolution can acknowledge an older message (or return a 200 no-op).
-      reasoningResult = await callApi(
+      if (v2) {
+        recordEvent(sessionId, {
+          type: "message",
+          data: {
+            role: "user", text: userText, agent: input?.agent, model: input?.model,
+            messageID: effectiveMessageId, sessionID: input?.sessionID || sessionId,
+          },
+        })
+        if (!await flushRecordingBuffer(sessionId) || !isCurrent?.()) {
+          throw new Error("[intaris] User recording not settled; retry the user instruction")
+        }
+      }
+      const request = callApi(
         "POST",
         "/api/v1/reasoning",
         {
@@ -730,8 +756,10 @@ const IntarisPlugin = async (
         },
         30000,
       )
+      if (v2) retainIO(sessionId, request)
+      reasoningResult = await request
 
-      recordEvent(sessionId, {
+      if (!v2) recordEvent(sessionId, {
         type: "message",
         data: {
           role: "user",
@@ -743,6 +771,8 @@ const IntarisPlugin = async (
         },
       })
     }
+
+    if (v2 && !isCurrent?.()) throw new Error("[intaris] User admission superseded")
 
     if (reasoningResult.error || (v2 && (reasoningResult.data?.ok !== true
       || typeof reasoningResult.data.call_id !== "string" || !reasoningResult.data.call_id.trim()))) {
@@ -763,6 +793,53 @@ const IntarisPlugin = async (
     state.pendingUserMessageId = null
     state.pendingUserText = ""
   }
+
+  options?.onAdmission((sessionId, messageID, text, signal, prepare) => {
+    const state = getOrCreateState(sessionId)
+    const join = (admission: NonNullable<SessionState["v2Admission"]>) => {
+      admission.waiters++
+      const cancel = () => {
+        admission.waiters--
+        if (admission.waiters === 0 && !admission.startedWork && state.v2Admission === admission) {
+          state.v2Admission = undefined
+          state.v2AdmissionTail = admission.predecessor
+          admission.controller.abort()
+        }
+      }
+      signal.addEventListener("abort", cancel, { once: true })
+      if (signal.aborted) cancel()
+      void admission.promise.finally(() => signal.removeEventListener("abort", cancel)).catch(() => {})
+      return admission.promise
+    }
+    if (state.v2Admission?.id === messageID && state.v2Admission.text === text) return join(state.v2Admission)
+    state.v2SelectedUserID = messageID
+    if (!state.reasoningError && state.reasoningSentForMessageId === messageID) return Promise.resolve()
+
+    const controller = new AbortController()
+    let admission: NonNullable<SessionState["v2Admission"]>
+    const current = () => !disposed && sessions.get(sessionId) === state && state.v2SelectedUserID === messageID
+      && state.v2Admission === admission && !controller.signal.aborted
+    const previous = state.v2AdmissionTail
+    const promise = previous.then(async () => {
+      if (!current()) throw new Error("[intaris] User admission superseded")
+      if (!await ensureSession(sessionId, state, controller.signal) || !current()) throw new Error("[intaris] User admission unavailable")
+      admission.startedWork = true
+      state.recordingFailed = false
+      await prepare(current)
+      if (!current()) throw new Error("[intaris] User admission superseded")
+      state.pendingUserMessageId = messageID
+      state.pendingUserText = text
+      await forwardUserReasoning(sessionId, state, text, messageID, undefined, true, current)
+      if (!current() || state.reasoningError || state.reasoningSentForMessageId !== messageID) {
+        throw new Error("[intaris] User intention submission failed; provide a fresh user instruction")
+      }
+    })
+    admission = { id: messageID, text, promise, predecessor: previous, controller, waiters: 0, startedWork: false }
+    state.v2Admission = admission
+    state.v2AdmissionTail = promise.then(() => {}, () => {})
+    void promise.finally(() => { if (state.v2Admission === admission) state.v2Admission = undefined }).catch(() => {})
+    return join(admission)
+  })
 
   // -- Recording Helpers ---------------------------------------------------
 
@@ -786,38 +863,34 @@ const IntarisPlugin = async (
     }
   }
 
-  /**
-   * Flush the recording buffer for a session (fire-and-forget).
-   * Sends buffered events to POST /session/{id}/events.
-   */
-  function flushRecordingBuffer(sessionId: string): void {
-    const state = sessions.get(sessionId)
-    if (!state?.intarisSessionId) return
-    if (state.recordingBuffer.length === 0) return
-
-    // Drain the buffer
-    const events = state.recordingBuffer.splice(0)
-
-    callApi(
-      "POST",
-      `/api/v1/session/${encodeURIComponent(state.intarisSessionId)}/events`,
-      events,
-      5000,
-      { "X-Intaris-Source": "opencode" },
-    ).then(({ error, status }) => {
-      if (error) {
-        client.app
-          .log({
-            body: {
-              service: "intaris",
-              level: "warn",
-              message: `Recording flush failed for ${state!.intarisSessionId}: ${error} (HTTP ${status})`,
-              extra: { eventCount: events.length },
-            },
-          })
-          .catch(() => {})
+  function uploadRecording(sessionId: string, state: SessionState, events: RecordingEvent[]): Promise<void> {
+    const upload = state.recordingTail.then(async () => {
+      if (!state.intarisSessionId) {
+        state.recordingFailed = true
+        return
       }
-    }).catch(() => {})
+      const { error, status } = await callApi(
+        "POST", `/api/v1/session/${encodeURIComponent(state.intarisSessionId)}/events`,
+        events, 5000, { "X-Intaris-Source": "opencode" },
+      )
+      if (error) {
+        state.recordingFailed = true
+        client.app.log({ body: { service: "intaris", level: "warn",
+          message: `Recording flush failed for ${state.intarisSessionId}: ${error} (HTTP ${status})`,
+          extra: { eventCount: events.length } } }).catch(() => {})
+      }
+    })
+    state.recordingTail = upload.catch(() => { state.recordingFailed = true })
+    retainIO(sessionId, state.recordingTail)
+    return state.recordingTail
+  }
+
+  /** Flush buffered recording through the same ordered chain as earlier uploads. */
+  function flushRecordingBuffer(sessionId: string): Promise<boolean> {
+    const state = sessions.get(sessionId)
+    if (!state?.intarisSessionId) return Promise.resolve(false)
+    if (state.recordingBuffer.length > 0) void uploadRecording(sessionId, state, state.recordingBuffer.splice(0))
+    return state.recordingTail.then(() => !state.recordingFailed && !disposed && sessions.get(sessionId) === state)
   }
 
   // Periodic recording flush timer (flushes all sessions)
@@ -1246,6 +1319,7 @@ const IntarisPlugin = async (
           state.pendingUserMessageId = info.id
           state.pendingUserText = state.recentMessageText.get(info.id) || ""
           await resumeSessionIfIdle(state).catch(() => {})
+          if (options && (disposed || sessions.get(sessionId) !== state)) return
         } else if (info.role === "assistant") {
           const latestText = state.recentMessageText.get(info.id)
           if (latestText) {
@@ -1306,7 +1380,7 @@ const IntarisPlugin = async (
       // In web mode, chat.message does not fire. The event stream still
       // captures the user's message parts, so forward them here before the
       // first tool call to keep intention tracking and recording intact.
-      if (state.pendingUserText) {
+      if (!input.userMessageID && state.pendingUserText) {
         await forwardUserReasoning(
           sessionID,
           state,
@@ -1316,7 +1390,7 @@ const IntarisPlugin = async (
           !!input.userMessageID,
         )
       }
-      if (input.userMessageID && (state.reasoningError
+      if (input.userMessageID && (state.v2SelectedUserID !== input.userMessageID || state.reasoningError
         || state.reasoningSentForMessageId !== input.userMessageID
         || (state.pendingUserMessageId && state.pendingUserMessageId !== input.userMessageID))) {
         throw new Error("[intaris] User intention submission failed; provide a fresh user instruction")
@@ -1645,6 +1719,7 @@ export default {
     const compactions = new Map<string, { checkpointID?: string; candidateID?: string; prepared: boolean; invalid: boolean }>()
     const revoke = (id: string) => { proofs.delete(id); compactions.delete(id) }
     let acknowledgedUser = (_id: string, _messageID: string) => false
+    let admitUser = (_id: string, _messageID: string, _text: string, _signal: AbortSignal, _prepare: (current: () => boolean) => Promise<void>): Promise<void> => Promise.reject(new Error("[intaris] User admission unavailable"))
     const key = (call: Call) => `${call.sessionID}\0${call.messageID}\0${call.id}`
     const client = {
       app: { log: async () => ({}) },
@@ -1664,9 +1739,10 @@ export default {
             title: info.title,
             agent: info.agent,
           })),
-          onDispose: cleanup => { dispose = cleanup },
+          onDispose: cleanup => { const prior = dispose; dispose = () => { prior(); cleanup() } },
           onStateRemoved: id => { seenUsers.delete(id); deliveredUsers.delete(id); inbox.delete(id); revoke(id) },
           onReceiptLookup: lookup => { acknowledgedUser = lookup },
+          onAdmission: admit => { admitUser = admit },
         },
       ))
       yield* Effect.addFinalizer(() => Effect.sync(() => { dispose(); families.clear(); deliveredUsers.clear(); inbox.clear(); proofs.clear(); compactions.clear() }))
@@ -1754,12 +1830,20 @@ export default {
               proofs.delete(event.sessionID)
               throw new Error("[intaris] No admitted user context; provide a fresh user instruction")
             }
-            if (user?.type === "user" && seenUsers.get(event.sessionID) !== user.id) {
-              await hooks.event({ event: { type: "message.updated", properties: { info: { sessionID: event.sessionID, id: user.id, role: "user" } } } })
+            if (user?.type === "user") {
+              // Install ownership before any event or network await; other tools
+              // for this native ID join the same recording/reasoning operation.
+              const admission = admitUser(event.sessionID, user.id, user.text, signal, async current => {
+                if (seenUsers.get(event.sessionID) === user.id) return
+                if (!current()) throw new Error("[intaris] User admission superseded")
+                await hooks.event({ event: { type: "message.updated", properties: { info: { sessionID: event.sessionID, id: user.id, role: "user" } } } })
+                if (!current()) throw new Error("[intaris] User admission superseded")
+                await hooks.event({ event: { type: "message.part.updated", properties: { part: { sessionID: event.sessionID, messageID: user.id, type: "text", text: user.text } } } })
+                if (!current()) throw new Error("[intaris] User admission superseded")
+                seenUsers.set(event.sessionID, user.id)
+              })
+              await admission
               checkLive()
-              await hooks.event({ event: { type: "message.part.updated", properties: { part: { sessionID: event.sessionID, messageID: user.id, type: "text", text: user.text } } } })
-              checkLive()
-              seenUsers.set(event.sessionID, user.id)
             }
             const args = input !== null && typeof input === "object" && !Array.isArray(input)
               ? { ...(input as Record<string, unknown>) }
