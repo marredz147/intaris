@@ -70,6 +70,46 @@ cp intaris.ts .opencode/plugins/
 
 Local plugins are loaded automatically -- no config entry needed.
 
+#### OpenCode V1 and V2
+
+Supports OpenCode V1 **1.18.29 or later** and V2 **2.0.0 or later**, within each
+major version. Install only one copy. From this directory:
+
+```bash
+bun install --frozen-lockfile
+bun run typecheck
+bun run test
+bun run build:v1
+bun run build:v2
+```
+
+V1 uses `intaris.ts` or `dist/v1/intaris.js`. V2 uses the **directory** `dist/v2`
+(entry `index.js`); keep it in this checkout so the pinned runtime dependencies
+resolve from `node_modules`. A copied `index.js` alone is not standalone.
+Add the directory to V2's `opencode.jsonc`:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": ["/path/to/intaris/integrations/opencode/dist/v2"],
+}
+```
+
+V2 evaluates `shell` as `bash`. User text is acknowledged before tool evaluation,
+not before model dispatch; recording uploads must succeed first when enabled.
+Compacted continuation requires an observed successful native checkpoint for an
+acknowledged user; otherwise provide fresh input. Summaries alone grant no authority.
+
+CodeMode evaluates the outer `execute` once and shares approval with matching
+nested calls. **Nested per-tool deny rules and critical patterns are not re-checked.**
+Keep native role-specific permissions; this is not a sandbox and does not guard
+separate HTTP requests. Outer execution always fails closed.
+
+An observed session move blocks that native ID until plugin reload: start a new
+native session in the target directory. On reuse, V2 verifies the persisted project
+directory and rejects mismatches or verification failures. Reload loses move history;
+this check detects a stale persisted boundary, not every historical move.
+
 ### 3. Verify
 
 Run OpenCode with `--print-logs` and look for:
@@ -104,6 +144,9 @@ Configure upstream MCP servers in Intaris (via the UI, REST API, or `MCP_CONFIG_
 See `opencode.json` in this directory for a complete example.
 
 ## Disabling OpenCode's Built-in Approvals
+
+The following permission guidance is for V1. For V2 CodeMode, retain native
+role-specific permissions as described above.
 
 OpenCode has its own permission system that prompts for approval on certain actions (e.g., `external_directory` prompts when tools access paths outside the working directory). When using the Intaris plugin, this creates **double prompting** -- OpenCode asks first, then Intaris evaluates.
 
