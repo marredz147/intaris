@@ -36,10 +36,50 @@ test('Audit backend labels use persisted routes without guessing old or fast pat
   }
   for (const record of [null, {}, { evaluation_path: 'llm' },
     { evaluation_path: 'llm', evaluation_metadata: null },
+    { evaluation_path: 'llm', evaluation_metadata: { backend_provenance: { final_model: 'decisions-model' } } },
+    ...['reasoning', 'checkpoint', 'summary'].map(record_type => ({ record_type,
+      evaluation_path: 'llm', evaluation_metadata: { backend_provenance: { route: 'decisions' } },
+    })),
+    { source: 'event', evaluation_path: 'llm', evaluation_metadata: { backend_provenance: { route: 'decisions' } } },
     ...['fast', 'critical'].map(evaluation_path => ({ evaluation_path,
       evaluation_metadata: { backend_provenance: { route: 'decisions' } },
     })),
   ]) assert.equal(tab.backendLabel(record), '');
+});
+
+test('Audit explains forwarding without displaying provider diagnostic text', () => {
+  const tab = ui().auditTab();
+  for (const [code, expected] of [
+    ['low_confidence', 'Low confidence in the Decisions assessment.'],
+    ['temporary_unavailable', 'Decisions was temporarily unavailable.'],
+    ['optional_escalation', 'Optional review of a Decisions escalation.'],
+    ['<img src=x onerror=alert(1)>', ''],
+    ['constructor', ''],
+  ]) {
+    const record = { evaluation_path: 'llm', evaluation_metadata: { backend_provenance: {
+      route: 'decisions_to_llm', final_backend: 'llm',
+      fallback_reason: { code, message: '<script>unsafe()</script>' },
+    } } };
+    assert.equal(tab.backendReviewReason(record), expected);
+  }
+  assert.equal(tab.backendReviewReason({ evaluation_path: 'llm' }), '');
+});
+
+test('Failed optional LLM review labels the retained Decisions result truthfully', () => {
+  const tab = ui().auditTab();
+  const provenance = { route: 'decisions_to_llm', final_backend: 'decisions',
+    fallback_reason: { code: 'optional_escalation' }, attempts: [
+      { backend: 'decisions', status: 'completed' }, { backend: 'llm', status: 'failed' },
+    ],
+  };
+  const record = { evaluation_path: 'alignment', evaluation_metadata: { backend_provenance: provenance } };
+  assert.equal(tab.backendLabel(record), 'Decisions');
+  assert.equal(tab.backendReviewReason(record),
+    'Optional review of a Decisions escalation. LLM review failed; Decisions result retained.');
+  provenance.final_backend = 'llm';
+  provenance.attempts[1].status = 'completed';
+  assert.equal(tab.backendLabel(record), 'Decisions → LLM');
+  assert.equal(tab.backendReviewReason(record), 'Optional review of a Decisions escalation.');
 });
 
 test('Live Audit rows fetch persisted backend provenance after evaluation', async () => {

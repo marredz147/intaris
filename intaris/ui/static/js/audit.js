@@ -297,13 +297,30 @@ function auditTab() {
 
     backendLabel(record) {
       if (!['llm', 'alignment'].includes(record?.evaluation_path)) return '';
-      const route = record.evaluation_metadata?.backend_provenance?.route;
-      switch (route) {
+      if (record.source === 'event' || (record.record_type && record.record_type !== 'tool_call')) return '';
+      const provenance = record.evaluation_metadata?.backend_provenance;
+      switch (provenance?.route) {
         case 'llm': return 'LLM';
         case 'decisions': return 'Decisions';
-        case 'decisions_to_llm': return 'Decisions → LLM';
+        case 'decisions_to_llm':
+          return provenance.final_backend === 'decisions' ? 'Decisions' : 'Decisions → LLM';
         default: return '';
       }
+    },
+
+    backendReviewReason(record) {
+      if (!this.backendLabel(record)) return '';
+      const provenance = record.evaluation_metadata.backend_provenance;
+      const reasons = {
+        low_confidence: 'Low confidence in the Decisions assessment.',
+        temporary_unavailable: 'Decisions was temporarily unavailable.',
+        optional_escalation: 'Optional review of a Decisions escalation.',
+      };
+      const code = provenance.fallback_reason?.code;
+      const reason = Object.hasOwn(reasons, code) ? reasons[code] : '';
+      const failedReview = provenance.final_backend === 'decisions'
+        && provenance.attempts?.some(attempt => attempt.backend === 'llm' && attempt.status === 'failed');
+      return [reason, failedReview ? 'LLM review failed; Decisions result retained.' : ''].filter(Boolean).join(' ');
     },
 
     recordTypeBadgeClass(type) {
