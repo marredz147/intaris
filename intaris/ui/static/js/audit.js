@@ -88,6 +88,8 @@ function auditTab() {
           ),
         ].slice(0, 30);
         this.total++;
+        // Stream events omit provenance; hydrate the persisted audit record.
+        this._refreshReview(callId);
       }
 
       if (
@@ -291,6 +293,17 @@ function auditTab() {
     pathBadgeClass(path) {
       if (path === 'critical') return 'badge badge-deny';
       return 'badge badge-' + (path || 'fast');
+    },
+
+    backendLabel(record) {
+      if (!['llm', 'alignment'].includes(record?.evaluation_path)) return '';
+      const route = record.evaluation_metadata?.backend_provenance?.route;
+      switch (route) {
+        case 'llm': return 'LLM';
+        case 'decisions': return 'Decisions';
+        case 'decisions_to_llm': return 'Decisions → LLM';
+        default: return '';
+      }
     },
 
     recordTypeBadgeClass(type) {

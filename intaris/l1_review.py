@@ -1,0 +1,172 @@
+"""Audit provenance for the bounded Decisions-to-generative-L1 review path."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
+from functools import wraps
+from typing import Any
+
+from intaris import model_retry
+from intaris.redactor import redact
+
+
+def is_decisions(client: Any) -> bool:
+    """Identify the native client without changing Jev or mock-client semantics."""
+    return getattr(type(client), "provider", None) == "decisions"
+
+
+def review_deadline(client: Any, llm: Any = None) -> AbstractContextManager[None]:
+    """Keep both L1 stages inside the existing caller deadline, including standalone use."""
+    if not is_decisions(client):
+        return nullcontext()
+    timeout_ms = getattr(llm, "_timeout_ms", None)
+    seconds = (
+        timeout_ms / 1000 if type(timeout_ms) in (int, float) else client._timeout_s
+    )
+    return model_retry.model_call_deadline(seconds)
+
+
+def primary_deadline(client: Any) -> AbstractContextManager[None]:
+    """Bound native retries while reserving half the remaining L1 budget for review."""
+    remaining = model_retry.remaining_seconds()
+    return (
+        model_retry.evaluation_deadline(min(client._timeout_s, remaining / 2))
+        if is_decisions(client) and remaining is not None
+        else nullcontext()
+    )
+
+
+def runtime_deadline(function: Callable[..., Any]) -> Callable[..., Any]:
+    """Keep hybrid policy-owned optional review in the same L1 budget."""
+
+    @wraps(function)
+    def bounded(runtime: Any, *args: Any, **kwargs: Any) -> Any:
+        with review_deadline(runtime.jev, runtime.llm):
+            return function(runtime, *args, **kwargs)
+
+    return bounded
+
+
+def optional_reason(
+    client: Any, diagnostics: dict, *, escalated: bool, critical: bool
+) -> dict | None:
+    """The decision owner supplies the actual escalation, never a risk heuristic."""
+    route = diagnostics.get("backend_provenance") or {}
+    return (
+        {"code": "optional_escalation"}
+        if is_decisions(client)
+        and client.l1_review_enabled
+        and escalated
+        and not critical
+        and not diagnostics.get("validation_error")
+        and route.get("final_backend") == "decisions"
+        and len(route.get("attempts", [])) == 1
+        else None
+    )
+
+
+def failure(exc: Exception) -> dict:
+    """Describe a failure without copying provider messages, URLs or credentials."""
+    return {
+        "category": getattr(exc, "category", type(exc).__name__),
+        "http_status": getattr(exc, "status_code", None),
+    }
+
+
+def temporary_reason(exc: Exception) -> dict:
+    """Identify the explicitly supported transient-only fallback."""
+    return {"code": "temporary_unavailable", **failure(exc)}
+
+
+def redact_metadata(metadata: dict) -> dict:
+    """Redact metadata values on a copy; structural keys and token counts survive."""
+
+    def visit(value: Any, key: str | None = None) -> Any:
+        if isinstance(value, dict):
+            return {name: visit(child, name) for name, child in value.items()}
+        if isinstance(value, list):
+            return [visit(child) for child in value]
+        if isinstance(value, str):
+            # This typed classification is not an HTTP Authorization credential.
+            if key == "authorization" and value in {
+                "explicit",
+                "implicit",
+                "absent",
+                "unclear",
+            }:
+                return value
+            return redact({key: value})[key] if key is not None else redact(value)
+        return value
+
+    return visit(metadata)
+
+
+def attempt(client: Any, diagnostics: dict, view: dict | None = None) -> dict:
+    """Record scores and request accounting, never evaluated text or credentials."""
+    backend = getattr(type(client), "provider", "llm")
+    model = getattr(client, "_model", None)
+    actual_view = view if view is not None else getattr(client, "input_view", None)
+    return redact_metadata(
+        {
+            "backend": backend,
+            "status": "failed"
+            if diagnostics.get("failure") or diagnostics.get("validation_error")
+            else "completed",
+            "model": model if isinstance(model, str) else None,
+            "model_view": actual_view if isinstance(actual_view, dict) else None,
+            **(
+                {"usage": client.usage}
+                if is_decisions(client) and isinstance(client.usage, dict)
+                else {}
+            ),
+            "diagnostics": {
+                key: diagnostics[key]
+                for key in (
+                    "aligned_probability",
+                    "alignment_confidence",
+                    "risk_confidence",
+                    "decision_confidence",
+                    "minimum_confidence",
+                    "threshold",
+                    "classification_uncertainty",
+                    "validation_error",
+                    "distributions",
+                    "thresholds",
+                    "confidence_semantics",
+                    "validation_errors",
+                    "failure",
+                )
+                if key in diagnostics
+            },
+        }
+    )
+
+
+def provenance(attempts: list[dict], reason: dict | None = None) -> dict:
+    """Describe the L1 route independently of the unchanged evaluation_path."""
+    final = next(
+        (row for row in reversed(attempts) if row.get("status") != "failed"),
+        attempts[-1],
+    )
+    return redact_metadata(
+        {
+            "route": "decisions_to_llm" if reason else attempts[-1]["backend"],
+            "initial_backend": attempts[0]["backend"],
+            "final_backend": final["backend"],
+            "final_model": final["model"],
+            "fallback_reason": reason,
+            "attempts": attempts,
+        }
+    )
+
+
+def preserve_restrictions(final_view: dict, initial_view: dict | None) -> dict:
+    """A second assessment cannot erase an earlier partial-input safety restriction."""
+    view = dict(final_view)
+    if isinstance(initial_view, dict):
+        if initial_view.get("affirmative_grants_eligible") is False:
+            view["affirmative_grants_eligible"] = False
+        if initial_view.get("source_coverage") == "partial":
+            view["source_coverage"] = "partial"
+    return view

@@ -22,7 +22,7 @@ Part of the [Cognara](https://github.com/fpytloun) platform (Cognis controller, 
 
 ## Features
 
-- **Tool-call assessment** -- Jev or an OpenAI-compatible model assesses action facts. Assessment is not itself permission.
+- **Tool-call assessment** -- Native OpenAI Decisions, Jev, or an OpenAI-compatible LLM assesses action facts. Low-confidence Decisions assessments receive generative L1 review before judge escalation. Assessment is not itself permission.
 - **Policy-controlled decisions** -- The hybrid pipeline combines controller evidence, policy obligations and bounded model assessments. The legacy pipeline remains available; identify the mode when comparing results.
 - **Source-aware review** -- Independent Judge review can consider original task instructions and scoped runtime evidence without treating generated summaries as user consent.
 - **Session management** -- Hierarchical parent/child sessions with intention tracking, lifecycle states, and idle sweep.

@@ -1,6 +1,6 @@
 """Per-call evaluator backend selection.
 
-``EVALUATOR_BACKEND`` is ``llm``, ``jev`` or ``auto``. ``auto`` is only valid
+``EVALUATOR_BACKEND`` is ``llm``, ``jev``, ``decisions`` or ``auto``. ``auto`` is only valid
 with Cognis-managed inference: the evaluation route's ``GET /v1/models`` entry
 lists the operations it resolves (``chat`` or ``systemone``), and that decides
 whether the chat LLM evaluator or the Jev evaluator handles a call. The lookup
@@ -28,12 +28,12 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 if TYPE_CHECKING:
-    from intaris.jev import JevClient
+    from intaris.finite_questions import FiniteQuestionClient
 
 logger = logging.getLogger(__name__)
 
 EVALUATION_ROUTE = "routes/intaris_evaluation"
-MODES = ("llm", "jev", "auto")
+MODES = ("llm", "jev", "auto", "decisions")
 CACHE_SECONDS = 60.0
 # Transport failures are retried sooner, but still coalesced and bounded.
 FAILURE_CACHE_SECONDS = 5.0
@@ -62,7 +62,7 @@ def is_protocol_mismatch(status: int | None, body: Any) -> bool:
 class EvaluatorBackend:
     """Select the evaluator backend for each call.
 
-    ``select()`` returns the Jev client when Jev should evaluate the call and
+    ``select()`` returns a finite client when Jev or Decisions should evaluate and
     ``None`` when the chat LLM evaluator should. It raises
     ``EvaluatorBackendError`` when the backend cannot be determined safely.
     """
@@ -71,7 +71,8 @@ class EvaluatorBackend:
         self,
         mode: str,
         *,
-        jev_factory: Callable[[], JevClient] | None = None,
+        jev_factory: Callable[[], FiniteQuestionClient] | None = None,
+        decisions_factory: Callable[[], FiniteQuestionClient] | None = None,
         models_url: str | None = None,
         token: Callable[[], str] | None = None,
         timeout_s: float = 4.0,
@@ -84,9 +85,11 @@ class EvaluatorBackend:
             raise ValueError("EVALUATOR_BACKEND=auto requires managed inference")
         if mode in ("jev", "auto") and jev_factory is None:
             raise ValueError(f"EVALUATOR_BACKEND={mode} requires a Jev client")
+        if mode == "decisions" and decisions_factory is None:
+            raise ValueError("EVALUATOR_BACKEND=decisions requires a Decisions client")
         self.mode = mode
-        self._jev_factory = jev_factory
-        self._jev: JevClient | None = None
+        self._jev_factory = decisions_factory if mode == "decisions" else jev_factory
+        self._jev: FiniteQuestionClient | None = None
         self._models_url = models_url
         self._token = token
         self._clock = clock
@@ -110,10 +113,12 @@ class EvaluatorBackend:
         )
 
     @classmethod
-    def fixed(cls, jev: JevClient | None) -> EvaluatorBackend:
+    def fixed(cls, jev: FiniteQuestionClient | None) -> EvaluatorBackend:
         """Pin a pre-built client (or the LLM evaluator when ``None``)."""
         if jev is None:
             return cls("llm")
+        if getattr(jev, "provider", None) == "decisions":
+            return cls("decisions", decisions_factory=lambda: jev)
         return cls("jev", jev_factory=lambda: jev)
 
     @property
@@ -121,15 +126,15 @@ class EvaluatorBackend:
         """Number of model-metadata lookups performed (for tests and metrics)."""
         return self._lookups
 
-    def select(self) -> JevClient | None:
-        """Return the Jev client for Jev, or ``None`` for the LLM evaluator."""
+    def select(self) -> FiniteQuestionClient | None:
+        """Return the finite client, or ``None`` for the chat evaluator."""
         with self._lock:
             if self._closed:
                 raise EvaluatorBackendError("Evaluator backend is closed")
         backend = self.mode if self.mode != "auto" else self._resolve()
-        return self._jev_client() if backend == "jev" else None
+        return self._jev_client() if backend in ("jev", "decisions") else None
 
-    async def select_async(self) -> JevClient | None:
+    async def select_async(self) -> FiniteQuestionClient | None:
         """Select without occupying a request worker while metadata is pending."""
         if self.mode != "auto":
             return self.select()
@@ -213,7 +218,7 @@ class EvaluatorBackend:
         """Drain the single metadata worker without blocking the event loop."""
         await asyncio.to_thread(self.close)
 
-    def _jev_client(self) -> JevClient:
+    def _jev_client(self) -> FiniteQuestionClient:
         assert self._jev_factory is not None
         with self._jev_lock:
             with self._lock:

@@ -30,6 +30,22 @@ def source_sections(sections):
         _sections.reset(token)
 
 
+@contextmanager
+def native_source_sections(*, json_index=0):
+    """Translate builder-owned state paths to the native Decisions envelope."""
+    with source_sections(
+        (
+            ("input", 0, "content", json_index, "data", *path[1:])
+            if path and path[0] == "state"
+            else path,
+            start,
+            end,
+        )
+        for path, start, end in _sections.get()
+    ):
+        yield
+
+
 def located_source(prompt, sources, *, path):
     """Bind the exact canonical source serialization, refusing ambiguous copies."""
     text = json.dumps(sources, ensure_ascii=False)
@@ -462,19 +478,36 @@ def _bounded_model_view(payload, capacity, *, jev):
         omitted = []
         if jev:
             # Schema/options and trusted evaluation instructions stay unchanged.
-            if "state" in result:
-                state = result["state"]
+            if "state" in result or "input" in result:
+                native = "input" in result
+                json_index = (
+                    next(
+                        index
+                        for index, part in enumerate(result["input"][0]["content"])
+                        if part["type"] == "input_json"
+                    )
+                    if native
+                    else None
+                )
+                parent = result["input"][0]["content"][json_index] if native else result
+                key = "data" if native else "state"
+                prefix = (
+                    ("input", 0, "content", json_index, "data")
+                    if native
+                    else ("state",)
+                )
+                state = parent[key]
                 if isinstance(state, dict):
-                    result["state"] = {
+                    parent[key] = {
                         key: child
                         if key == "evaluation_rules"
-                        else bound(child, limit, ("state", key), sequence_limit)
+                        else bound(child, limit, (*prefix, key), sequence_limit)
                         for key, child in state.items()
                     }
                 else:
-                    result["state"] = bound(state, limit, ("state",), sequence_limit)
+                    parent[key] = bound(state, limit, prefix, sequence_limit)
                 if omitted:
-                    annotate(result["state"])
+                    annotate(parent[key])
         else:
             for index, message in enumerate(result.get("messages", [])):
                 if message.get("role") not in {"system", "developer"}:

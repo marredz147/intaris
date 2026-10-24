@@ -21,6 +21,43 @@ function ui() {
 
 function plain(value) { return JSON.parse(JSON.stringify(value)); }
 
+test('Audit backend labels use persisted routes without guessing old or fast paths', () => {
+  const tab = ui().auditTab();
+  assert.equal(tab.backendLabel({ evaluation_path: 'alignment',
+    evaluation_metadata: { backend_provenance: { route: 'decisions_to_llm' } },
+  }), 'Decisions → LLM');
+  for (const [route, label] of [
+    ['llm', 'LLM'], ['decisions', 'Decisions'],
+    ['decisions_to_llm', 'Decisions → LLM'], ['unknown', ''],
+  ]) {
+    assert.equal(tab.backendLabel({ evaluation_path: 'llm',
+      evaluation_metadata: { backend_provenance: { route } },
+    }), label);
+  }
+  for (const record of [null, {}, { evaluation_path: 'llm' },
+    { evaluation_path: 'llm', evaluation_metadata: null },
+    ...['fast', 'critical'].map(evaluation_path => ({ evaluation_path,
+      evaluation_metadata: { backend_provenance: { route: 'decisions' } },
+    })),
+  ]) assert.equal(tab.backendLabel(record), '');
+});
+
+test('Live Audit rows fetch persisted backend provenance after evaluation', async () => {
+  const context = ui();
+  const tab = context.auditTab();
+  tab.initialized = true;
+  const fresh = { call_id: 'live-call', evaluation_path: 'llm',
+    evaluation_metadata: { backend_provenance: { route: 'decisions_to_llm' } },
+  };
+  context.IntarisAPI.getAuditRecord = async callId => {
+    assert.equal(callId, fresh.call_id);
+    return fresh;
+  };
+  tab._handleWsEvent({ type: 'evaluated', call_id: fresh.call_id, path: 'llm' });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(tab.backendLabel(tab.records[0]), 'Decisions → LLM');
+});
+
 test('Judge headline and exact cites come only from the latest structured stage', () => {
   const context = ui();
   assert.equal(context.judgePresentation({ reasoning: 'User simulator: approve; basis=explicit_request' }), null);

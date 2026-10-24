@@ -390,6 +390,77 @@ def system_prompt(question: dict, *, include_schema: bool = True) -> str:
 
 @attributed("policy_assess")
 def classify(llm, jev, question: dict) -> tuple[dict, dict, dict]:
+    from intaris import l1_review
+    from intaris.decisions import DecisionsTemporaryError
+
+    with l1_review.review_deadline(jev if not question["judge"] else None, llm):
+        reason = None
+        try:
+            with l1_review.primary_deadline(jev if not question["judge"] else None):
+                raw, diagnostics, obligations = _classify(llm, jev, question)
+        except DecisionsTemporaryError as exc:
+            if not l1_review.is_decisions(jev) or question["judge"] or llm is None:
+                raise
+            reason = l1_review.temporary_reason(exc)
+            raw, obligations = None, {}
+            diagnostics = {
+                "failure": l1_review.failure(exc),
+                "model_view": jev.input_view,
+            }
+        if question["judge"] or (jev is not None and not l1_review.is_decisions(jev)):
+            return raw, diagnostics, obligations
+        client = jev if jev is not None else llm
+        attempts = [
+            l1_review.attempt(client, diagnostics, diagnostics.get("model_view"))
+        ]
+        reason = reason or (
+            jev.low_confidence(diagnostics) if jev is not None else None
+        )
+        diagnostics["backend_provenance"] = l1_review.provenance(attempts)
+        if reason:
+            return review_native(llm, question, (raw, diagnostics, obligations), reason)
+        return (
+            raw,
+            l1_review.redact_metadata(diagnostics)
+            if l1_review.is_decisions(jev)
+            else diagnostics,
+            obligations,
+        )
+
+
+def review_native(llm, question: dict, previous: tuple, reason: dict) -> tuple:
+    """Review original evidence once; optional review failure retains native escalation."""
+    from intaris import l1_review
+
+    raw, diagnostics, obligations = previous
+    attempts = list(diagnostics["backend_provenance"]["attempts"])
+    try:
+        reviewed, reviewed_diagnostics, reviewed_obligations = _classify(
+            llm, None, question
+        )
+    except Exception as exc:
+        if reason["code"] != "optional_escalation":
+            raise
+        attempts.append(l1_review.attempt(llm, {"failure": l1_review.failure(exc)}))
+    else:
+        attempts.append(
+            l1_review.attempt(
+                llm, reviewed_diagnostics, reviewed_diagnostics.get("model_view")
+            )
+        )
+        raw, diagnostics, obligations = (
+            reviewed,
+            reviewed_diagnostics,
+            reviewed_obligations,
+        )
+        diagnostics["model_view"] = l1_review.preserve_restrictions(
+            diagnostics["model_view"], attempts[0]["model_view"]
+        )
+    diagnostics["backend_provenance"] = l1_review.provenance(attempts, reason)
+    return raw, l1_review.redact_metadata(diagnostics), obligations
+
+
+def _classify(llm, jev, question: dict) -> tuple[dict, dict, dict]:
     from intaris.evaluation_context import model_view, request_view
     from intaris.input_budget import located_source, source_sections
 
@@ -412,19 +483,26 @@ def classify(llm, jev, question: dict) -> tuple[dict, dict, dict]:
                 continue
             else:
                 options[key] = tuple(prop["enum"])
+        from intaris.l1_review import is_decisions
+
+        state = {
+            "prompt": instructions + "\n" + question["prompt"],
+            "selective_options": options,
+        }
+        if is_decisions(jev):
+            state = {
+                "evaluation_rules": instructions,
+                "prompt": question["prompt"],
+                "selective_options": options,
+            }
         payload, actual_view = request_view(
-            {
-                "state": {
-                    "prompt": instructions + "\n" + question["prompt"],
-                    "selective_options": options,
-                }
-            },
-            boundary="jev.classify_hybrid",
+            {"state": state},
+            boundary=f"{getattr(type(jev), 'provider', 'jev')}.classify_hybrid",
             coverage=metadata.get("source_coverage"),
             witnesses=metadata.get("witnesses"),
         )
         if actual_view["overflow"]:
-            raise ValueError("Final Jev model input exceeds budget")
+            raise ValueError("Final finite model input exceeds budget")
         sections = located_source(
             payload["state"]["prompt"],
             question.get("raw_sources"),

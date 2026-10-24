@@ -1170,6 +1170,8 @@
                   <span :class="riskBadgeClass(r.risk)" x-text="r.risk" x-show="r.risk"></span>
                   <span x-show="r.evaluation_path"
                         :class="pathBadgeClass(r.evaluation_path)" x-text="r.evaluation_path"></span>
+                  <span x-show="backendLabel(r)" class="text-xs text-muted"
+                        title="Evaluation backend" x-text="backendLabel(r)"></span>
                 </div>
                 <div class="flex items-center gap-3 text-xs text-muted">
                   <span x-show="r.agent_id" class="font-mono" x-text="r.agent_id"></span>
