@@ -58,6 +58,6 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ghcr.io/fpytloun/intaris:${{ steps.image.outputs.tag }}
+          tags: ghcr.io/${{ github.repository }}:${{ steps.image.outputs.tag }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
