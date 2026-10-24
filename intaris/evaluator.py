@@ -69,7 +69,7 @@ from intaris.sanitize import ANTI_INJECTION_PREAMBLE
 from intaris.session import SessionStore
 
 if TYPE_CHECKING:
-    from intaris.jev import JevClient
+    from intaris.finite_questions import FiniteQuestionClient
 
 # Escalation retry: reuse approval if same tool+args approved within this window.
 _ESCALATION_RETRY_TTL_MINUTES = 10
@@ -377,7 +377,7 @@ class Evaluator:
         db: Database | None = None,
         analysis_config: AnalysisConfig | None = None,
         alignment_barrier: Any | None = None,
-        jev: JevClient | None = None,
+        jev: FiniteQuestionClient | None = None,
         evaluator_backend: EvaluatorBackend | None = None,
         task_context: Any | None = None,
         l1_input_projection: str = "auto",
@@ -414,8 +414,8 @@ class Evaluator:
         self._approved_paths_lock = threading.Lock()
 
     @property
-    def _jev(self) -> JevClient | None:
-        """Per-call backend: the Jev client, or ``None`` for the LLM evaluator."""
+    def _jev(self) -> FiniteQuestionClient | None:
+        """Per-call finite client, or ``None`` for the chat evaluator."""
         return self._backend.select()
 
     def evaluate(
@@ -918,6 +918,7 @@ class Evaluator:
                 )
                 args_hash = _compute_args_hash(args)
                 alignment_mutation = read_only.observe(tool, args)
+                alignment_diagnostics = None
                 if overlay["read_only_required"]:
                     from intaris.hybrid import digest
                     from intaris.hybrid_runtime import (
@@ -938,7 +939,7 @@ class Evaluator:
                             "\nEffective read-only overlay:\n" + json.dumps(overlay)
                         )
                         try:
-                            assessment, _ = classify_mutation(
+                            assessment, alignment_diagnostics = classify_mutation(
                                 self._llm,
                                 (yield BackendSelection(self._backend)),
                                 evidence,
@@ -950,6 +951,14 @@ class Evaluator:
                                 503,
                             ) from exc
                         alignment_mutation = assessment["mutation"]
+                        if (
+                            alignment_mutation == "read_only"
+                            and (alignment_diagnostics.get("model_view") or {}).get(
+                                "affirmative_grants_eligible"
+                            )
+                            is False
+                        ):
+                            alignment_mutation = "unclear"
                     alignment_decision, _ = read_only.enforce(
                         alignment_decision,
                         overlay,
@@ -980,6 +989,23 @@ class Evaluator:
                     if durable_misaligned or overlay["read_only_required"]
                     else None
                 )
+                if alignment_diagnostics is not None:
+                    alignment_metadata.update(
+                        {
+                            "stages": [
+                                {
+                                    "stage": "read_only_alignment_l1",
+                                    "classification": assessment,
+                                    **alignment_diagnostics,
+                                }
+                            ],
+                            **{
+                                key: alignment_diagnostics[key]
+                                for key in ("backend_provenance", "model_view")
+                                if key in alignment_diagnostics
+                            },
+                        }
+                    )
                 self._audit.insert(
                     call_id=call_id,
                     user_id=user_id,
@@ -1491,6 +1517,14 @@ class Evaluator:
                     stages.append({"stage": "read_only_l1", "status": "unavailable"})
                 else:
                     mutation = assessment["mutation"]
+                    if (
+                        mutation == "read_only"
+                        and (diagnostics.get("model_view") or {}).get(
+                            "affirmative_grants_eligible"
+                        )
+                        is False
+                    ):
+                        mutation = "unclear"
                     stages.append(
                         {
                             "stage": "read_only_l1",
@@ -1507,15 +1541,20 @@ class Evaluator:
                 or decision.reasoning
             )
             overlay_metadata = {
+                **(decision.metadata or {}),
                 "evaluation_policy_version": "legacy",
                 "overlay": overlay,
                 "mode_identity": read_only.identity(overlay),
                 "mutation": mutation,
                 "policy_revision": session["policy_revision"],
                 "state_revision": session["state_revision"],
-                "stages": stages,
+                "stages": [*(decision.metadata or {}).get("stages", []), *stages],
                 "execution_state": "not_dispatched",
             }
+            for stage in stages:
+                for key in ("backend_provenance", "model_view"):
+                    if key in stage:
+                        overlay_metadata.setdefault(key, stage[key])
             decision.metadata = overlay_metadata
 
         # Learn from LLM approvals: cache path prefixes for path-reclassified
@@ -2238,138 +2277,262 @@ class Evaluator:
 
         try:
             jev = yield BackendSelection(self._backend)
-            if jev is not None:
-                payload, actual_view = request_view(
-                    {
-                        "state": {
-                            "intention": session["intention"],
-                            "effective_policy": effective_policy,
-                            "parent_intention": parent_intention,
-                            "recent_history": compact_records(recent_history),
-                            "recent_reasoning": compact_records(
-                                recent_reasoning, chars=600
+            from intaris import l1_review
+
+            with l1_review.review_deadline(jev, self._llm):
+                review_reason = None
+                native_attempt = None
+                failed_review = None
+                if jev is not None:
+                    payload, actual_view = request_view(
+                        {
+                            "state": {
+                                "intention": session["intention"],
+                                "effective_policy": effective_policy,
+                                "parent_intention": parent_intention,
+                                "recent_history": compact_records(recent_history),
+                                "recent_reasoning": compact_records(
+                                    recent_reasoning, chars=600
+                                ),
+                                "user_decisions": compact_records(
+                                    user_decisions, full_args=True
+                                ),
+                                "session_stats": session_stats,
+                                "tool": tool,
+                                "arguments": projection_arguments(args_redacted),
+                                "agent_id": agent_id,
+                                "context": context,
+                            },
+                            "evaluation_rules": SAFETY_EVALUATION_SYSTEM_PROMPT.format(
+                                anti_injection=ANTI_INJECTION_PREAMBLE,
                             ),
-                            "user_decisions": compact_records(
-                                user_decisions, full_args=True
-                            ),
-                            "session_stats": session_stats,
-                            "tool": tool,
-                            "arguments": projection_arguments(args_redacted),
-                            "agent_id": agent_id,
-                            "context": context,
                         },
-                        "evaluation_rules": SAFETY_EVALUATION_SYSTEM_PROMPT.format(
-                            anti_injection=ANTI_INJECTION_PREAMBLE,
+                        boundary=f"{getattr(type(jev), 'provider', 'jev')}.evaluate_tool_call",
+                        coverage=(context or {})
+                        .get("raw_task_sources", {})
+                        .get("coverage", "unknown"),
+                        witnesses=source_witnesses(
+                            (context or {}).get("raw_task_sources")
                         ),
-                    },
-                    boundary="jev.evaluate_tool_call",
-                    coverage=(context or {})
-                    .get("raw_task_sources", {})
-                    .get("coverage", "unknown"),
-                    witnesses=source_witnesses((context or {}).get("raw_task_sources")),
-                )
-                if actual_view["overflow"]:
-                    raise ValueError("Final legacy Jev model input exceeds budget")
-                from intaris.input_budget import source_sections
-
-                with source_sections(
-                    [
-                        (
-                            ("state", "tool_call", "context", "raw_task_sources"),
-                            None,
-                            None,
-                        ),
-                    ]
-                ):
-                    try:
-                        evaluation = jev.evaluate_tool_call(**payload)
-                    except ValueError as exc:
-                        from intaris.input_budget import ModelResponseError
-
-                        raise ModelResponseError(
-                            "Malformed evaluator model response"
-                        ) from exc
-            else:
-                payload, actual_view = request_view(
-                    {
-                        "messages": messages,
-                        "json_schema": SAFETY_EVALUATION_SCHEMA,
-                        "max_tokens": STRUCTURED_OUTPUT_MAX_TOKENS,
-                    },
-                    boundary="llm.generate",
-                    coverage=(context or {})
-                    .get("raw_task_sources", {})
-                    .get("coverage", "unknown"),
-                    witnesses=source_witnesses((context or {}).get("raw_task_sources")),
-                )
-                if actual_view["overflow"]:
-                    raise ValueError("Final legacy LLM model input exceeds budget")
-                from intaris.inference_attribution import llm_attribution
-                from intaris.input_budget import located_source, source_sections
-
-                with (
-                    llm_attribution(operation="evaluation"),
-                    source_sections(
-                        located_source(
-                            messages[1]["content"],
-                            (context or {}).get("raw_task_sources"),
-                            path=("messages", 1, "content"),
+                    )
+                    if actual_view["overflow"]:
+                        raise ValueError(
+                            "Final legacy finite model input exceeds budget"
                         )
-                    ),
+                    from intaris.input_budget import source_sections
+
+                    with source_sections(
+                        [
+                            (
+                                ("state", "tool_call", "context", "raw_task_sources"),
+                                None,
+                                None,
+                            ),
+                        ]
+                    ):
+                        from intaris.decisions import DecisionsTemporaryError
+
+                        try:
+                            with l1_review.primary_deadline(jev):
+                                evaluation = jev.evaluate_tool_call(**payload)
+                        except DecisionsTemporaryError as exc:
+                            if not l1_review.is_decisions(jev) or self._llm is None:
+                                raise
+                            evaluation = None
+                            review_reason = l1_review.temporary_reason(exc)
+                        except ValueError as exc:
+                            from intaris.input_budget import ModelResponseError
+
+                            raise ModelResponseError(
+                                "Malformed evaluator model response"
+                            ) from exc
+                    if l1_review.is_decisions(jev):
+                        wire_view = getattr(jev, "input_view", None)
+                        native_view = (
+                            {**actual_view, **wire_view}
+                            if isinstance(wire_view, dict)
+                            else actual_view
+                        )
+                        native_attempt = l1_review.attempt(
+                            jev,
+                            (evaluation.metadata or {})
+                            if evaluation is not None
+                            else {"failure": review_reason},
+                            native_view,
+                        )
+                        if evaluation is not None:
+                            review_reason = jev.low_confidence(
+                                evaluation.metadata or {}
+                            )
+                            if not review_reason and jev.l1_review_enabled:
+                                evaluation = _apply_authoritative_user_precedent(
+                                    evaluation,
+                                    tool=tool,
+                                    args_redacted=args_redacted,
+                                    user_decisions=user_decisions,
+                                )
+                                review_reason = l1_review.optional_reason(
+                                    jev,
+                                    {
+                                        **(evaluation.metadata or {}),
+                                        "backend_provenance": l1_review.provenance(
+                                            [native_attempt]
+                                        ),
+                                    },
+                                    escalated=evaluation.decision == "escalate"
+                                    or apply_decision_matrix(evaluation).decision
+                                    == "escalate",
+                                    critical=evaluation.risk.lower() == "critical",
+                                )
+                if jev is None or review_reason:
+                    payload, actual_view = request_view(
+                        {
+                            "messages": messages,
+                            "json_schema": SAFETY_EVALUATION_SCHEMA,
+                            "max_tokens": STRUCTURED_OUTPUT_MAX_TOKENS,
+                        },
+                        boundary="llm.generate",
+                        coverage=(context or {})
+                        .get("raw_task_sources", {})
+                        .get("coverage", "unknown"),
+                        witnesses=source_witnesses(
+                            (context or {}).get("raw_task_sources")
+                        ),
+                    )
+                    if actual_view["overflow"]:
+                        raise ValueError("Final legacy LLM model input exceeds budget")
+                    from intaris.inference_attribution import llm_attribution
+                    from intaris.input_budget import located_source, source_sections
+
+                    try:
+                        with (
+                            llm_attribution(operation="evaluation"),
+                            source_sections(
+                                located_source(
+                                    messages[1]["content"],
+                                    (context or {}).get("raw_task_sources"),
+                                    path=("messages", 1, "content"),
+                                )
+                            ),
+                        ):
+                            raw = self._llm.generate(
+                                payload["messages"],
+                                json_schema=payload["json_schema"],
+                                max_tokens=payload["max_tokens"],
+                            )
+                        result = parse_json_response(
+                            raw,
+                            expected_keys={"aligned", "risk", "reasoning", "decision"},
+                        )
+                        if review_reason:
+                            import jsonschema
+
+                            try:
+                                jsonschema.validate(
+                                    result, SAFETY_EVALUATION_SCHEMA["schema"]
+                                )
+                            except jsonschema.ValidationError as exc:
+                                raise ValueError(
+                                    "L1 review response failed schema validation"
+                                ) from exc
+                    except Exception as exc:
+                        if (
+                            not review_reason
+                            or review_reason["code"] != "optional_escalation"
+                        ):
+                            if isinstance(exc, ValueError):
+                                from intaris.input_budget import ModelResponseError
+
+                                raise ModelResponseError(
+                                    "Malformed evaluator model response"
+                                ) from exc
+                            raise
+                        failed_review = l1_review.attempt(
+                            self._llm, {"failure": l1_review.failure(exc)}
+                        )
+                    else:
+                        if review_reason:
+                            evaluation = EvaluationResult(**result)
+                        else:
+                            evaluation = EvaluationResult(
+                                aligned=bool(result.get("aligned", False)),
+                                risk=str(result.get("risk", "high")),
+                                reasoning=str(
+                                    result.get("reasoning", "No reasoning provided")
+                                ),
+                                decision=str(result.get("decision", "escalate")),
+                            )
+                wire_view = getattr(
+                    jev
+                    if jev is not None
+                    and (not review_reason or failed_review is not None)
+                    else self._llm,
+                    "input_view",
+                    None,
+                )
+                if failed_review is not None:
+                    actual_view = native_attempt["model_view"]
+                if isinstance(wire_view, dict):
+                    actual_view = {
+                        **actual_view,
+                        **wire_view,
+                        "boundary": "provider_request",
+                    }
+                if native_attempt is not None or jev is None:
+                    attempts = [native_attempt] if native_attempt is not None else []
+                    if jev is None or review_reason:
+                        attempts.append(
+                            failed_review
+                            or l1_review.attempt(
+                                self._llm, evaluation.metadata or {}, actual_view
+                            )
+                        )
+                    if review_reason:
+                        actual_view = l1_review.preserve_restrictions(
+                            actual_view, native_attempt["model_view"]
+                        )
+                    evaluation.metadata = {
+                        **(evaluation.metadata or {}),
+                        "backend_provenance": l1_review.provenance(
+                            attempts, review_reason
+                        ),
+                    }
+                    if l1_review.is_decisions(jev):
+                        evaluation.metadata = l1_review.redact_metadata(
+                            evaluation.metadata
+                        )
+                evaluation = _apply_authoritative_user_precedent(
+                    evaluation,
+                    tool=tool,
+                    args_redacted=args_redacted,
+                    user_decisions=user_decisions,
+                )
+                if (
+                    jev is not None
+                    and (not review_reason or failed_review is not None)
+                    and evaluation.decision == "escalate"
+                    and not (
+                        l1_review.is_decisions(jev)
+                        and evaluation.risk.lower() == "critical"
+                    )
                 ):
-                    raw = self._llm.generate(
-                        payload["messages"],
-                        json_schema=payload["json_schema"],
-                        max_tokens=payload["max_tokens"],
+                    return Decision(
+                        decision="escalate",
+                        risk=evaluation.risk,
+                        reasoning=evaluation.reasoning,
+                        path="llm",
+                        metadata={
+                            **(evaluation.metadata or {}),
+                            "model_view": actual_view,
+                        },
                     )
-                try:
-                    result = parse_json_response(
-                        raw,
-                        expected_keys={"aligned", "risk", "reasoning", "decision"},
-                    )
-                except ValueError as exc:
-                    from intaris.input_budget import ModelResponseError
 
-                    raise ModelResponseError(
-                        "Malformed evaluator model response"
-                    ) from exc
-
-                evaluation = EvaluationResult(
-                    aligned=bool(result.get("aligned", False)),
-                    risk=str(result.get("risk", "high")),
-                    reasoning=str(result.get("reasoning", "No reasoning provided")),
-                    decision=str(result.get("decision", "escalate")),
-                )
-            wire_view = getattr(
-                jev if jev is not None else self._llm, "input_view", None
-            )
-            if isinstance(wire_view, dict):
-                actual_view = {
-                    **actual_view,
-                    **wire_view,
-                    "boundary": "provider_request",
+                decision = apply_decision_matrix(evaluation)
+                decision.metadata = {
+                    **(evaluation.metadata or {}),
+                    "model_view": actual_view,
                 }
-            evaluation = _apply_authoritative_user_precedent(
-                evaluation,
-                tool=tool,
-                args_redacted=args_redacted,
-                user_decisions=user_decisions,
-            )
-            if jev is not None and evaluation.decision == "escalate":
-                return Decision(
-                    decision="escalate",
-                    risk=evaluation.risk,
-                    reasoning=evaluation.reasoning,
-                    path="llm",
-                    metadata={**(evaluation.metadata or {}), "model_view": actual_view},
-                )
-
-            decision = apply_decision_matrix(evaluation)
-            decision.metadata = {
-                **(evaluation.metadata or {}),
-                "model_view": actual_view,
-            }
-            return decision
+                return decision
 
         except Exception:
             # LLM failure → propagate as exception. The API endpoint

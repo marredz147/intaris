@@ -147,7 +147,7 @@ JWT validation requires:
 
 | Variable | Default | Description |
 |---|---|---|
-| `EVALUATOR_BACKEND` | `auto` with managed inference, else `llm` | Evaluator backend: `llm`, `jev`, or `auto` (follow the Cognis `intaris_evaluation` route; managed inference only). |
+| `EVALUATOR_BACKEND` | `auto` with managed inference, else `llm` | Evaluator backend: `llm`, `jev`, `decisions`, or `auto` (follow the Cognis `intaris_evaluation` route; managed inference only). |
 | `EVALUATION_DEADLINE_MS` | `60000` | Shared model-call retry budget from `/evaluate` arrival, including L1, repairs and the Judge. Not a hard endpoint deadline or metadata timeout. |
 | `LLM_API_KEY` | (required for generative features) | API key for the LLM provider. Falls back to `OPENAI_API_KEY`. |
 | `LLM_BASE_URL` | `https://api.openai.com/v1` | LLM API base URL. Falls back to `OPENAI_API_BASE`. |
@@ -204,6 +204,56 @@ LLM_BASE_URL=https://api.groq.com/openai/v1
 ANALYSIS_LLM_MODEL=gpt-oss-120b
 JUDGE_LLM_MODEL=gpt-oss-120b
 ```
+
+## Native Decisions evaluator
+
+Set `EVALUATOR_BACKEND=decisions` and `DECISIONS_API_KEY` to use the native
+[OpenAI Decisions API](https://developers.openai.com/api/docs/guides/decisions)
+for tool assessments and child alignment. This explicit selection is independent
+of Cognis auto routing and generative LLM credentials. Intention generation,
+judge review and behavioral analysis still require their generative LLM configuration.
+Valid low-confidence tool assessments receive one review by the configured
+generative L1 LLM (`LLM_*` settings), using the original evidence and deterministic policy. A
+reasoning-capable L1 can resolve ambiguous classifications before invoking the
+judge; judge review remains reserved for decisions that still escalate.
+Both stages share the evaluation deadline.
+Temporary native network/timeouts, rate limits and server errors also
+fall back to generative L1. Native retries are capped by `DECISIONS_TIMEOUT_MS`
+and half the remaining evaluation budget, leaving review time without extending
+the deadline. Auth/configuration errors, malformed answers and refusals do not
+trigger fallback; refusals cannot authorize execution. Jev and auto routing are unchanged.
+Optional review of a confident native escalation is controlled separately by
+`DECISIONS_L1_REVIEW_ENABLED`. Hybrid review runs after deterministic policy
+reports escalation; fixed critical/static denials are never relaxed. Review runs at most
+once per assessment, and optional-review failure retains the native escalation.
+
+| Variable | Default | Description |
+|---|---|---|
+| `DECISIONS_API_KEY` | (required) | Dedicated Decisions credential; no shared-key fallback. |
+| `DECISIONS_MODEL` | `gpt-6-luna` | Native model identifier. |
+| `DECISIONS_BASE_URL` | `https://api.openai.com/v1` | API root; Intaris appends `/decisions`. |
+| `DECISIONS_TIMEOUT_MS` | `2000` | Native per-attempt timeout; retries and L1 review share the evaluation deadline. |
+| `DECISIONS_MINIMUM_CONFIDENCE` | `0.8` | Legacy/alignment confidence floor; also the native provider-confidence floor for hybrid L1 review. |
+| `DECISIONS_L1_REVIEW_ENABLED` | `false` | Additionally review confident noncritical native escalations at generative L1; automatic low-confidence and temporary-error forwarding are independent of this toggle. |
+| `DECISIONS_HYBRID_MINIMUM_POSTERIOR` | `0.6` | Hybrid selected-label posterior floor. |
+| `DECISIONS_HYBRID_MINIMUM_MARGIN` | `0.1` | Hybrid top-label probability margin floor. |
+
+Request budgets cover the native envelope, including question descriptions.
+Without a verified capacity API, the existing bounded unknown-capacity policy applies.
+Audit labels distinguish **LLM**, **Decisions** and **Decisions → LLM**.
+`evaluation_metadata.backend_provenance` records the route, both L1 attempts,
+uncertainty scores, request views and final backend/model within one tool-call record.
+New Decisions metadata is secret-redacted on a copy without rewriting structural
+keys, policy/source references, digests or usage counts.
+
+Requests with builder-supplied stable evaluation rules mark that text prefix for
+native prompt caching; changing user/tool evidence stays in a separate JSON part.
+Reuse requires at least 1024 shared input tokens; questions are outside the reusable
+prefix and do not count toward that minimum. Full-assessment helpers without a
+separate stable rules prefix retain implicit caching. Audit attempts retain reported
+`usage.input_tokens_details.cached_tokens` and `cache_write_tokens` when available;
+these are included in `input_tokens`, not additional tokens. Hits and savings are
+not assumed. Every call still requests a new assessment; verdicts are never cached.
 
 ## LLM (L2 Behavioral Analysis)
 

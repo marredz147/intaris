@@ -96,10 +96,11 @@ def _get_db():
 
 
 def _get_evaluator_backend():
-    """Process-wide per-call evaluator selector (llm, jev, or auto)."""
+    """Process-wide per-call evaluator selector, including native Decisions."""
     global _evaluator_backend
     if _evaluator_backend is None:
         from intaris.config import evaluator_backend_mode
+        from intaris.decisions import DecisionsClient
         from intaris.evaluator_backend import EvaluatorBackend
         from intaris.inference import managed_endpoint, token_supplier
         from intaris.jev import JevClient
@@ -118,6 +119,7 @@ def _get_evaluator_backend():
         backend = EvaluatorBackend(
             mode,
             jev_factory=jev_factory if cfg.jev.enabled else None,
+            decisions_factory=lambda: DecisionsClient(cfg.decisions),
             models_url=f"{endpoint}/models" if endpoint else None,
             token=token_supplier() if endpoint else None,
             timeout_s=cfg.llm.timeout_ms / 1000.0,

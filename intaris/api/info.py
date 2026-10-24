@@ -421,6 +421,9 @@ async def config(
         # lookup is blocking I/O, so keep it off the event loop.
         selection = await asyncio.to_thread(_get_evaluator_backend().active)
         jev = selection["active"] == "jev"
+        decisions = selection["active"] == "decisions"
+        finite_config = cfg.decisions if decisions else cfg.jev
+        finite = jev or decisions
         return {
             "version": __version__,
             "evaluator": {
@@ -429,14 +432,29 @@ async def config(
                 "backend": selection["active"],
                 "mode": selection["mode"],
                 "backend_error": selection["error"],
-                "model": cfg.jev.model if jev else cfg.llm.model,
-                "timeout_ms": cfg.jev.timeout_ms if jev else cfg.llm.timeout_ms,
-                "minimum_confidence": cfg.jev.minimum_confidence if jev else None,
-                "decision_question": cfg.jev.decision_question if jev else None,
+                "l1_review_enabled": cfg.decisions.l1_review_enabled
+                if decisions
+                else False,
+                "model": finite_config.model if finite else cfg.llm.model,
+                "timeout_ms": finite_config.timeout_ms
+                if finite
+                else cfg.llm.timeout_ms,
+                "minimum_confidence": finite_config.minimum_confidence
+                if finite
+                else None,
+                "decision_question": True
+                if decisions
+                else cfg.jev.decision_question
+                if jev
+                else None,
                 "approval_risk_confidence": (
                     cfg.jev.approval_risk_confidence if jev else None
                 ),
-                "diagnostics": cfg.jev.diagnostics if jev else False,
+                "diagnostics": True
+                if decisions
+                else cfg.jev.diagnostics
+                if jev
+                else False,
             },
             "llm": {
                 "model": cfg.llm.model,

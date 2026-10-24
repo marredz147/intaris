@@ -107,7 +107,7 @@ def service_databases():
         yield lambda url: stack.enter_context(_isolated_postgres(url))
 
 
-@pytest.fixture(params=["llm", "jev"])
+@pytest.fixture(params=["llm", "jev", "decisions"])
 def service(request, env_no_auth, monkeypatch, tmp_path, service_databases):  # noqa: F811
     import intaris.server as server
 
@@ -145,6 +145,8 @@ def service(request, env_no_auth, monkeypatch, tmp_path, service_databases):  # 
         "JEV_API_KEY": "offline-test-token",
         "JEV_BASE_URL": "https://source-context-jev.test",
         "JEV_MODEL": "jev-1.13.0",
+        "DECISIONS_API_KEY": "offline-decisions-token",
+        "DECISIONS_BASE_URL": "https://source-context-decisions.test/v1",
         "EVENT_STORE_ENABLED": "true",
         "EVENT_STORE_BACKEND": "filesystem",
         "EVENT_STORE_PATH": str(tmp_path / "events"),
@@ -157,6 +159,7 @@ def service(request, env_no_auth, monkeypatch, tmp_path, service_databases):  # 
         assert req.url.host in {
             "source-context-provider.test",
             "source-context-jev.test",
+            "source-context-decisions.test",
         }, req.url
         if req.method == "GET":
             return httpx.Response(
@@ -170,11 +173,24 @@ def service(request, env_no_auth, monkeypatch, tmp_path, service_databases):  # 
             )
         body = json.loads(req.content)
         if "questions" in body:
-            wire.append(("l1-jev", body))
+            native = isinstance(body["questions"], list)
+            wire.append(("l1-decisions" if native else "l1-jev", body))
             answers = {}
-            for field, question in body["questions"].items():
-                choices = question["criteria"]
-                value = VALUES.get(field)
+            questions = (
+                ((question["name"], question) for question in body["questions"])
+                if native
+                else body["questions"].items()
+            )
+            for field, question in questions:
+                if native and question["type"] == "predicate":
+                    answers[field] = {"type": "predicate", "probability": 0.99}
+                    continue
+                choices = (
+                    [row["value"] for row in question["choices"]]
+                    if native
+                    else question["criteria"]
+                )
+                value = VALUES.get(field, "approve" if field == "decision" else None)
                 value = (
                     {
                         "latest_user_message": "latest user message",
@@ -198,12 +214,47 @@ def service(request, env_no_auth, monkeypatch, tmp_path, service_databases):  # 
                         option: float(option == value) for option in choices
                     },
                 }
+            if native:
+                assert req.url.path == "/v1/decisions"
+                assert req.headers["Authorization"] == "Bearer offline-decisions-token"
+                answers = [
+                    {
+                        **answer,
+                        "name": field,
+                        **(
+                            {
+                                "probabilities": [
+                                    {"value": value, "probability": probability}
+                                    for value, probability in answer[
+                                        "probabilities"
+                                    ].items()
+                                ]
+                            }
+                            if "probabilities" in answer
+                            else {}
+                        ),
+                    }
+                    for field, answer in answers.items()
+                ]
+                if hooks.get("decisions_answers"):
+                    hooks["decisions_answers"](answers)
+                if hooks.get("decisions_timeout"):
+                    raise httpx.ReadTimeout("offline timeout", request=req)
             return httpx.Response(
-                200,
+                hooks.get("decisions_status", 200) if native else 200,
                 json={
                     "model": body["model"],
                     "answers": answers,
-                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "total_tokens": 15,
+                        **(
+                            {"input_tokens_details": hooks["decisions_usage_details"]}
+                            if native and "decisions_usage_details" in hooks
+                            else {}
+                        ),
+                    },
                 },
             )
         schema = (body.get("response_format") or {}).get("json_schema", {})
@@ -323,6 +374,8 @@ def service(request, env_no_auth, monkeypatch, tmp_path, service_databases):  # 
                     if labels[field] not in fields[field]["enum"]:
                         labels[field] = "none"
             answer = labels
+            if not judge and hooks.get("l1_answer"):
+                answer = hooks["l1_answer"](labels)
             if judge:
                 answer = {
                     "classification": labels,
@@ -334,6 +387,16 @@ def service(request, env_no_auth, monkeypatch, tmp_path, service_databases):  # 
                         for identifier in properties["obligations"]["properties"]
                     },
                 }
+        elif name == "safety_evaluation":
+            wire.append(("l1-gpt", body))
+            answer = {
+                "aligned": True,
+                "risk": "low",
+                "reasoning": "The original evidence supports this bounded task.",
+                "decision": "approve",
+            }
+            if hooks.get("l1_answer"):
+                answer = hooks["l1_answer"](answer)
         elif name == "session_intention":
             wire.append(("intention", body))
             assert body["response_format"]["type"] == "json_schema"
@@ -378,7 +441,9 @@ def service(request, env_no_auth, monkeypatch, tmp_path, service_databases):  # 
         else:
             raise AssertionError(f"Unexpected provider route: {name}")
         return httpx.Response(
-            200,
+            hooks.get("l1_status", 200)
+            if name in {"safety_evaluation", "hybrid_selective_assessment"}
+            else 200,
             json={
                 "id": str(uuid.uuid4()),
                 "object": "chat.completion",
@@ -456,6 +521,518 @@ def evaluate(client, sid, **extra):
     return response.json()
 
 
+@pytest.mark.parametrize("service", [("decisions", "mixed")], indirect=True)
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("temporary", [429, 503, 529, "timeout"])
+def test_temporary_native_errors_review_original_evidence_at_l1(
+    service, legacy, temporary, monkeypatch
+):
+    from intaris import model_retry
+
+    client, app, wire = service
+    monkeypatch.setattr(model_retry, "backoff_delay", lambda *args: 0)
+    hooks = app.state.offline_provider_hooks
+    hooks["decisions_timeout" if temporary == "timeout" else "decisions_status"] = (
+        True if temporary == "timeout" else temporary
+    )
+    hooks["l1_answer"] = lambda labels: {
+        **labels,
+        "risk": "low",
+        **({"consequence": "routine"} if "consequence" in labels else {}),
+    }
+    sid = str(uuid.uuid4())
+    response = client.post(
+        "/api/v1/intention",
+        json={
+            "session_id": sid,
+            "intention": "CANONICAL_TRANSIENT_EVIDENCE",
+            "policy": {
+                "evaluation_policy_version": "legacy" if legacy else "hybrid_v1"
+            },
+        },
+    )
+    assert response.status_code == 200
+    result = evaluate(client, sid)
+    assert result["decision"] == "approve", result
+    provenance = result["evaluation_metadata"]["backend_provenance"]
+    assert provenance["fallback_reason"]["code"] == "temporary_unavailable"
+    assert [row["status"] for row in provenance["attempts"]] == ["failed", "completed"]
+    assert provenance["final_backend"] == "llm"
+    native = next(body for stage, body in wire if stage == "l1-decisions")
+    chat = [body for stage, body in wire if stage == "l1-gpt"]
+    assert len(chat) == 1 and "CANONICAL_TRANSIENT_EVIDENCE" in json.dumps(chat[0])
+    from intaris.input_budget import measure
+
+    assert (
+        provenance["attempts"][0]["model_view"]["digest"] == measure(native)["digest"]
+    )
+    saved = client.get(f"/api/v1/audit/{result['call_id']}").json()
+    assert saved["evaluation_metadata"]["backend_provenance"] == provenance
+    assert client.get(f"/api/v1/session/{sid}").json()["total_calls"] == 1
+
+
+@pytest.mark.parametrize("service", [("decisions", "mixed")], indirect=True)
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_optional_native_escalation_review_is_policy_owned(service, legacy, enabled):
+    from intaris import server
+
+    client, app, wire = service
+    server._get_evaluator_backend().select().l1_review_enabled = enabled
+    server._get_config().decisions.l1_review_enabled = enabled
+    hooks = app.state.offline_provider_hooks
+
+    def escalate(answers):
+        for row in answers:
+            if row["name"] == "decision":
+                row["choice"] = "escalate"
+                for probability in row["probabilities"]:
+                    probability["probability"] = float(
+                        probability["value"] == "escalate"
+                    )
+
+    hooks["decisions_answers"] = escalate
+    hooks["l1_answer"] = lambda labels: {
+        **labels,
+        "risk": "low",
+        **({"consequence": "routine"} if "consequence" in labels else {}),
+    }
+    sid = str(uuid.uuid4())
+    response = client.post(
+        "/api/v1/intention",
+        json={
+            "session_id": sid,
+            "intention": "Inspect the local repository",
+            "policy": {
+                "evaluation_policy_version": "legacy" if legacy else "hybrid_v1"
+            },
+        },
+    )
+    assert response.status_code == 200
+    result = evaluate(client, sid)
+    provenance = result["evaluation_metadata"]["backend_provenance"]
+    assert len([body for stage, body in wire if stage == "l1-gpt"]) == int(enabled)
+    if enabled:
+        assert result["decision"] == "approve"
+        assert provenance["fallback_reason"]["code"] == "optional_escalation"
+    else:
+        assert provenance["route"] == "decisions"
+    saved = client.get(f"/api/v1/audit/{result['call_id']}").json()
+    assert saved["evaluation_metadata"]["backend_provenance"] == provenance
+    assert (
+        client.get("/api/v1/config").json()["evaluator"]["l1_review_enabled"] == enabled
+    )
+
+
+@pytest.mark.parametrize("service", [("decisions", "mixed")], indirect=True)
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize(
+    "case", ["low_confidence", "critical", "static_deny", "review_failure"]
+)
+def test_optional_review_never_duplicates_low_review_or_relaxes_critical(
+    service, legacy, case
+):
+    from intaris import server
+
+    client, app, wire = service
+    server._get_evaluator_backend().select().l1_review_enabled = True
+    hooks = app.state.offline_provider_hooks
+
+    def native_answers(answers):
+        if case == "low_confidence":
+            low_native_confidence(answers)
+        for answer in answers:
+            if answer["name"] == "decision" or (
+                case == "critical" and answer["name"] == "risk"
+            ):
+                label = "critical" if answer["name"] == "risk" else "escalate"
+                answer["choice"] = label
+                for probability in answer["probabilities"]:
+                    probability["probability"] = float(probability["value"] == label)
+
+    hooks["decisions_answers"] = native_answers
+    if case == "review_failure":
+        hooks["l1_status"] = 401
+    else:
+        hooks["l1_answer"] = lambda labels: {
+            **labels,
+            "risk": "low",
+            **({"consequence": "routine"} if "consequence" in labels else {}),
+        }
+    sid = str(uuid.uuid4())
+    policy = {
+        "evaluation_policy_version": "legacy" if legacy else "hybrid_v1",
+        **({"deny_tools": ["write"]} if case == "static_deny" else {}),
+    }
+    assert (
+        client.post(
+            "/api/v1/intention",
+            json={
+                "session_id": sid,
+                "intention": "Inspect local repository",
+                "policy": policy,
+            },
+        ).status_code
+        == 200
+    )
+    result = evaluate(client, sid)
+    reviews = [body for stage, body in wire if stage == "l1-gpt"]
+    if case in {"critical", "static_deny"}:
+        if case == "static_deny" or legacy:
+            assert result["decision"] == "deny", result
+        else:
+            # Upstream independently reviews model-predicted critical risk;
+            # this toggle must not add a generative L1 correction of its own.
+            assert (
+                result["evaluation_metadata"]["backend_provenance"]["route"]
+                == "decisions"
+            )
+        assert not reviews
+    else:
+        assert len(reviews) == 1
+        provenance = result["evaluation_metadata"]["backend_provenance"]
+        assert provenance["fallback_reason"]["code"] == (
+            "low_confidence" if case == "low_confidence" else "optional_escalation"
+        )
+        if case == "review_failure":
+            if legacy:
+                assert result["decision"] != "approve"
+            assert provenance["final_backend"] == "decisions"
+            assert provenance["attempts"][-1]["status"] == "failed"
+    assert client.get(f"/api/v1/session/{sid}").json()["total_calls"] == 1
+
+
+@pytest.mark.parametrize("service", [("decisions", "mixed")], indirect=True)
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        {"aligned": "false"},
+        {"reasoning": []},
+        {"risk": "unknown"},
+        {"decision": "allowed"},
+        {"reasoning": None},
+    ],
+)
+def test_legacy_optional_review_rejects_malformed_fields_and_retains_native(
+    service, invalid
+):
+    from intaris import server
+
+    client, app, wire = service
+    server._get_evaluator_backend().select().l1_review_enabled = True
+
+    def native_escalation(answers):
+        answer = next(row for row in answers if row["name"] == "decision")
+        answer["choice"] = "escalate"
+        for row in answer["probabilities"]:
+            row["probability"] = float(row["value"] == "escalate")
+
+    def malformed(labels):
+        result = {
+            **labels,
+            "risk": "low",
+            "aligned": True,
+            "decision": "approve",
+            **invalid,
+        }
+        if invalid == {"reasoning": None}:
+            result.pop("reasoning")
+        return result
+
+    app.state.offline_provider_hooks.update(
+        decisions_answers=native_escalation, l1_answer=malformed
+    )
+    sid = str(uuid.uuid4())
+    assert (
+        client.post(
+            "/api/v1/intention",
+            json={
+                "session_id": sid,
+                "intention": "Inspect local files",
+                "policy": {"evaluation_policy_version": "legacy"},
+            },
+        ).status_code
+        == 200
+    )
+    result = evaluate(client, sid)
+    assert result["decision"] != "approve"
+    assert len([body for stage, body in wire if stage == "l1-gpt"]) == 1
+    saved = client.get(f"/api/v1/audit/{result['call_id']}").json()
+    provenance = saved["evaluation_metadata"]["backend_provenance"]
+    assert provenance["final_backend"] == "decisions"
+    assert provenance["fallback_reason"]["code"] == "optional_escalation"
+    assert provenance["attempts"][-1]["status"] == "failed"
+    assert (
+        provenance["attempts"][-1]["diagnostics"]["failure"]["category"] == "ValueError"
+    )
+
+
+@pytest.mark.parametrize("service", [("decisions", "mixed")], indirect=True)
+@pytest.mark.parametrize("trigger", ["low_confidence", "temporary"])
+def test_legacy_mandatory_review_malformed_fields_fail_closed(
+    service, trigger, monkeypatch
+):
+    from intaris import model_retry
+
+    client, app, wire = service
+    monkeypatch.setattr(model_retry, "backoff_delay", lambda *args: 0)
+    hooks = app.state.offline_provider_hooks
+    if trigger == "low_confidence":
+        hooks["decisions_answers"] = low_native_confidence
+    else:
+        hooks["decisions_status"] = 503
+    hooks["l1_answer"] = lambda labels: {
+        **labels,
+        "aligned": "false",
+        "risk": "low",
+        "decision": "approve",
+    }
+    sid = str(uuid.uuid4())
+    assert (
+        client.post(
+            "/api/v1/intention",
+            json={
+                "session_id": sid,
+                "intention": "Inspect local files",
+                "policy": {"evaluation_policy_version": "legacy"},
+            },
+        ).status_code
+        == 200
+    )
+    response = client.post(
+        "/api/v1/evaluate",
+        json={
+            "session_id": sid,
+            "tool": "write",
+            "args": {"file_path": "/repo/notes.md", "content": "bounded"},
+        },
+    )
+    assert response.status_code >= 500, response.text
+    assert len([body for stage, body in wire if stage == "l1-gpt"]) == 1
+
+
+@pytest.mark.parametrize("service", [("decisions", "mixed")], indirect=True)
+def test_exhausted_shared_deadline_cannot_grant_or_start_new_l1_request(
+    service, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from intaris import model_retry, server
+
+    client, app, wire = service
+    sid = create(client)
+    now = [1000.0]
+    monkeypatch.setattr(model_retry, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    server._get_config().evaluation_deadline_ms = 1000
+
+    def exhausted(answers):
+        low_native_confidence(answers)
+        now[0] += 1.1
+
+    app.state.offline_provider_hooks["decisions_answers"] = exhausted
+    response = client.post(
+        "/api/v1/evaluate",
+        json={
+            "session_id": sid,
+            "tool": "write",
+            "args": {"file_path": "/repo/parser.py", "content": "bounded"},
+        },
+    )
+    assert response.status_code == 503, response.text
+    assert not [body for stage, body in wire if stage == "l1-gpt"]
+
+
+def low_native_confidence(answers):
+    answer = next(row for row in answers if row["type"] == "choice")
+    answer["confidence"] = 0.1
+
+
+@pytest.mark.parametrize(
+    "service", [("decisions", "mixed"), ("decisions", "source_context")], indirect=True
+)
+@pytest.mark.parametrize("legacy", [False, True])
+def test_low_decisions_confidence_resolves_at_l1_with_one_audit_record(service, legacy):
+    client, app, wire = service
+    hooks = app.state.offline_provider_hooks
+    hooks["decisions_answers"] = low_native_confidence
+    hooks["decisions_usage_details"] = {"cached_tokens": 4, "cache_write_tokens": 6}
+    hooks["l1_answer"] = lambda labels: {
+        **labels,
+        "risk": "low",
+        **({"consequence": "routine"} if "consequence" in labels else {}),
+    }
+    if legacy:
+        sid = str(uuid.uuid4())
+        response = client.post(
+            "/api/v1/intention",
+            json={
+                "session_id": sid,
+                "intention": "Update the local usage guide",
+                "policy": {"evaluation_policy_version": "legacy"},
+            },
+        )
+        assert response.status_code == 200, response.text
+    else:
+        sid = create(client)
+    result = evaluate(client, sid)
+    assert result["decision"] == "approve", result
+    assert not [body for stage, body in wire if stage == "judge"]
+    native = [body for stage, body in wire if stage == "l1-decisions"]
+    chat = [body for stage, body in wire if stage == "l1-gpt"]
+    assert len(native) == len(chat) == 1
+    provenance = result["evaluation_metadata"]["backend_provenance"]
+    assert provenance["route"] == "decisions_to_llm"
+    assert provenance["final_backend"] == "llm"
+    assert provenance["final_model"] == "openai/gpt-oss-20b"
+    assert provenance["fallback_reason"]["code"] == "low_confidence"
+    assert [row["backend"] for row in provenance["attempts"]] == ["decisions", "llm"]
+    assert provenance["attempts"][0]["usage"] == {
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "total_tokens": 15,
+        "input_tokens_details": {"cached_tokens": 4, "cache_write_tokens": 6},
+    }
+    from intaris.input_budget import measure
+
+    for row, body in zip(provenance["attempts"], [native[0], chat[0]], strict=True):
+        assert row["model_view"]["digest"] == measure(body)["digest"]
+    saved = client.get(f"/api/v1/audit/{result['call_id']}").json()
+    assert saved["evaluation_metadata"]["backend_provenance"] == provenance
+    records = client.get("/api/v1/audit", params={"session_id": sid}).json()
+    assert (
+        len([row for row in records["items"] if row["record_type"] == "tool_call"]) == 1
+    )
+    session = client.get(f"/api/v1/session/{sid}").json()
+    assert session["total_calls"] == 1
+
+
+@pytest.mark.parametrize("service", [("decisions", "source_context")], indirect=True)
+def test_low_decisions_confidence_still_uses_judge_when_l1_requires_review(service):
+    client, app, wire = service
+    app.state.offline_provider_hooks["decisions_answers"] = low_native_confidence
+    sid = create(client)
+    record(
+        client,
+        sid,
+        {
+            "type": "user_message",
+            "data": {"content": "Apply the bounded local parser patch."},
+        },
+    )
+    reason(client, sid)
+    result = evaluate(client, sid)
+    assert any(stage == "l1-gpt" for stage, _ in wire)
+    assert any(stage == "judge" for stage, _ in wire)
+    assert result["evaluation_metadata"]["context_input"]["judge_invoked"]
+    assert (
+        result["evaluation_metadata"]["backend_provenance"]["route"]
+        == "decisions_to_llm"
+    )
+
+
+@pytest.mark.parametrize("service", [("decisions", "mixed")], indirect=True)
+def test_high_confidence_decisions_does_not_invoke_l1_llm(service):
+    client, app, wire = service
+    app.state.offline_provider_hooks["decisions_usage_details"] = {
+        "cached_tokens": 8,
+        "cache_write_tokens": 0,
+    }
+    sid = create(client)
+    result = evaluate(client, sid)
+    assert not [body for stage, body in wire if stage == "l1-gpt"]
+    assert result["evaluation_metadata"]["backend_provenance"]["route"] == "decisions"
+    assert len(result["evaluation_metadata"]["backend_provenance"]["attempts"]) == 1
+    saved = client.get(f"/api/v1/audit/{result['call_id']}").json()
+    usage = saved["evaluation_metadata"]["backend_provenance"]["attempts"][0]["usage"]
+    assert usage == {
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "total_tokens": 15,
+        "input_tokens_details": {"cached_tokens": 8, "cache_write_tokens": 0},
+    }
+
+
+@pytest.mark.parametrize("service", [("decisions", "mixed")], indirect=True)
+@pytest.mark.parametrize(
+    "failure", ["refusal", "malformed", "auth", "review_failure", "cache_usage"]
+)
+def test_decisions_and_l1_review_failures_do_not_grant_execution(service, failure):
+    client, app, wire = service
+    hooks = app.state.offline_provider_hooks
+    if failure == "refusal":
+        hooks["decisions_answers"] = lambda answers: answers[0].update(type="refusal")
+    elif failure == "malformed":
+        hooks["decisions_answers"] = lambda answers: answers[0].update(confidence=True)
+    elif failure == "auth":
+        hooks["decisions_status"] = 401
+    elif failure == "cache_usage":
+        hooks["decisions_usage_details"] = {"cached_tokens": True}
+    else:
+        hooks["decisions_answers"] = low_native_confidence
+        hooks["l1_status"] = 401
+    sid = create(client)
+    response = client.post(
+        "/api/v1/evaluate",
+        json={
+            "session_id": sid,
+            "tool": "write",
+            "args": {"file_path": "/repo/parser.py", "content": "patch"},
+        },
+    )
+    assert response.status_code != 200 or response.json()["decision"] != "approve"
+    if failure != "review_failure":
+        assert not [body for stage, body in wire if stage == "l1-gpt"]
+
+
+@pytest.mark.parametrize("service", [("decisions", "mixed")], indirect=True)
+def test_decisions_review_shares_api_deadline_and_persists_provenance(
+    service, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from intaris import model_retry, server
+
+    client, app, wire = service
+    sid = create(client)
+    now = [1000.0]
+    monkeypatch.setattr(model_retry, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    server._get_config().evaluation_deadline_ms = 1000
+
+    def slow_native(answers):
+        low_native_confidence(answers)
+        now[0] += 0.8
+
+    app.state.offline_provider_hooks["decisions_answers"] = slow_native
+    app.state.offline_provider_hooks["l1_answer"] = lambda labels: {
+        **labels,
+        "risk": "low",
+        **({"consequence": "routine"} if "consequence" in labels else {}),
+    }
+    timeouts = []
+    native_timeouts = []
+    original = httpx.HTTPTransport.handle_request
+
+    def observe(transport, req):
+        if req.url.path.endswith("/decisions"):
+            native_timeouts.append(req.extensions["timeout"]["read"])
+        if req.method == "POST" and req.url.path.endswith("chat/completions"):
+            body = json.loads(req.content)
+            if body["model"] == "openai/gpt-oss-20b":
+                timeouts.append(req.extensions["timeout"]["read"])
+        return original(transport, req)
+
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", observe)
+    result = evaluate(client, sid)
+    assert result["decision"] == "approve"
+    assert len(timeouts) == 1 and 0 < timeouts[0] <= 0.201
+    assert len(native_timeouts) == 1 and 0 < native_timeouts[0] <= 0.501
+    saved = client.get(f"/api/v1/audit/{result['call_id']}").json()
+    assert (
+        saved["evaluation_metadata"]["backend_provenance"]["route"]
+        == "decisions_to_llm"
+    )
+
+
 def test_actual_service_barrier_and_both_provider_payloads(service):
     client, app, wire = service
     sid = create(client)
@@ -484,6 +1061,12 @@ def test_actual_service_barrier_and_both_provider_payloads(service):
     assert l1
     for body in l1:
         serialized = json.dumps(body)
+        if "input" in body:
+            parts = body["input"][0]["content"]
+            assert parts[0]["type"] == "input_text"
+            assert parts[0]["prompt_cache_breakpoint"] == {"mode": "explicit"}
+            assert CANARY not in parts[0]["text"]
+            assert CANARY in json.dumps(parts[1])
         # Original instructions accompany the generated goal at L1 as well as
         # Judge; provenance, not omission, prevents authority promotion.
         assert CANARY in serialized
@@ -505,7 +1088,7 @@ def test_actual_service_barrier_and_both_provider_payloads(service):
         )
         assert "independent_grant" not in serialized
         assert '"authorization_sources":' not in serialized
-        assert body["model"] in {"openai/gpt-oss-20b", "jev-1.13.0"}
+        assert body["model"] in {"openai/gpt-oss-20b", "jev-1.13.0", "gpt-6-luna"}
     judge = next(body for stage, body in wire if stage == "judge")
     assert CANARY in json.dumps(judge)
     assert "Apply this local parser patch?" in json.dumps(judge)
@@ -1182,6 +1765,8 @@ def test_l1_v4_transport_action_first_and_frozen_judge(
             prompt = (
                 payload["state"]["prompt"]
                 if stage == "l1-jev"
+                else payload["input"][0]["content"][1]["data"]["prompt"]
+                if stage == "l1-decisions"
                 else payload["messages"][1]["content"]
             )
             # Jev prepends the unchanged system instructions to its single
