@@ -36,13 +36,18 @@
 
 import type { Plugin } from "@opencode-ai/plugin"
 import { realpathSync } from "node:fs"
+import { createRequire } from "node:module"
 
 interface RecordingEvent {
   type: string
   data: Record<string, any>
 }
 
+interface V2Authority { current: () => boolean }
+
 interface SessionState {
+  workingDirectory: string
+  reasoningError?: boolean
   intarisSessionId: string | null
   sessionCreated: boolean
   callCount: number
@@ -66,8 +71,15 @@ interface SessionState {
   pendingUserMessageId: string | null
   pendingUserText: string
   reasoningSentForMessageId: string | null
+  v2Authority?: V2Authority
+  v2Receipt?: { id: string; authority: V2Authority }
+  v2Admission?: { id: string; text: string; authority: V2Authority; promise: Promise<void>; predecessor: Promise<void>; controller: AbortController; waiters: number; startedWork: boolean }
+  v2SelectedUserID?: string
+  v2AdmissionTail: Promise<void>
   // Recording buffer
   recordingBuffer: RecordingEvent[]
+  recordingTail: Promise<void>
+  recordingFailed: boolean
   toolCallAuditIds: Map<string, string>
 }
 
@@ -80,7 +92,17 @@ interface EvaluateResponse {
   latency_ms: number
 }
 
-export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => {
+const IntarisPlugin = async (
+  { client, worktree, directory }: Parameters<Plugin>[0],
+  options?: {
+    sessionInfo: (id: string) => Promise<{ directory: string; parentID?: string; title?: string; agent?: string }>
+    onDispose: (dispose: () => void) => void
+    onStateRemoved: (id: string) => void
+    onReceiptLookup: (lookup: (id: string, messageID: string) => boolean) => void
+    onAdmission: (admit: (id: string, messageID: string, text: string, authority: V2Authority, signal: AbortSignal, prepare: (current: () => boolean) => Promise<void>) => Promise<void>) => void
+    onLifecycle: (api: { capture: (id: string) => V2Authority; revoke: (id: string) => void; revokeAll: () => void }) => void
+  },
+) => {
   // -- Configuration --------------------------------------------------------
   const baseUrl = process.env.INTARIS_URL || "http://localhost:8060"
   const apiKey = process.env.INTARIS_API_KEY || ""
@@ -122,6 +144,79 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
   const MAX_SESSIONS = 100
   const MAX_RECENT_TOOLS = 10
   const sessions = new Map<string, SessionState>()
+  const sessionIO = new Map<string, Promise<void>>()
+  function retainIO(sessionId: string, request: Promise<unknown>): void {
+    const earlier = sessionIO.get(sessionId) || Promise.resolve()
+    const fence = Promise.all([earlier, request]).then(() => {}, () => {})
+    sessionIO.set(sessionId, fence)
+    void fence.then(() => { if (sessionIO.get(sessionId) === fence) sessionIO.delete(sessionId) })
+  }
+  let disposed = false
+  function clearAuthority(state: SessionState): void {
+    state.v2Authority = undefined
+    state.v2Receipt = undefined
+    state.v2Admission = undefined
+    state.v2SelectedUserID = undefined
+    state.reasoningSentForMessageId = null
+    state.reasoningError = false
+    state.pendingUserMessageId = null
+    state.pendingUserText = ""
+    state.intentionPending = false
+  }
+  options?.onLifecycle({
+    capture: id => {
+      if (disposed) throw new Error("[intaris] Plugin disposed")
+      const state = getOrCreateState(id)
+      if (state.v2Authority?.current()) return state.v2Authority
+      const authority: V2Authority = {
+        current: () => !disposed && sessions.get(id) === state && state.v2Authority === authority,
+      }
+      state.v2Authority = authority
+      return authority
+    },
+    revoke: id => { const state = sessions.get(id); if (state) clearAuthority(state) },
+    revokeAll: () => { for (const state of sessions.values()) clearAuthority(state) },
+  })
+  options?.onDispose(() => { disposed = true; for (const state of sessions.values()) clearAuthority(state); sessions.clear() })
+  function hasReceipt(state: SessionState, messageID: string, authority: V2Authority): boolean {
+    return authority.current() && state.v2Authority === authority
+      && state.v2Receipt?.id === messageID && state.v2Receipt.authority === authority
+      && !state.reasoningError && state.reasoningSentForMessageId === messageID
+      && (!state.pendingUserMessageId || state.pendingUserMessageId === messageID)
+  }
+  options?.onReceiptLookup((id, messageID) => {
+    const state = sessions.get(id)
+    return !!state && !!state.v2Authority && state.v2SelectedUserID === messageID
+      && hasReceipt(state, messageID, state.v2Authority)
+  })
+  type ResolvedSession = { directory: string; parentID?: string; title?: string; agent?: string }
+  const metadataReady = new WeakMap<SessionState, Promise<ResolvedSession>>()
+  async function loadSessionInfo(sessionId: string, state: SessionState, signal?: AbortSignal, assertCurrent?: () => void): Promise<void> {
+    if (!options) return
+    let ready = metadataReady.get(state)
+    if (!ready) {
+      ready = options.sessionInfo(sessionId)
+      metadataReady.set(state, ready)
+      // A rejected lookup must not poison the cache: evict it so a later
+      // call retries instead of re-awaiting the rejected promise forever.
+      ready.catch(() => { if (metadataReady.get(state) === ready) metadataReady.delete(state) })
+    }
+    const cancel = () => { if (metadataReady.get(state) === ready) metadataReady.delete(state) }
+    signal?.addEventListener("abort", cancel, { once: true })
+    let info: ResolvedSession
+    try {
+      info = await ready
+    } finally {
+      signal?.removeEventListener("abort", cancel)
+    }
+    if (signal?.aborted) throw new Error("[intaris] Execution cancelled")
+    assertCurrent?.()
+    if (!info.directory) throw new Error("[intaris] Missing session directory")
+    state.workingDirectory = info.directory
+    if (info.parentID) state.parentSessionId = `oc-${info.parentID}`
+    if (info.agent) state.agentName = info.agent
+    if (info.title && !state.sessionTitle) state.sessionTitle = info.title
+  }
 
   // -- API Client -----------------------------------------------------------
 
@@ -137,6 +232,7 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
     payload: object | null,
     timeoutMs: number = 5000,
     extraHeaders?: Record<string, string>,
+    signal?: AbortSignal,
   ): Promise<ApiResult> {
     const headers: Record<string, string> = {
       "X-Agent-Id": agentId,
@@ -156,7 +252,7 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
       const fetchOptions: RequestInit = {
         method,
         headers,
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: signal ? AbortSignal.any([AbortSignal.timeout(timeoutMs), signal]) : AbortSignal.timeout(timeoutMs),
       }
       if (payload !== null) {
         fetchOptions.body = JSON.stringify(payload)
@@ -209,12 +305,15 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
     payload: object | null,
     timeoutMs: number = 30000,
     maxRetries: number = 3,
+    assertCurrent?: () => void,
   ): Promise<ApiResult> {
     const backoffMs = [1000, 2000, 4000]
     let lastResult: ApiResult = { data: null, error: "no attempts", status: null }
 
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      assertCurrent?.()
       lastResult = await callApi(method, path, payload, timeoutMs)
+      assertCurrent?.()
 
       // Success — return immediately
       if (lastResult.data !== null) return lastResult
@@ -237,6 +336,7 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
           })
           .catch(() => {})
         await new Promise((resolve) => setTimeout(resolve, delay))
+        assertCurrent?.()
       }
     }
 
@@ -270,7 +370,10 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
     tool: string,
     callId: string,
     reason: string,
+    signal?: AbortSignal,
+    assertCurrent?: () => void,
   ): Promise<void> {
+    assertCurrent?.()
     await client.app
       .log({
         body: {
@@ -280,6 +383,7 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
         },
       })
       .catch(() => {})
+    assertCurrent?.()
     showToast(
       `Tool "${tool}" escalated — approve or deny in Intaris UI.\n${reason}`,
       "warning",
@@ -292,6 +396,8 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
     let lastReminderAt = startTime
 
     while (true) {
+      assertCurrent?.()
+      if (signal?.aborted) throw new Error("[intaris] Approval cancelled")
       if (escalationTimeoutMs > 0 && Date.now() - startTime > escalationTimeoutMs) {
         throw new Error(
           `[intaris] ESCALATION TIMEOUT (${callId}): ${reason}\n` +
@@ -311,6 +417,7 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
             },
           })
           .catch(() => {})
+        assertCurrent?.()
         showToast(
           `Still waiting for approval of "${tool}"... (${waitSec}s)`,
           "info",
@@ -319,7 +426,13 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
       }
 
       const delay = pollBackoffMs[Math.min(pollAttempt, pollBackoffMs.length - 1)]
-      await new Promise((resolve) => setTimeout(resolve, delay))
+      await new Promise<void>((resolve, reject) => {
+        if (signal?.aborted) return reject(new Error("[intaris] Approval cancelled"))
+        const timer = setTimeout(() => { signal?.removeEventListener("abort", cancel); resolve() }, delay)
+        const cancel = () => { clearTimeout(timer); reject(new Error("[intaris] Approval cancelled")) }
+        signal?.addEventListener("abort", cancel, { once: true })
+      })
+      assertCurrent?.()
       pollAttempt++
 
       const { data: auditRecord } = await callApi(
@@ -327,11 +440,16 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
         `/api/v1/audit/${encodeURIComponent(callId)}`,
         null,
         5000,
+        undefined,
+        signal,
       )
+      assertCurrent?.()
 
       if (!auditRecord) continue
 
+      if (signal?.aborted) throw new Error("[intaris] Approval cancelled")
       if (auditRecord.user_decision === "approve") {
+        assertCurrent?.()
         await client.app
           .log({
             body: {
@@ -341,7 +459,10 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
             },
           })
           .catch(() => {})
+        assertCurrent?.()
         showToast(`Tool "${tool}" approved — proceeding`, "success")
+        if (signal?.aborted) throw new Error("[intaris] Approval cancelled")
+        assertCurrent?.()
         return
       }
 
@@ -363,6 +484,7 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
     let state = sessions.get(sessionId)
     if (!state) {
       state = {
+        workingDirectory,
         intarisSessionId: null,
         sessionCreated: false,
         callCount: 0,
@@ -383,7 +505,10 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
         pendingUserMessageId: null,
         pendingUserText: "",
         reasoningSentForMessageId: null,
+        v2AdmissionTail: sessionIO.get(sessionId) || Promise.resolve(),
         recordingBuffer: [],
+        recordingTail: sessionIO.get(sessionId) || Promise.resolve(),
+        recordingFailed: false,
         toolCallAuditIds: new Map(),
       }
       sessions.set(sessionId, state)
@@ -393,7 +518,10 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
         let count = 0
         for (const key of sessions.keys()) {
           if (count >= excess) break
+          const removed = sessions.get(key)
+          if (removed) clearAuthority(removed)
           sessions.delete(key)
+          options?.onStateRemoved(key)
           count++
         }
       }
@@ -415,7 +543,7 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
       if (title) {
         return `OpenCode ${agent}: ${title}`
       }
-      return `OpenCode ${agent} session in ${workingDirectory || "unknown"}`
+      return `OpenCode ${agent} session in ${state.workingDirectory || "unknown"}`
     }
 
     // For main sessions, use title if available
@@ -423,8 +551,8 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
       return state.sessionTitle
     }
 
-    if (workingDirectory) {
-      return `OpenCode coding session in ${workingDirectory}`
+    if (state.workingDirectory) {
+      return `OpenCode coding session in ${state.workingDirectory}`
     }
     return "OpenCode coding session"
   }
@@ -435,7 +563,7 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
   function buildDetails(state: SessionState): Record<string, any> {
     const details: Record<string, any> = {
       source: "opencode",
-      working_directory: workingDirectory,
+      working_directory: state.workingDirectory,
     }
     if (state.agentName) {
       details.agent_type = state.agentName
@@ -472,7 +600,7 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
     return patterns
   }
 
-  function buildPolicy(): Record<string, any> | null {
+  function buildPolicy(state: SessionState): Record<string, any> | null {
     const home = process.env.HOME || process.env.USERPROFILE || ""
     const builtinPaths: string[] = [...globPatternsFor("/tmp"), ...globPatternsFor("/var/tmp")]
     const tmpDir = process.env.TMPDIR
@@ -482,8 +610,8 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
     if (home) {
       builtinPaths.push(`${home}/.local/share/opencode/*`)
     }
-    if (workingDirectory) {
-      builtinPaths.push(`${workingDirectory}/*`)
+    if (state.workingDirectory) {
+      builtinPaths.push(`${state.workingDirectory}/*`)
     }
     const userPatterns = allowPathsRaw
       ? allowPathsRaw
@@ -555,7 +683,7 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
       `OpenCode session${agent} completed. ${state.callCount} tool calls ` +
       `(${state.approvedCount} approved, ${state.deniedCount} denied, ` +
       `${state.escalatedCount} escalated). ` +
-      `Working directory: ${workingDirectory || "unknown"}`
+      `Working directory: ${state.workingDirectory || "unknown"}`
     )
   }
 
@@ -601,11 +729,16 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
       messageID?: string
       sessionID?: string
     },
+    v2 = false,
+    isCurrent?: () => boolean,
+    authority?: V2Authority,
   ): Promise<void> {
     if (!state.intarisSessionId || !userText) return
+    if (v2 && !isCurrent?.()) throw new Error("[intaris] User admission superseded")
 
     const effectiveMessageId = messageId || input?.messageID || null
-    if (effectiveMessageId && state.reasoningSentForMessageId === effectiveMessageId) {
+    if (effectiveMessageId && (v2 ? !!authority && hasReceipt(state, effectiveMessageId, authority)
+      : state.reasoningSentForMessageId === effectiveMessageId)) {
       state.pendingUserMessageId = null
       state.pendingUserText = ""
       return
@@ -614,9 +747,9 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
     const assistantContext = state.lastAssistantText || undefined
     state.lastAssistantText = ""
 
-    let reasoningResult: { error?: string; status?: number }
+    let reasoningResult: ApiResult
 
-    if (sessionRecording) {
+    if (sessionRecording && !v2) {
       // When session recording is enabled, record the user message
       // event first, flush synchronously to ensure it's in the event
       // store, then trigger reasoning with from_events=true to avoid
@@ -635,19 +768,8 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
         },
       })
 
-      // Await the flush directly instead of using the fire-and-forget
-      // flushRecordingBuffer helper — the /reasoning call depends on
-      // the events being persisted server-side.
-      if (state.intarisSessionId && state.recordingBuffer.length > 0) {
-        const events = state.recordingBuffer.splice(0)
-        await callApi(
-          "POST",
-          `/api/v1/session/${encodeURIComponent(state.intarisSessionId)}/events`,
-          events,
-          5000,
-          { "X-Intaris-Source": "opencode" },
-        ).catch(() => {})
-      }
+      // Wait for buffered events and any auto-flushed upload already in flight.
+      await flushRecordingBuffer(sessionId)
 
       reasoningResult = await callApi(
         "POST",
@@ -660,8 +782,21 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
         30000,
       )
     } else {
-      // Without recording, send the content directly via /reasoning.
-      reasoningResult = await callApi(
+      // V2 submits the selected native user's text directly: event-store
+      // resolution can acknowledge an older message (or return a 200 no-op).
+      if (v2) {
+        recordEvent(sessionId, {
+          type: "message",
+          data: {
+            role: "user", text: userText, agent: input?.agent, model: input?.model,
+            messageID: effectiveMessageId, sessionID: input?.sessionID || sessionId,
+          },
+        })
+        if (!await flushRecordingBuffer(sessionId) || !isCurrent?.()) {
+          throw new Error("[intaris] User recording not settled; retry the user instruction")
+        }
+      }
+      const request = callApi(
         "POST",
         "/api/v1/reasoning",
         {
@@ -671,8 +806,10 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
         },
         30000,
       )
+      if (v2) retainIO(sessionId, request)
+      reasoningResult = await request
 
-      recordEvent(sessionId, {
+      if (!v2) recordEvent(sessionId, {
         type: "message",
         data: {
           role: "user",
@@ -685,22 +822,79 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
       })
     }
 
-    if (reasoningResult.error) {
+    if (v2 && !isCurrent?.()) throw new Error("[intaris] User admission superseded")
+
+    if (reasoningResult.error || (v2 && (reasoningResult.data?.ok !== true
+      || typeof reasoningResult.data.call_id !== "string" || !reasoningResult.data.call_id.trim()))) {
+      state.reasoningError = true
       await client.app.log({
         body: {
           service: "intaris",
           level: "error",
-          message: `Intaris: /reasoning failed — ${reasoningResult.error} (status=${reasoningResult.status}, contextLen=${assistantContext ? assistantContext.length : 0})`,
+          message: `Intaris: /reasoning failed — ${reasoningResult.error || "no acknowledgement"} (status=${reasoningResult.status}, contextLen=${assistantContext ? assistantContext.length : 0})`,
         },
       }).catch(() => {})
       return
     }
 
+    state.reasoningError = false
     state.intentionPending = true
     state.reasoningSentForMessageId = effectiveMessageId
+    if (v2 && effectiveMessageId && authority) state.v2Receipt = { id: effectiveMessageId, authority }
     state.pendingUserMessageId = null
     state.pendingUserText = ""
   }
+
+  options?.onAdmission((sessionId, messageID, text, authority, signal, prepare) => {
+    const state = sessions.get(sessionId)
+    if (!state || !authority.current() || state.v2Authority !== authority) {
+      return Promise.reject(new Error("[intaris] User admission superseded"))
+    }
+    const join = (admission: NonNullable<SessionState["v2Admission"]>) => {
+      admission.waiters++
+      const cancel = () => {
+        admission.waiters--
+        if (admission.waiters === 0 && !admission.startedWork && state.v2Admission === admission) {
+          state.v2Admission = undefined
+          state.v2AdmissionTail = admission.predecessor
+          admission.controller.abort()
+        }
+      }
+      signal.addEventListener("abort", cancel, { once: true })
+      if (signal.aborted) cancel()
+      void admission.promise.finally(() => signal.removeEventListener("abort", cancel)).catch(() => {})
+      return admission.promise
+    }
+    if (state.v2Admission?.authority === authority && state.v2Admission.id === messageID && state.v2Admission.text === text) return join(state.v2Admission)
+    state.v2SelectedUserID = messageID
+    if (hasReceipt(state, messageID, authority)) return Promise.resolve()
+
+    const controller = new AbortController()
+    let admission: NonNullable<SessionState["v2Admission"]>
+    const current = () => !disposed && sessions.get(sessionId) === state && state.v2SelectedUserID === messageID
+      && state.v2Authority === authority && authority.current() && state.v2Admission === admission && !controller.signal.aborted
+    const assertCurrent = () => { if (!current()) throw new Error("[intaris] User admission superseded") }
+    const previous = state.v2AdmissionTail
+    const promise = previous.then(async () => {
+      if (!current()) throw new Error("[intaris] User admission superseded")
+      if (!await ensureSession(sessionId, state, controller.signal, assertCurrent) || !current()) throw new Error("[intaris] User admission unavailable")
+      admission.startedWork = true
+      state.recordingFailed = false
+      await prepare(current)
+      if (!current()) throw new Error("[intaris] User admission superseded")
+      state.pendingUserMessageId = messageID
+      state.pendingUserText = text
+      await forwardUserReasoning(sessionId, state, text, messageID, undefined, true, current, authority)
+      if (!current() || !hasReceipt(state, messageID, authority)) {
+        throw new Error("[intaris] User intention submission failed; provide a fresh user instruction")
+      }
+    })
+    admission = { id: messageID, text, authority, promise, predecessor: previous, controller, waiters: 0, startedWork: false }
+    state.v2Admission = admission
+    state.v2AdmissionTail = promise.then(() => {}, () => {})
+    void promise.finally(() => { if (state.v2Admission === admission) state.v2Admission = undefined }).catch(() => {})
+    return join(admission)
+  })
 
   // -- Recording Helpers ---------------------------------------------------
 
@@ -724,38 +918,34 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
     }
   }
 
-  /**
-   * Flush the recording buffer for a session (fire-and-forget).
-   * Sends buffered events to POST /session/{id}/events.
-   */
-  function flushRecordingBuffer(sessionId: string): void {
-    const state = sessions.get(sessionId)
-    if (!state?.intarisSessionId) return
-    if (state.recordingBuffer.length === 0) return
-
-    // Drain the buffer
-    const events = state.recordingBuffer.splice(0)
-
-    callApi(
-      "POST",
-      `/api/v1/session/${encodeURIComponent(state.intarisSessionId)}/events`,
-      events,
-      5000,
-      { "X-Intaris-Source": "opencode" },
-    ).then(({ error, status }) => {
-      if (error) {
-        client.app
-          .log({
-            body: {
-              service: "intaris",
-              level: "warn",
-              message: `Recording flush failed for ${state!.intarisSessionId}: ${error} (HTTP ${status})`,
-              extra: { eventCount: events.length },
-            },
-          })
-          .catch(() => {})
+  function uploadRecording(sessionId: string, state: SessionState, events: RecordingEvent[]): Promise<void> {
+    const upload = state.recordingTail.then(async () => {
+      if (!state.intarisSessionId) {
+        state.recordingFailed = true
+        return
       }
-    }).catch(() => {})
+      const { error, status } = await callApi(
+        "POST", `/api/v1/session/${encodeURIComponent(state.intarisSessionId)}/events`,
+        events, 5000, { "X-Intaris-Source": "opencode" },
+      )
+      if (error) {
+        state.recordingFailed = true
+        client.app.log({ body: { service: "intaris", level: "warn",
+          message: `Recording flush failed for ${state.intarisSessionId}: ${error} (HTTP ${status})`,
+          extra: { eventCount: events.length } } }).catch(() => {})
+      }
+    })
+    state.recordingTail = upload.catch(() => { state.recordingFailed = true })
+    retainIO(sessionId, state.recordingTail)
+    return state.recordingTail
+  }
+
+  /** Flush buffered recording through the same ordered chain as earlier uploads. */
+  function flushRecordingBuffer(sessionId: string): Promise<boolean> {
+    const state = sessions.get(sessionId)
+    if (!state?.intarisSessionId) return Promise.resolve(false)
+    if (state.recordingBuffer.length > 0) void uploadRecording(sessionId, state, state.recordingBuffer.splice(0))
+    return state.recordingTail.then(() => !state.recordingFailed && !disposed && sessions.get(sessionId) === state)
   }
 
   // Periodic recording flush timer (flushes all sessions)
@@ -767,6 +957,7 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
       }
     }, recordingFlushMs)
   }
+  options?.onDispose(() => { if (recordingFlushTimer) clearInterval(recordingFlushTimer) })
 
   /**
    * Ensure an Intaris session exists for the given OpenCode session.
@@ -776,7 +967,11 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
   async function ensureSession(
     sessionId: string,
     state: SessionState,
+    signal?: AbortSignal,
+    assertCurrent?: () => void,
   ): Promise<string | null> {
+    await loadSessionInfo(sessionId, state, signal, assertCurrent)
+    assertCurrent?.()
     if (state.intarisSessionId) return state.intarisSessionId
 
     // Generate a deterministic Intaris session ID from the OpenCode session
@@ -789,7 +984,7 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
     }
 
     // Include allow_paths policy from INTARIS_ALLOW_PATHS
-    const policy = buildPolicy()
+    const policy = buildPolicy(state)
     if (policy) {
       intentionBody.policy = policy
     }
@@ -805,7 +1000,9 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
       intentionBody,
       5000, // 5s timeout for session creation
       2,    // 2 retries
+      assertCurrent,
     )
+    assertCurrent?.()
 
     if (data) {
       state.intarisSessionId = intarisSessionId
@@ -820,6 +1017,16 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
         })
         .catch(() => {})
     } else if (status === 409) {
+      if (options) {
+        const existing = await callApi(
+          "GET", `/api/v1/session/${encodeURIComponent(intarisSessionId)}`, null, 5000,
+          undefined, signal,
+        )
+        assertCurrent?.()
+        if (existing.error || existing.data?.details?.working_directory !== state.workingDirectory) {
+          throw new Error("[intaris] Cannot verify the existing session's project boundary; start a new native OpenCode session")
+        }
+      }
       // Session already exists (resumed OpenCode session) — reuse it
       state.intarisSessionId = intarisSessionId
       await client.app
@@ -840,7 +1047,8 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
         { status: "active" },
         2000,
       ).catch(() => {})
-      callApi(
+      // V2 reuse must not overwrite the persisted boundary just verified above.
+      if (!options) callApi(
         "PATCH",
         `/api/v1/session/${encodeURIComponent(intarisSessionId)}`,
         { intention: buildIntention(state), details: buildDetails(state) },
@@ -917,7 +1125,9 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
     for (const [childId, childState] of sessions) {
       if (childState.parentSessionId === parentIntarisId && childState.intarisSessionId) {
         signalCompletion(childState.intarisSessionId, childState, childId)
+        clearAuthority(childState)
         sessions.delete(childId)
+        options?.onStateRemoved(childId)
       }
     }
   }
@@ -1028,7 +1238,7 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
     },
 
     // -- Session Lifecycle --------------------------------------------------
-    event: async ({ event }: { event: { type: string; properties: any } }) => {
+    event: async ({ event }: { event: { type: string; properties: any; assertCurrent?: () => void } }) => {
       if (event.type === "session.created") {
         const sessionId: string = event.properties?.info?.id
         if (!sessionId) return
@@ -1069,7 +1279,7 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
           callApi(
             "PATCH",
             `/api/v1/session/${encodeURIComponent(state.intarisSessionId)}`,
-            { intention: buildIntention(state), details: buildDetails(state) },
+            { intention: buildIntention(state), ...(!options && { details: buildDetails(state) }) },
             2000,
           ).catch(() => {})
         }
@@ -1089,7 +1299,9 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
         completeChildSessions(state.intarisSessionId)
         state.messageRoles.clear()
         state.recentMessageText.clear()
+        clearAuthority(state)
         sessions.delete(sessionId)
+        options?.onStateRemoved(sessionId)
       }
 
       // Handle session.idle — transition parent sessions to idle,
@@ -1105,7 +1317,9 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
         if (state.parentSessionId) {
           // Child sessions (sub-agents): idle means the task is done
           signalCompletion(state.intarisSessionId, state, sessionId)
+          clearAuthority(state)
           sessions.delete(sessionId)
+          options?.onStateRemoved(sessionId)
         } else {
           // Parent sessions: transition to idle so the UI shows the
           // session is waiting for user input, not actively working
@@ -1126,6 +1340,7 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
       // streaming deltas. Captures assistant text, step-start/finish, tool
       // invocations, and all other part types for full session fidelity.
       if (event.type === "message.part.updated") {
+        event.assertCurrent?.()
         const part = event.properties?.part
         if (!part) return
 
@@ -1165,6 +1380,7 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
 
       // message.updated captures full message metadata (role, model, tokens)
       if (event.type === "message.updated") {
+        event.assertCurrent?.()
         const info = event.properties?.info
         if (!info) return
 
@@ -1175,9 +1391,12 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
         rememberMessageRole(state, info.id, info.role)
 
         if (info.role === "user") {
+          event.assertCurrent?.()
           state.pendingUserMessageId = info.id
           state.pendingUserText = state.recentMessageText.get(info.id) || ""
           await resumeSessionIfIdle(state).catch(() => {})
+          if (options && (disposed || sessions.get(sessionId) !== state)) return
+          event.assertCurrent?.()
         } else if (info.role === "assistant") {
           const latestText = state.recentMessageText.get(info.id)
           if (latestText) {
@@ -1185,6 +1404,7 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
           }
         }
 
+        event.assertCurrent?.()
         recordEvent(sessionId, {
           type: "message",
           data: {
@@ -1200,27 +1420,42 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
 
     // -- Tool Interception --------------------------------------------------
     "tool.execute.before": async (
-      input: { tool: string; sessionID: string; callID: string },
+      input: {
+        tool: string; sessionID: string; callID: string
+        signal?: AbortSignal
+        assertCurrent?: () => void
+        codeMode?: { onApproved: (auditId: string) => void }
+        userMessageID?: string
+      },
       _output: { args: any },
     ) => {
       const { tool, sessionID } = input
-      if (!sessionID) return
+      if (!sessionID) {
+        if (input.codeMode) throw new Error("[intaris] Missing session identity")
+        return
+      }
 
       // Skip evaluation for invalid/unavailable tool calls.
       // OpenCode fires tool.execute.before even when the model tries to
       // call a tool that doesn't exist — the args contain an error message.
       // No point evaluating these; they'll fail on their own.
       const args = _output.args || {}
-      if (typeof args.error === "string" && args.error.includes("unavailable tool")) {
+      if (!input.codeMode && typeof args.error === "string" && args.error.includes("unavailable tool")) {
         return
       }
 
       const state = getOrCreateState(sessionID)
+      const assertCurrent = () => {
+        if (input.userMessageID && sessions.get(sessionID) !== state) throw new Error("[intaris] Session superseded")
+        input.assertCurrent?.()
+      }
+      assertCurrent()
 
       // Ensure session exists (lazy creation for resumed sessions)
-      const intarisSessionId = await ensureSession(sessionID, state)
+      const intarisSessionId = await ensureSession(sessionID, state, input.signal, assertCurrent)
+      assertCurrent()
       if (!intarisSessionId) {
-        if (failOpen) return
+        if (failOpen && !input.codeMode) { assertCurrent(); return }
         const detail = state.lastError || "unknown error"
         throw new Error(
           `[intaris] Cannot create session: ${detail}`,
@@ -1230,14 +1465,23 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
       // In web mode, chat.message does not fire. The event stream still
       // captures the user's message parts, so forward them here before the
       // first tool call to keep intention tracking and recording intact.
-      if (state.pendingUserText) {
+      if (!input.userMessageID && state.pendingUserText) {
         await forwardUserReasoning(
           sessionID,
           state,
           state.pendingUserText,
           state.pendingUserMessageId || undefined,
+          undefined,
+          !!input.userMessageID,
         )
       }
+      if (input.userMessageID && (state.v2SelectedUserID !== input.userMessageID || state.reasoningError
+        || state.reasoningSentForMessageId !== input.userMessageID
+        || (state.pendingUserMessageId && state.pendingUserMessageId !== input.userMessageID))) {
+        throw new Error("[intaris] User intention submission failed; provide a fresh user instruction")
+      }
+      if (input.userMessageID) state.isIdle = false
+      assertCurrent()
 
       // Record tool call event (before evaluation, fire-and-forget)
       recordEvent(sessionID, {
@@ -1255,6 +1499,7 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
       // When intentionPending is true, the server waits for the
       // /reasoning call to arrive before evaluating (race condition fix).
       const intentionPending = state.intentionPending
+      assertCurrent()
       const { data: result, error: evalError, status: evalStatus } = await callApi(
         "POST",
         "/api/v1/evaluate",
@@ -1265,7 +1510,11 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
           ...(intentionPending && { intention_pending: true }),
         },
         60000,
+        undefined,
+        input.signal,
       )
+      assertCurrent()
+      if (input.signal?.aborted) throw new Error("[intaris] Execution cancelled")
 
       // Clear the flag after the first evaluate call — subsequent tool
       // calls in this turn benefit from the already-updated intention.
@@ -1281,7 +1530,7 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
           )
         }
         // Intaris unreachable or server error
-        if (failOpen) {
+        if (failOpen && !input.codeMode) {
           await client.app
             .log({
               body: {
@@ -1291,12 +1540,19 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
               },
             })
             .catch(() => {})
+          assertCurrent()
           return
         }
         throw new Error(
           `[intaris] Evaluation failed for ${tool}: ${evalError || "server unreachable"} (INTARIS_FAIL_OPEN=false)`,
         )
       }
+      if (input.codeMode && (
+        !["approve", "deny", "escalate"].includes(result.decision)
+        || typeof result.call_id !== "string" || !result.call_id.trim()
+        || typeof result.path !== "string" || !result.path
+        || !Number.isInteger(result.latency_ms) || result.latency_ms < 0
+      )) throw new Error("[intaris] Invalid execution evaluation response")
 
       // Track decision statistics
       state.callCount++
@@ -1323,6 +1579,7 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
           },
         })
         .catch(() => {})
+      assertCurrent()
 
       // Send periodic checkpoint (fire-and-forget, non-blocking)
       sendCheckpoint(intarisSessionId, state)
@@ -1331,6 +1588,7 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
       updateIntention(intarisSessionId, state)
 
       if (result.decision === "deny") {
+        if (input.codeMode && result.session_status === "suspended") throw new Error("[intaris] Execution suspended; retry after reactivation")
         // Handle session-level suspension: wait for user action
         // (reactivation or termination) rather than dying immediately.
         if (result.session_status === "suspended") {
@@ -1344,6 +1602,7 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
               },
             })
             .catch(() => {})
+          assertCurrent()
           showToast(
             `Session suspended: ${statusReason}. Reactivate in Intaris UI.`,
             "warning",
@@ -1357,6 +1616,7 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
           let suspendLastReminder = suspendStart
 
           while (true) {
+            assertCurrent()
             // Check timeout (reuse escalation timeout)
             if (escalationTimeoutMs > 0 && Date.now() - suspendStart > escalationTimeoutMs) {
               throw new Error(
@@ -1378,6 +1638,7 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
                   },
                 })
                 .catch(() => {})
+              assertCurrent()
               showToast(
                 `Session still suspended... (${waitSec}s)`,
                 "info",
@@ -1388,6 +1649,7 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
             // Wait with exponential backoff
             const suspendDelay = suspendBackoffMs[Math.min(suspendAttempt, suspendBackoffMs.length - 1)]
             await new Promise((resolve) => setTimeout(resolve, suspendDelay))
+            assertCurrent()
             suspendAttempt++
 
             // Poll session status
@@ -1397,6 +1659,7 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
               null,
               5000,
             )
+            assertCurrent()
 
             if (!sessionData) continue // Server unreachable — keep polling
 
@@ -1413,8 +1676,10 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
                   },
                 })
                 .catch(() => {})
+              assertCurrent()
               showToast("Session reactivated — re-evaluating...", "success")
 
+              assertCurrent()
               const { data: reResult } = await callApi(
                 "POST",
                 "/api/v1/evaluate",
@@ -1425,9 +1690,10 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
                 },
                 60000,
               )
+              assertCurrent()
 
               if (!reResult) {
-                if (failOpen) return
+                if (failOpen) { assertCurrent(); return }
                 throw new Error(`[intaris] Re-evaluation failed for ${tool} after session reactivation`)
               }
 
@@ -1442,10 +1708,14 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
                   tool,
                   reResult.call_id,
                   reResult.reasoning || "Tool call requires human approval",
+                  input.signal,
+                  assertCurrent,
                 )
+                assertCurrent()
                 return
               }
               // Approved — let tool proceed
+              assertCurrent()
               return
             }
 
@@ -1478,10 +1748,18 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
         const reason =
           result.reasoning ||
           "Tool call requires human approval"
-        await waitForEscalationResolution(tool, result.call_id, reason)
+        await waitForEscalationResolution(tool, result.call_id, reason, input.signal, assertCurrent)
+        assertCurrent()
       }
 
+      if (input.codeMode) {
+        if (result.decision !== "approve" && result.decision !== "escalate") throw new Error("[intaris] Execution not approved")
+        if (input.signal?.aborted) throw new Error("[intaris] Execution cancelled")
+        assertCurrent()
+        input.codeMode.onApproved(result.call_id)
+      }
       // decision === "approve" (or escalation approved) — tool call proceeds normally
+      assertCurrent()
     },
 
     // -- Tool Result Recording ------------------------------------------------
@@ -1521,4 +1799,339 @@ export const IntarisPlugin: Plugin = async ({ client, worktree, directory }) => 
       })
     },
   }
+}
+
+// V1 loads only `server`. Keep V2 dependencies inside `effect` so a V1
+// single-file install does not need the V2 SDK or Effect at module load time.
+export default {
+  id: "intaris",
+  server: (input: Parameters<Plugin>[0]) => IntarisPlugin(input),
+  effect: (ctx: import("@opencode/plugin/effect").Plugin.Context) => {
+    const requireV2 = createRequire(import.meta.url)
+    const { Effect, Stream } = requireV2("effect") as typeof import("effect")
+    type Call = { sessionID: string; messageID: string; id: string; tool: string }
+    type Family = Call & {
+      approved: boolean
+      done: boolean
+      active: () => boolean
+      assertCurrent: () => void
+      owner: number
+      remove: () => void
+    }
+    const families = new Map<string, Family>()
+    // A move changes the project boundary. Keep this outside evictable session
+    // state so neither fresh input nor cache eviction can restore old authority.
+    const movedSessions = new Set<string>()
+    const assertNotMoved = (id: string) => {
+      if (movedSessions.has(id)) throw new Error("[intaris] Session moved; start a new native OpenCode session in the target directory")
+    }
+    const seenUsers = new Map<string, string>()
+    const deliveredUsers = new Map<string, string>()
+    const inbox = new Map<string, Map<string, string>>()
+    const proofs = new Map<string, { acknowledgedUserID: string; completedCheckpointID: string }>()
+    const compactions = new Map<string, { checkpointID?: string; candidateID?: string; prepared: boolean; invalid: boolean }>()
+    const lookupTokens = new Map<string, Set<object>>()
+    let lifecycle: { capture: (id: string) => V2Authority; revoke: (id: string) => void; revokeAll: () => void } = {
+      capture: () => { throw new Error("[intaris] User admission unavailable") },
+      revoke: () => {}, revokeAll: () => {},
+    }
+    const lookup = (id: string) => {
+      assertNotMoved(id)
+      const authority = lifecycle.capture(id)
+      const tokens = lookupTokens.get(id) || new Set<object>()
+      const token = {}
+      tokens.add(token)
+      lookupTokens.set(id, tokens)
+      return {
+        authority,
+        current: () => authority.current() && lookupTokens.get(id) === tokens && tokens.has(token),
+        finish: () => {
+          tokens.delete(token)
+          if (tokens.size === 0 && lookupTokens.get(id) === tokens) lookupTokens.delete(id)
+        },
+      }
+    }
+    const clearContext = (id: string) => { lookupTokens.delete(id); proofs.delete(id); compactions.delete(id) }
+    const revoke = (id: string) => { clearContext(id); seenUsers.delete(id); lifecycle.revoke(id) }
+    let acknowledgedUser = (_id: string, _messageID: string) => false
+    let admitUser = (_id: string, _messageID: string, _text: string, _authority: V2Authority, _signal: AbortSignal, _prepare: (current: () => boolean) => Promise<void>): Promise<void> => Promise.reject(new Error("[intaris] User admission unavailable"))
+    const key = (call: Call) => `${call.sessionID}\0${call.messageID}\0${call.id}`
+    const client = {
+      app: { log: async () => ({}) },
+      tui: { showToast: async () => ({}) },
+    }
+    let dispose = () => {}
+
+    return Effect.gen(function* () {
+      const { Tool } = yield* Effect.promise(() => import("@opencode/schema/tool"))
+      const { SessionMessage } = yield* Effect.promise(() => import("@opencode/schema/session-message"))
+      const hooks = yield* Effect.promise(() => IntarisPlugin(
+        { client, worktree: ctx.location.directory, directory: ctx.location.directory } as unknown as Parameters<Plugin>[0],
+        {
+          sessionInfo: id => Effect.runPromise(ctx.session.get({ sessionID: id as import("@opencode/schema/session").Session.ID })).then(info => ({
+            directory: info.location.directory,
+            parentID: info.parentID,
+            title: info.title,
+            agent: info.agent,
+          })),
+          onDispose: cleanup => { const prior = dispose; dispose = () => { prior(); cleanup() } },
+          onStateRemoved: id => { seenUsers.delete(id); deliveredUsers.delete(id); inbox.delete(id); revoke(id) },
+          onReceiptLookup: lookup => { acknowledgedUser = lookup },
+          onAdmission: admit => { admitUser = admit },
+          onLifecycle: api => { lifecycle = api },
+        },
+      ))
+      yield* Effect.addFinalizer(() => Effect.sync(() => { lifecycle.revokeAll(); dispose(); families.clear(); seenUsers.clear(); deliveredUsers.clear(); inbox.clear(); lookupTokens.clear(); proofs.clear(); compactions.clear() }))
+
+      yield* ctx.session.hook("compaction", input => Effect.tryPromise({
+        try: async () => {
+          const id = input.sessionID
+          const pending = lookup(id)
+          try {
+            const context = await Effect.runPromise(ctx.session.context({ sessionID: id }))
+            if (!pending.current()) return
+            const user = context.filter(message => message.type === "user").at(-1)
+            const checkpoint = context.filter(message => message.type === "compaction" && message.status === "completed").at(-1)
+            const previous = proofs.get(id)
+            const candidate = user?.type === "user" ? user.id
+              : checkpoint?.type === "compaction" && previous?.completedCheckpointID === checkpoint.id
+                ? previous.acknowledgedUserID : undefined
+            const flight = compactions.get(id) || { prepared: false, invalid: false }
+            flight.candidateID = candidate && (!deliveredUsers.has(id) || deliveredUsers.get(id) === candidate)
+              && acknowledgedUser(id, candidate) ? candidate : undefined
+            flight.prepared = true
+            if (!flight.candidateID) flight.invalid = true
+            compactions.set(id, flight)
+            proofs.delete(id)
+          } catch {
+            if (pending.current()) revoke(id)
+          } finally {
+            pending.finish()
+          }
+        },
+        catch: () => undefined,
+      }).pipe(Effect.ignore))
+
+      function end(family: Family, result?: { output?: unknown; isError: boolean; metadata?: Record<string, unknown> }) {
+        if (family.done) return Promise.resolve()
+        family.done = true
+        family.remove()
+        if (families.get(key(family)) !== family) return Promise.resolve()
+        families.delete(key(family))
+        return hooks["tool.execute.after"](
+          { tool: "execute", sessionID: family.sessionID, callID: family.id },
+          result || { isError: true, metadata: { error: "Execution ended without a result" } },
+        )
+      }
+
+      yield* ctx.tool.hook("execute.before", event => Effect.withFiber(fiber => Effect.tryPromise({
+        try: async signal => {
+          const id = key(event)
+          assertNotMoved(event.sessionID)
+          const family = families.get(id)
+          if (family && fiber.id !== family.owner) {
+            if (family.approved && !family.done && family.active()) {
+              family.assertCurrent()
+              return
+            }
+            throw new Error("[intaris] Execution family not approved")
+          }
+          if (family) throw new Error("[intaris] Duplicate execution identity")
+          const input = event.input
+          const outer = event.tool === "execute"
+            && input !== null && typeof input === "object" && !Array.isArray(input)
+            && typeof (input as Record<string, unknown>).code === "string"
+          if (event.tool === "execute" && !outer) {
+            throw new Error("[intaris] Unrecognized execution input")
+          }
+          let pending: Family | undefined
+          if (outer) {
+            if (!event.id || !event.messageID || !event.sessionID) throw new Error("[intaris] Missing execution identity")
+            pending = { sessionID: event.sessionID, messageID: event.messageID, id: event.id,
+              tool: event.tool, approved: false, done: false, owner: fiber.id,
+              active: () => !fiber.pollUnsafe(), assertCurrent: () => { throw new Error("[intaris] Execution family not approved") }, remove: () => {} }
+            families.set(id, pending)
+            pending.remove = fiber.addObserver(() => { void end(pending!).catch(() => {}) })
+          }
+          const checkLive = () => {
+            assertNotMoved(event.sessionID)
+            if (signal.aborted || (pending && (pending.done || !pending.active() || families.get(id) !== pending))) {
+              throw new Error("[intaris] Execution cancelled")
+            }
+          }
+          try {
+            checkLive()
+            const pendingLookup = lookup(event.sessionID)
+            let user: { id: string; text: string } | undefined
+            let selectedID: string
+            try {
+              const context = await Effect.runPromise(ctx.session.context({ sessionID: event.sessionID }))
+              if (!pendingLookup.current()) throw new Error("[intaris] Session context changed; provide a fresh user instruction")
+              checkLive()
+              const latestUser = context.filter(message => message.type === "user").at(-1)
+              const checkpoint = context.filter(message => message.type === "compaction" && message.status === "completed").at(-1)
+              const latestCompaction = context.filter(message => message.type === "compaction").at(-1)
+              if (latestUser?.type === "user") {
+                user = { id: latestUser.id, text: latestUser.text }
+                proofs.delete(event.sessionID)
+              }
+              const proof = proofs.get(event.sessionID)
+              const candidate = user ? user.id
+                : !compactions.has(event.sessionID) && latestCompaction?.type === "compaction"
+                  && latestCompaction.status === "completed" && checkpoint?.type === "compaction"
+                  && proof?.completedCheckpointID === checkpoint.id && acknowledgedUser(event.sessionID, proof.acknowledgedUserID)
+                  ? proof.acknowledgedUserID : undefined
+              if (!candidate || (deliveredUsers.has(event.sessionID) && deliveredUsers.get(event.sessionID) !== candidate)) {
+                if (!candidate && compactions.has(event.sessionID)) proofs.delete(event.sessionID)
+                else revoke(event.sessionID)
+                throw new Error("[intaris] No admitted user context; provide a fresh user instruction")
+              }
+              selectedID = candidate
+            } finally {
+              pendingLookup.finish()
+            }
+            if (user) {
+              // Install ownership before any event or network await; other tools
+              // for this native ID join the same recording/reasoning operation.
+              const admission = admitUser(event.sessionID, user.id, user.text, pendingLookup.authority, signal, async current => {
+                if (seenUsers.get(event.sessionID) === user.id) return
+                if (!current()) throw new Error("[intaris] User admission superseded")
+                const assertCurrent = () => { if (!current()) throw new Error("[intaris] User admission superseded") }
+                await hooks.event({ event: { type: "message.updated", properties: { info: { sessionID: event.sessionID, id: user.id, role: "user" } }, assertCurrent } })
+                if (!current()) throw new Error("[intaris] User admission superseded")
+                await hooks.event({ event: { type: "message.part.updated", properties: { part: { sessionID: event.sessionID, messageID: user.id, type: "text", text: user.text } }, assertCurrent } })
+                if (!current()) throw new Error("[intaris] User admission superseded")
+                seenUsers.set(event.sessionID, user.id)
+              })
+              await admission
+              checkLive()
+            }
+            const assertAdmitted = () => {
+              checkLive()
+              if (!pendingLookup.authority.current() || !acknowledgedUser(event.sessionID, selectedID)) {
+                throw new Error("[intaris] User context superseded; provide a fresh user instruction")
+              }
+            }
+            assertAdmitted()
+            if (pending) pending.assertCurrent = assertAdmitted
+            const args = input !== null && typeof input === "object" && !Array.isArray(input)
+              ? { ...(input as Record<string, unknown>) }
+              : null
+            if (!args) throw new Error("[intaris] Unrecognized tool input")
+            const tool = event.tool === "shell" ? "bash" : event.tool
+            if (event.tool === "shell") {
+              if (typeof args.command !== "string") throw new Error("[intaris] Unrecognized shell input")
+              args._intaris_opencode_tool = "shell"
+            }
+            checkLive()
+            await hooks["tool.execute.before"](
+              { tool, sessionID: event.sessionID, callID: event.id, signal, userMessageID: selectedID,
+                assertCurrent: assertAdmitted,
+                ...(pending && { codeMode: { onApproved: () => { assertAdmitted(); pending!.approved = true } } }) },
+              { args },
+            )
+            assertAdmitted()
+          } catch (error) {
+            if (pending) await end(pending, { isError: true, metadata: { error: "Execution not approved" } })
+            throw error
+          }
+        },
+        catch: error => new Tool.Error({ message: error instanceof Error ? error.message : "[intaris] Tool evaluation failed" }),
+      })))
+      yield* ctx.tool.hook("execute.after", event => Effect.withFiber(fiber => Effect.tryPromise({
+        try: async () => {
+          const family = families.get(key(event))
+          if (family && event.tool === family.tool && family.owner === fiber.id && family.active()) {
+            const failed = event.status === "error"
+              || Boolean(event.status === "completed" && (
+                event.result.metadata?.error
+                || (event.result.output && typeof event.result.output === "object" && "error" in event.result.output && event.result.output.error)
+              ))
+            await end(family, { output: event.status === "completed" ? event.result : undefined,
+              isError: failed, metadata: failed ? { error: "Execution failed" } : undefined })
+            return
+          }
+          if (family && family.active()) return
+          await hooks["tool.execute.after"](
+            { tool: event.tool === "shell" ? "bash" : event.tool, sessionID: event.sessionID, callID: event.id },
+            event.status === "completed" ? { output: event.result, isError: false }
+              : { isError: true, metadata: { error: "Tool failed" } },
+          )
+        },
+        catch: () => undefined,
+      }).pipe(Effect.ignore)))
+      yield* Stream.runForEach(ctx.event.subscribe(), event => Effect.tryPromise({
+        try: async () => {
+          const data = event.data as Record<string, any>
+          if (event.type === "session.created" && !movedSessions.has(event.durable.aggregateID)) await hooks.event({ event: { type: "session.created", properties: { info: { id: event.durable.aggregateID, title: data.title, parentID: data.parentID } } } })
+          if (event.type === "session.renamed" && !movedSessions.has(data.sessionID)) await hooks.event({ event: { type: "session.updated", properties: { info: { id: data.sessionID, title: data.title } } } })
+          if (event.type === "session.deleted") {
+            seenUsers.delete(data.sessionID)
+            deliveredUsers.delete(data.sessionID)
+            inbox.delete(data.sessionID)
+            revoke(data.sessionID)
+            for (const family of families.values()) if (family.sessionID === data.sessionID) await end(family)
+            await hooks.event({ event: { type: "session.deleted", properties: { info: { id: data.sessionID } } } })
+          }
+          if (event.type === "session.inbox.enqueued") {
+            const pending = inbox.get(data.sessionID) || new Map<string, string>()
+            if (pending.size >= 100) pending.clear() // Uncorrelated delivery will fail closed.
+            pending.set(data.inboxID, data.item.type)
+            inbox.set(data.sessionID, pending)
+          }
+          if (event.type === "session.inbox.delivered") {
+            const pending = inbox.get(data.sessionID)
+            const type = pending?.get(data.inboxID)
+            pending?.delete(data.inboxID)
+            if (type === "user") {
+              deliveredUsers.set(data.sessionID, data.inboxID)
+              revoke(data.sessionID)
+            } else if (type !== "synthetic" && type !== "compaction") {
+              revoke(data.sessionID) // Move or uncorrelated delivery changes the view.
+            }
+          }
+          if (event.type === "session.inbox.cancelled") inbox.get(data.sessionID)?.delete(data.inboxID)
+          if (event.type === "session.moved") {
+            movedSessions.add(data.sessionID)
+            revoke(data.sessionID)
+          }
+          if (event.type === "session.revert.staged"
+            || event.type === "session.revert.cleared" || event.type === "session.revert.committed") revoke(data.sessionID)
+          if (event.type === "session.compaction.started") {
+            const id = data.sessionID
+            const checkpointID = data.inputID || SessionMessage.ID.fromEvent(event.id)
+            const flight = compactions.get(id) || { prepared: false, invalid: false }
+            if (flight.checkpointID) flight.invalid = true
+            flight.checkpointID = checkpointID
+            compactions.set(id, flight)
+          }
+          if (event.type === "session.compaction.failed" || event.type === "session.compaction.ended") {
+            const id = data.sessionID
+            const flight = compactions.get(id)
+            if (event.type === "session.compaction.failed") revoke(id)
+            else clearContext(id)
+            if (event.type === "session.compaction.ended" && flight?.prepared && !flight.invalid
+              && flight.checkpointID && flight.candidateID && acknowledgedUser(id, flight.candidateID)
+              && (!deliveredUsers.has(id) || deliveredUsers.get(id) === flight.candidateID)) {
+              proofs.set(id, { acknowledgedUserID: flight.candidateID, completedCheckpointID: flight.checkpointID })
+            }
+          }
+          // succeeded, failed and user/superseded/inactivity interruptions are
+          // all terminal for the running execution — mirror them to idle so
+          // failed or cancelled runs do not leave sessions active. shutdown
+          // keeps the session resumable.
+          if (event.type === "session.execution.succeeded"
+            || event.type === "session.execution.failed"
+            || (event.type === "session.execution.interrupted" && data.reason !== "shutdown")) {
+            await hooks.event({ event: { type: "session.idle", properties: { sessionID: data.sessionID } } })
+          }
+          if (event.type === "session.text.ended") {
+            await hooks.event({ event: { type: "message.updated", properties: { info: { id: data.assistantMessageID, role: "assistant", sessionID: data.sessionID } } } })
+            await hooks.event({ event: { type: "message.part.updated", properties: { part: { messageID: data.assistantMessageID, sessionID: data.sessionID, type: "text", text: data.text } } } })
+          }
+        },
+        catch: () => { lifecycle.revokeAll(); seenUsers.clear(); lookupTokens.clear(); proofs.clear(); compactions.clear(); return undefined },
+      }).pipe(Effect.ignore)).pipe(Effect.ensuring(Effect.sync(() => { lifecycle.revokeAll(); seenUsers.clear(); lookupTokens.clear(); proofs.clear(); compactions.clear() })), Effect.forkScoped)
+    })
+  },
 }
