@@ -248,7 +248,7 @@ class LLMClient:
                         self._model,
                     )
                     self._supports_structured = True
-                elif self._supports_structured is None:
+                elif _is_unsupported_schema_error(exc):
                     logger.warning(
                         "Structured outputs not supported by provider, "
                         "falling back to JSON mode. Schema enum constraints "
@@ -281,8 +281,9 @@ class LLMClient:
     def _single_call(
         self, messages, schema, temperature, max_tokens, effort, mode=None
     ):
-        """One logical attempt (transient failures still retry); unsupported
-        formats fall back on the next update."""
+        """One logical attempt (transient failures still retry, and rejected
+        parameters are adapted as in ``_call``); unsupported formats fall back
+        on the next update."""
         response_format = (
             {"type": "json_schema", "json_schema": schema}
             if schema and self._supports_structured is not False
@@ -308,12 +309,27 @@ class LLMClient:
         }
         self._generation_metrics.set(metrics)
         start = time.monotonic()
+        # Calls made by attempts that ended in a parameter repair.
+        repaired_calls = 0
         try:
-            response = self._call_with_transient_retries(
-                params,
-                max_attempts=self._transient_retries + 1,
-                metrics=metrics,
-            )
+            # Parameter repairs adapt the transport; they are not new attempts.
+            max_repairs = 3
+            for repair in range(1 + max_repairs):
+                if repair:
+                    # A retry may fail before reaching the provider.
+                    metrics["calls"] = 0
+                try:
+                    response = self._call_with_transient_retries(
+                        params,
+                        max_attempts=self._transient_retries + 1,
+                        metrics=metrics,
+                    )
+                    break
+                except BadRequestError as e:
+                    if repair < max_repairs and self._try_fix_params(e, params):
+                        repaired_calls += metrics["calls"]
+                        continue
+                    raise
             if response.usage is not None:
                 metrics.update(
                     prompt_tokens=response.usage.prompt_tokens,
@@ -324,17 +340,26 @@ class LLMClient:
             return _clean_response(response.choices[0].message.content or "")
         except BadRequestError as exc:
             self._raise_protocol_mismatch(exc)
+            body = _provider_error_body(exc)
+            logger.warning(
+                "LLM request rejected for model %s (status=%s, code=%s, param=%s%s)",
+                self._model,
+                getattr(exc, "status_code", None),
+                body.get("code"),
+                body.get("param"),
+                # Schema rejections describe our schema, not request content.
+                f", message={str(body.get('message') or '')[:300]!r}"
+                if body.get("param") == "response_format"
+                else "",
+            )
             # Cache only a format incompatibility, not arbitrary invalid parameters.
-            body = getattr(exc, "body", {}) or {}
-            error = body.get("error", body)
-            if (
-                isinstance(error, dict)
-                and error.get("param") == "response_format"
-                and not is_output_validation_error(exc)
+            if _is_unsupported_schema_error(exc) and not is_output_validation_error(
+                exc
             ):
                 self._supports_structured = False
             raise
         finally:
+            metrics["calls"] += repaired_calls
             metrics["latency_ms"] = round((time.monotonic() - start) * 1000)
 
     def _call(
@@ -373,9 +398,7 @@ class LLMClient:
                 )
                 break
             except BadRequestError as e:
-                if attempt < max_retries and self._try_fix_params(
-                    e, params, max_tokens
-                ):
+                if attempt < max_retries and self._try_fix_params(e, params):
                     continue
                 raise
 
@@ -632,7 +655,12 @@ class LLMClient:
             "messages": messages,
         }
 
-        if "temperature" not in self._param_fixes:
+        effective_effort = reasoning_effort or self._reasoning_effort
+        if "temperature" not in self._param_fixes and effective_effort in (
+            None,
+            "",
+            "none",
+        ):
             params["temperature"] = temperature
 
         if "max_tokens" in self._param_fixes:
@@ -643,7 +671,6 @@ class LLMClient:
         if response_format:
             params["response_format"] = response_format
 
-        effective_effort = reasoning_effort or self._reasoning_effort
         if effective_effort and "reasoning_effort" not in self._param_fixes:
             params["reasoning_effort"] = effective_effort
 
@@ -653,16 +680,12 @@ class LLMClient:
         self,
         error: BadRequestError,
         params: dict[str, Any],
-        max_tokens: int,
     ) -> bool:
         """Try to fix params based on a BadRequestError.
 
         Returns True if a fix was applied and the call should be retried.
         """
-        error_body = getattr(error, "body", None)
-        if not isinstance(error_body, dict):
-            return False
-
+        error_body = _provider_error_body(error)
         param = error_body.get("param", "")
         code = error_body.get("code", "")
 
@@ -672,20 +695,18 @@ class LLMClient:
         ):
             return False
 
-        if param in self._param_fixes:
-            return False
-
         if param == "max_tokens":
+            if "max_tokens" not in params:
+                return False
             logger.info(
                 "Model %s requires max_completion_tokens — adapting",
                 self._model,
             )
             self._param_fixes["max_tokens"] = "use_max_completion_tokens"
-            params.pop("max_tokens", None)
-            params["max_completion_tokens"] = max_tokens
+            params["max_completion_tokens"] = params.pop("max_tokens")
             return True
 
-        if param == "temperature":
+        if param == "temperature" and param in params:
             logger.info(
                 "Model %s does not support custom temperature — omitting",
                 self._model,
@@ -694,7 +715,7 @@ class LLMClient:
             params.pop("temperature", None)
             return True
 
-        if param in params:
+        if param == "reasoning_effort" and param in params:
             logger.info(
                 "Model %s does not support parameter '%s' — omitting",
                 self._model,
@@ -840,6 +861,41 @@ def _parse_retry_after_value(value: str) -> float | None:
             return None
 
     return None
+
+
+def _provider_error_body(error: Exception) -> dict[str, Any]:
+    """Unwrap the OpenAI SDK's flat or nested provider error body."""
+    body = getattr(error, "body", None)
+    if not isinstance(body, dict):
+        return {}
+    nested = body.get("error")
+    return nested if isinstance(nested, dict) else body
+
+
+def _is_unsupported_schema_error(error: Exception) -> bool:
+    """Only downgrade structured output for explicit format incompatibility."""
+    body = _provider_error_body(error)
+    param = str(body.get("param") or "").lower()
+    code = str(body.get("code") or "").lower()
+    message = str(body.get("message") or "").lower()
+    if param in ("response_format", "response_format.type", "json_schema"):
+        if code:
+            return code in (
+                "unsupported_parameter",
+                "unsupported_value",
+                "not_supported",
+            )
+    elif param or code not in ("", "invalid_request_error"):
+        return False
+    return bool(
+        re.search(
+            r"(?:response_format|json_schema|structured outputs?)"
+            r".{0,60}(?:not supported|unsupported|does not support)"
+            r"|(?:not supported|unsupported|does not support)"
+            r".{0,60}(?:response_format|json_schema|structured outputs?)",
+            message,
+        )
+    )
 
 
 def is_output_validation_error(error: Exception) -> bool:
