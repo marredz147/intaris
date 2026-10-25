@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test"
-import { createCore, loadApiKey } from "../src/core"
+import { createCore, formatErrorDetail, loadApiKey } from "../src/core"
 import { IntarisPlugin } from "../intaris"
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
@@ -66,6 +66,31 @@ describe("guard decisions", () => {
       const { before } = await core()
       await expect(before()).rejects.toThrow("Evaluation failed")
     }
+  })
+  test("structured evaluator errors are readable; raw bodies stay private", async () => {
+    const cases: Array<[Response, string]> = [
+      [Response.json({ detail: { code: "review_unavailable", message: "Automated review could not complete.", retryable: true } }, { status: 503 }),
+        "Evaluation failed for bash: HTTP 503: review_unavailable: Automated review could not complete. (INTARIS_FAIL_OPEN=false)"],
+      [new Response("private server response", { status: 503 }), "Evaluation failed for bash: HTTP 503 (INTARIS_FAIL_OPEN=false)"],
+      [Response.json({ detail: "Session not found" }, { status: 404 }), "Evaluation rejected for bash: HTTP 404: Session not found"],
+    ]
+    for (const [response, message] of cases) {
+      fixture()
+      const fetchBase = globalThis.fetch
+      globalThis.fetch = (async (url: string, init: RequestInit) => new URL(url).pathname === "/api/v1/evaluate"
+        ? response.clone() : fetchBase(url, init)) as typeof fetch
+      const { before } = await core()
+      const error = await before().catch((err: Error) => err)
+      expect(String(error)).not.toContain("[object Object]")
+      expect((error as Error).message).toBe(`[intaris] ${message}`)
+    }
+  })
+  test("error detail formatting keeps only Intaris-authored text", () => {
+    expect(formatErrorDetail([{ msg: "field required", input: "secret" }, null, { loc: ["x"] }])).toBe("field required")
+    expect(formatErrorDetail({ token: "secret" })).toBeNull()
+    expect(formatErrorDetail({ message: "only message" })).toBe("only message")
+    expect(formatErrorDetail(" ")).toBeNull()
+    expect(formatErrorDetail(42)).toBeNull()
   })
   test("custom and MCP names remain intact for evaluation", async () => {
     const mock = fixture()

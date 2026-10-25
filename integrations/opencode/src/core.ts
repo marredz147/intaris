@@ -53,6 +53,23 @@ export interface Host {
   } | null>
 }
 
+/**
+ * Readable text from an Intaris error body's `detail`: a string, the
+ * structured `{code, message}` envelope, or a validation list (`msg` only).
+ * Other shapes return null so raw server content is never surfaced.
+ */
+export function formatErrorDetail(value: unknown): string | null {
+  let text: string | null = null
+  if (typeof value === "string") text = value
+  else if (Array.isArray(value)) {
+    text = value.map(item => item && typeof item === "object" && typeof item.msg === "string" ? item.msg : "").filter(Boolean).join("; ")
+  } else if (value && typeof value === "object") {
+    const { code, message } = value as { code?: unknown; message?: unknown }
+    if (typeof message === "string") text = typeof code === "string" && code ? `${code}: ${message}` : message
+  }
+  return text?.trim() ? text.trim().slice(0, 300) : null
+}
+
 export function loadApiKey(env: NodeJS.ProcessEnv = process.env): string {
   const path = env.INTARIS_API_KEY_FILE
   if (!path) return env.INTARIS_API_KEY || ""
@@ -206,7 +223,12 @@ export const createCore = async ({ client: hostClient, worktree, directory, sess
       const resp = await fetch(`${baseUrl}${path}`, fetchOptions)
       if (resp.ok) return { data: await resp.json(), error: null, status: resp.status }
 
-      const detail = `HTTP ${resp.status}`
+      let detail = `HTTP ${resp.status}`
+      try {
+        const parsed = JSON.parse(await resp.text())
+        const formatted = formatErrorDetail(parsed?.detail)
+        if (formatted) detail = `${detail}: ${formatted}`
+      } catch {}
 
       await client.app
         .log({
