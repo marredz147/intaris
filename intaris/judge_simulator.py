@@ -271,12 +271,17 @@ def _strict(node):
         return [_strict(item) for item in node]
     if not isinstance(node, dict):
         return node
+    properties = node.get("properties")
     node = {
         key: _strict(value)
         for key, value in node.items()
         if key not in _STRICT_UNSUPPORTED
     }
     if "properties" in node:
+        # Field names are not keywords; never filter the mapping itself.
+        node["properties"] = {
+            name: _strict(value) for name, value in properties.items()
+        }
         node["required"] = list(node["properties"])
         node["additionalProperties"] = False
     return node

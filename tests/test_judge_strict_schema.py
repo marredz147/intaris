@@ -68,3 +68,11 @@ def test_strict_answer_with_nulls_still_validates():
         simulator.Answer.model_validate(
             {**answer.model_dump(), "explanation": "x" * 701}
         )
+
+
+def test_strict_keeps_fields_named_like_keywords():
+    normalized = simulator._strict(
+        {"type": "object", "properties": {"default": {"type": "string", "default": ""}}}
+    )
+    assert normalized["properties"] == {"default": {"type": "string"}}
+    assert normalized["required"] == ["default"]
