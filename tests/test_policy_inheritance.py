@@ -1,5 +1,6 @@
 """Delegation is not an independent policy or approval boundary."""
 
+import asyncio
 import json
 from unittest.mock import Mock
 
@@ -407,3 +408,46 @@ def test_parent_change_before_child_admission_is_reevaluated(store, monkeypatch)
     child = store.get("child", user_id="owner")
     with store._db.cursor() as cur:
         validate_parent_chain(cur, child)
+
+
+def test_async_evaluation_reevaluates_parent_race(store, monkeypatch):
+    evaluator, _, reads, _ = raced_parent_reads(
+        store, monkeypatch, lambda read: read == 1
+    )
+    result = asyncio.run(
+        evaluator.evaluate_async(
+            user_id="owner",
+            session_id="child",
+            agent_id=None,
+            tool="read",
+            args={"path": "/repo/readme.md"},
+        )
+    )
+    assert result["decision"] == "approve"
+    assert len(reads) > 2
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        HybridError("stale_admission", "Session changed during evaluation", 409),
+        HybridError("policy_state_changed", "Invalid policy ancestry", 409),
+    ],
+)
+def test_session_local_or_permanent_conflicts_are_not_rerun(store, error):
+    calls = []
+
+    def flow(**kwargs):
+        calls.append(kwargs)
+        raise error
+        yield  # pragma: no cover
+
+    evaluator = Evaluator(
+        llm=Mock(), session_store=store, audit_store=AuditStore(store._db)
+    )
+    evaluator._evaluation_flow = flow
+    with pytest.raises(HybridError):
+        evaluator.evaluate(
+            user_id="owner", session_id="child", agent_id=None, tool="read", args={}
+        )
+    assert len(calls) == 1
