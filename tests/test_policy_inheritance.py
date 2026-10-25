@@ -216,9 +216,8 @@ def test_nested_activation_refreshes_changed_ancestor_before_child_has_evaluated
     assert updated["policy"]["profile"] == "strict"
 
 
-def test_parent_resume_between_lifecycle_reads_is_retryable_not_swallowed(
-    store, monkeypatch
-):
+def raced_parent_reads(store, monkeypatch, suspended_reads):
+    """Make the given parent reads (1-based) observe a stale suspension."""
     parent(store, evaluation_policy_version="legacy")
     child = store.create(
         user_id="owner",
@@ -227,14 +226,13 @@ def test_parent_resume_between_lifecycle_reads_is_retryable_not_swallowed(
         intention="Research",
     )
     original_get = store.get
-    reads = 0
+    reads = []
 
     def raced_get(session_id, *, user_id):
-        nonlocal reads
         value = original_get(session_id, user_id=user_id)
         if session_id == "parent":
-            reads += 1
-            if reads == 1:
+            reads.append(1)
+            if suspended_reads(len(reads)):
                 return {**value, "status": "suspended"}
         return value
 
@@ -243,6 +241,32 @@ def test_parent_resume_between_lifecycle_reads_is_retryable_not_swallowed(
     model = Mock()
     evaluator = Evaluator(
         llm=model, session_store=store, audit_store=AuditStore(store._db)
+    )
+    return evaluator, model, reads, original_get
+
+
+def test_parent_resume_between_lifecycle_reads_is_reevaluated_not_swallowed(
+    store, monkeypatch
+):
+    evaluator, model, reads, original_get = raced_parent_reads(
+        store, monkeypatch, lambda read: read == 1
+    )
+    result = evaluator.evaluate(
+        user_id="owner",
+        session_id="child",
+        agent_id=None,
+        tool="read",
+        args={"path": "/repo/readme.md"},
+    )
+    # The re-run saw the active parent: a real evaluation, not a lifecycle denial.
+    assert result["decision"] == "approve"
+    assert len(reads) > 2
+    assert original_get("child", user_id="owner")["status"] == "active"
+
+
+def test_persistent_parent_conflict_still_fails_closed(store, monkeypatch):
+    evaluator, model, reads, original_get = raced_parent_reads(
+        store, monkeypatch, lambda read: read % 2 == 1
     )
     with pytest.raises(HybridError) as error:
         evaluator.evaluate(
@@ -254,8 +278,28 @@ def test_parent_resume_between_lifecycle_reads_is_retryable_not_swallowed(
         )
     assert error.value.code == "policy_state_changed"
     assert error.value.retryable
+    assert len(reads) == 6  # Three bounded attempts, two parent reads each.
     model.generate.assert_not_called()
     assert original_get("child", user_id="owner")["status"] == "active"
+
+
+def test_pinned_revision_keeps_parent_conflict_fence(store, monkeypatch):
+    evaluator, model, reads, original_get = raced_parent_reads(
+        store, monkeypatch, lambda read: read == 1
+    )
+    with pytest.raises(HybridError) as error:
+        evaluator.evaluate(
+            user_id="owner",
+            session_id="child",
+            agent_id=None,
+            tool="read",
+            args={"path": "/repo/readme.md"},
+            expected_policy_revision=original_get("child", user_id="owner")[
+                "policy_revision"
+            ],
+        )
+    assert error.value.code == "policy_state_changed"
+    assert len(reads) == 2
 
 
 @pytest.mark.parametrize("update", ["intention", "user_evidence", "suspension"])
@@ -322,3 +366,44 @@ def test_judge_defer_vocabulary_is_not_confused_with_tool_escalation(
     )
     assert child["policy"]["judge"]["on_uncertain"] == expected
     assert child["policy"]["judge"]["allowed_decisions"] == ["defer"]
+
+
+def test_parent_change_before_child_admission_is_reevaluated(store, monkeypatch):
+    parent(store)
+    store.create(
+        user_id="owner",
+        session_id="child",
+        parent_session_id="parent",
+        intention="Research",
+    )
+    with store._db.cursor() as cur:
+        cur.execute("UPDATE sessions SET alignment_state = 'ready'")
+    audit = AuditStore(store._db)
+    original_insert = audit.insert
+    admissions = []
+
+    def insert_after_parent_change(**kwargs):
+        if kwargs.get("admission_snapshot") is not None:
+            admissions.append(1)
+            if len(admissions) == 1:
+                # A busy parent records new user evidence mid-evaluation.
+                store.update_session(
+                    "parent", user_id="owner", intention="Research offers today"
+                )
+        return original_insert(**kwargs)
+
+    monkeypatch.setattr(audit, "insert", insert_after_parent_change)
+    evaluator = Evaluator(llm=Mock(), session_store=store, audit_store=audit)
+    result = evaluator.evaluate(
+        user_id="owner",
+        session_id="child",
+        agent_id=None,
+        tool="read",
+        args={"path": "/repo/readme.md"},
+    )
+    assert result["decision"] == "approve"
+    assert len(admissions) == 2
+    # The admitted child is bound to the parent's current authorization.
+    child = store.get("child", user_id="owner")
+    with store._db.cursor() as cur:
+        validate_parent_chain(cur, child)
