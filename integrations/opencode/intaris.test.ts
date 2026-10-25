@@ -559,6 +559,23 @@ test("newer failed or empty user cannot inherit U1 receipt for direct or outer e
   }
 })
 
+test("structured evaluator error detail is readable", async () => {
+  const fx = fixture()
+  await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    yield* entry.effect(fx.ctx as any)
+    const base = globalThis.fetch
+    globalThis.fetch = (async (url: string, init: RequestInit) => new URL(url).pathname === "/api/v1/evaluate"
+      ? Response.json({ detail: { code: "review_unavailable", message: "Automated review could not complete.", retryable: true } }, { status: 503 })
+      : base(url, init)) as typeof fetch
+    const exit = yield* Effect.exit(fx.hooks["execute.before"](fx.call("read", "root", "first", { path: "/repo/a" })))
+    globalThis.fetch = base
+    expect(Exit.isFailure(exit)).toBe(true)
+    const message = Exit.isFailure(exit) ? Cause.pretty(exit.cause) : ""
+    expect(message).toContain("review_unavailable: Automated review could not complete.")
+    expect(message).not.toContain("[object Object]")
+  })))
+})
+
 test("delivered user blocks compacted receipt; synthetic and manual compaction do not masquerade as users", async () => {
   const fx = fixture()
   const queue = await Effect.runPromise(Queue.unbounded<any>())

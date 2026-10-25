@@ -83,6 +83,24 @@ interface SessionState {
   toolCallAuditIds: Map<string, string>
 }
 
+// Server errors carry `detail` as a string, a structured object
+// ({code, message, ...}) or a validation-error list.
+function formatErrorDetail(value: unknown): string | null {
+  if (value === null || value === undefined || value === "") return null
+  if (typeof value === "string") return value
+  if (Array.isArray(value)) {
+    const parts = value.map((item) => formatErrorDetail(item?.msg ?? item)).filter(Boolean)
+    return parts.length ? parts.join("; ") : null
+  }
+  if (typeof value === "object") {
+    const { code, message } = value as { code?: unknown; message?: unknown }
+    if (typeof message === "string" && message) {
+      return typeof code === "string" && code ? `${code}: ${message}` : message
+    }
+  }
+  return JSON.stringify(value).slice(0, 200)
+}
+
 interface EvaluateResponse {
   call_id: string
   decision: "approve" | "deny" | "escalate"
@@ -265,7 +283,7 @@ const IntarisPlugin = async (
       let detail = `HTTP ${resp.status}`
       try {
         const parsed = JSON.parse(body)
-        detail = parsed.detail || parsed.error || detail
+        detail = formatErrorDetail(parsed.detail) ?? formatErrorDetail(parsed.error) ?? detail
       } catch {
         if (body) detail = body.slice(0, 200)
       }
