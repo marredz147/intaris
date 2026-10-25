@@ -16,6 +16,67 @@ def is_decisions(client: Any) -> bool:
     return getattr(type(client), "provider", None) == "decisions"
 
 
+# Native single-decision L1: the three-question Decisions form (aligned, risk,
+# decision) answers only calls whose sole open question is the routine intent
+# assessment. Anything the three answers cannot ground stays with the factual
+# L1: strict scope checks, operator or extracted user restrictions, read-only
+# overlays, configured rules, unknown or consequential effects, secrets,
+# protected repository/deploy targets and targets outside the working directory.
+_NATIVE_PROFILES = frozenset({"balanced", "bounded_autonomy"})
+_NATIVE_EFFECTS = frozenset({"read", "write", "execute"})
+
+
+def native_decision_eligible(
+    client: Any,
+    state: Any,
+    result: Any,
+    *,
+    profile: str,
+    tool: str,
+    args: dict,
+    working_directory: str | None,
+) -> bool:
+    """Whether a confident native approve can stand in for the intent assessment."""
+    import os
+
+    from intaris.classifier import reads_secret_location
+    from intaris.effect_scope import requires_explicit_grant
+    from intaris.evaluator import _protected_edit_target
+
+    if not is_decisions(client) or profile not in _NATIVE_PROFILES:
+        return False
+    if [item.id for item in result.outstanding_obligations] != ["intent.assessment"]:
+        return False
+    if (
+        state.read_only_required
+        or state.advisory_clauses
+        or state.process_lifecycle
+        or (state.workflow_scope or {}).get("declared")
+    ):
+        return False
+    effects = set(state.value("effects", None) or ())
+    if not effects or not effects <= _NATIVE_EFFECTS:
+        return False
+    if state.value("secret_argument") or requires_explicit_grant(state):
+        return False
+    for source in state.sources.values():
+        if source.get("constraint_items") or source.get("interpretation_missing"):
+            return False
+    if not state.value("paths_complete") or not working_directory:
+        return False
+    root = os.path.normpath(working_directory)
+    paths = state.value("paths", None) or []
+    if not os.path.isabs(root) or not all(os.path.isabs(path) for path in paths):
+        return False
+    if any(
+        os.path.commonpath([root, os.path.normpath(path)]) != root
+        or _protected_edit_target(path)
+        for path in paths
+    ):
+        return False
+    return not reads_secret_location(tool, args, working_directory)
+
+
 def review_deadline(client: Any, llm: Any = None) -> AbstractContextManager[None]:
     """Keep both L1 stages inside the existing caller deadline, including standalone use."""
     if not is_decisions(client):
