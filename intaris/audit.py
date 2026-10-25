@@ -494,6 +494,8 @@ class AuditStore:
                 records with a user_decision set, ``False`` returns only
                 unresolved records (user_decision IS NULL). ``None`` (default)
                 returns all records regardless of resolution status.
+                With decision='escalate', unresolved revision-bound receipts
+                must also satisfy current session/task-context freshness.
 
         Returns:
             Dict with 'items', 'total', 'page', 'pages'.
@@ -544,30 +546,112 @@ class AuditStore:
             where = "WHERE " + " AND ".join(conditions)
 
         with self._db.cursor() as cur:
-            # Count total matching records
-            cur.execute(f"SELECT COUNT(*) FROM audit_log {where}", params)
-            total = cur.fetchone()[0]
-
-            # Fetch page
             offset = (page - 1) * limit
-            cur.execute(
-                f"""
-                SELECT * FROM audit_log
-                {where}
-                ORDER BY timestamp DESC, id DESC
-                LIMIT ? OFFSET ?
-                """,
-                params + [limit, offset],
-            )
-            rows = cur.fetchall()
+            if resolved is False and decision == "escalate":
+                items, total = self._pending_page(
+                    cur, where, params, user_id=user_id, offset=offset, limit=limit
+                )
+            else:
+                cur.execute(f"SELECT COUNT(*) FROM audit_log {where}", params)
+                total = cur.fetchone()[0]
+                cur.execute(
+                    f"""
+                    SELECT * FROM audit_log
+                    {where}
+                    ORDER BY timestamp DESC, id DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    params + [limit, offset],
+                )
+                items = [_row_to_dict(row) for row in cur.fetchall()]
 
         pages = max(1, (total + limit - 1) // limit)
         return {
-            "items": [_row_to_dict(row) for row in rows],
+            "items": items,
             "total": total,
             "page": page,
             "pages": pages,
         }
+
+    def _pending_page(
+        self,
+        cur: Any,
+        where: str,
+        params: list[Any],
+        *,
+        user_id: str,
+        offset: int,
+        limit: int,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Filter pending receipt freshness before hydrating only the requested page."""
+        from intaris.task_context import decision_watermark
+
+        metadata = "NULLIF(audit_log.evaluation_metadata, '')"
+        if self._db.backend == "postgresql":
+            metadata += "::jsonb"
+            version = f"({metadata} ->> 'evaluation_policy_version')"
+            overlay_truthy = f"""({metadata} -> 'overlay') NOT IN (
+                'null'::jsonb, 'false'::jsonb, '0'::jsonb, '""'::jsonb,
+                '[]'::jsonb, '{{}}'::jsonb)"""
+            policy_revision = f"({metadata} ->> 'policy_revision')::bigint"
+            state_revision = f"({metadata} ->> 'state_revision')::bigint"
+            watermark = f"({metadata} #>> '{{task_context,watermarks,decisions}}')"
+        else:
+            version = f"json_extract({metadata}, '$.evaluation_policy_version')"
+            overlay = f"json_extract({metadata}, '$.overlay')"
+            overlay_type = f"json_type({metadata}, '$.overlay')"
+            overlay_truthy = f"""CASE
+                WHEN {overlay_type} IN ('object', 'array')
+                    THEN EXISTS (SELECT 1 FROM json_each({metadata}, '$.overlay'))
+                WHEN {overlay_type} = 'text' THEN length({overlay}) > 0
+                ELSE COALESCE({overlay} != 0, FALSE) END"""
+            policy_revision = f"json_extract({metadata}, '$.policy_revision')"
+            state_revision = f"json_extract({metadata}, '$.state_revision')"
+            watermark = (
+                f"json_extract({metadata}, '$.task_context.watermarks.decisions')"
+            )
+        revision_bound = f"(COALESCE({version} = 'hybrid_v1', FALSE) OR COALESCE(({overlay_truthy}), FALSE))"
+        eligible = f"""(NOT {revision_bound} OR EXISTS (
+            SELECT 1 FROM sessions s
+            WHERE s.user_id = audit_log.user_id AND s.session_id = audit_log.session_id
+              AND s.status = 'active' AND s.policy_revision = {policy_revision}
+              AND s.state_revision = {state_revision}))"""
+        cur.execute(
+            f"""SELECT call_id, session_id,
+                       CASE WHEN {revision_bound} THEN {watermark} END AS task_watermark
+                FROM audit_log {where} AND {eligible}
+                ORDER BY timestamp DESC, id DESC""",
+            params,
+        )
+        candidates = cur.fetchall()
+        watermarks = {}
+        selected = []
+        total = 0
+        for candidate in candidates:
+            expected = candidate["task_watermark"]
+            if expected is not None:
+                session_id = candidate["session_id"]
+                if session_id not in watermarks:
+                    # Pending calls have no user_decision, so they cannot appear
+                    # in the resolved human decisions hashed by decision_watermark.
+                    # Excluding each pending call therefore yields this same hash.
+                    watermarks[session_id] = decision_watermark(
+                        cur, user_id, session_id
+                    )
+                if expected != watermarks[session_id]:
+                    continue
+            if offset <= total < offset + limit:
+                selected.append(candidate["call_id"])
+            total += 1
+        if not selected:
+            return [], total
+        placeholders = ", ".join("?" for _ in selected)
+        cur.execute(
+            f"SELECT * FROM audit_log {where} AND call_id IN ({placeholders}) "
+            "ORDER BY timestamp DESC, id DESC",
+            params + selected,
+        )
+        return [_row_to_dict(row) for row in cur.fetchall()], total
 
     def get_recent(
         self,

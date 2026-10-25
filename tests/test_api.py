@@ -4665,6 +4665,442 @@ class TestAuditResolvedFilter:
         # Should have at least 2 records (escalated + approved)
         assert data["total"] >= 2
 
+    @pytest.mark.parametrize("receipt_kind", ["hybrid_v1", "overlay"])
+    def test_pending_receipts_require_current_session_without_losing_history(
+        self, client_no_auth, receipt_kind
+    ):
+        from intaris.audit import AuditStore
+        from intaris.decision import UNATTENDED_JUDGE_REVIEW
+        from intaris.server import _get_db
+        from intaris.session import SessionStore
+
+        user_id = "pending-owner"
+        headers = {"X-User-Id": user_id}
+        store, sessions = AuditStore(_get_db()), SessionStore(_get_db())
+        names = [
+            "current",
+            "completed",
+            "suspended",
+            "terminated",
+            "idle",
+            "policy",
+            "state",
+            "legacy",
+            "empty-overlay",
+            "judge-only",
+        ]
+        before = {}
+        for name in names:
+            session = sessions.create(
+                user_id=user_id,
+                session_id=name,
+                intention="Review a bounded local change",
+                policy={"evaluation_policy_version": "legacy"},
+            )
+            metadata = {
+                "evaluation_policy_version": "hybrid_v1"
+                if receipt_kind == "hybrid_v1"
+                else "legacy",
+                "policy_revision": session["policy_revision"],
+                "state_revision": session["state_revision"],
+                "execution_state": "not_dispatched",
+                "admission": None,
+                **(
+                    {"overlay": {"chat_mode": "build", "read_only_required": False}}
+                    if receipt_kind == "overlay"
+                    else {}
+                ),
+            }
+            if name in {"legacy", "empty-overlay"}:
+                metadata = None if name == "legacy" else {"overlay": {}}
+            store.insert(
+                call_id=name,
+                user_id=user_id,
+                session_id=name,
+                agent_id="legacy-agent"
+                if name in {"legacy", "empty-overlay"}
+                else "pending-agent",
+                tool="write",
+                args_redacted={"file_path": "/repo/notes.md"},
+                classification="write",
+                evaluation_path="llm",
+                decision="escalate",
+                risk="high",
+                reasoning="Review required",
+                latency_ms=1,
+                evaluation_metadata=metadata,
+                outcome_override=UNATTENDED_JUDGE_REVIEW
+                if name == "judge-only"
+                else None,
+            )
+            if name in {"current", "completed"}:
+                store.set_judge_reasoning(
+                    name, "Human review needed", user_id=user_id, judge_decision="defer"
+                )
+            if name in {
+                "completed",
+                "suspended",
+                "terminated",
+                "idle",
+                "legacy",
+                "empty-overlay",
+            }:
+                sessions.update_status(
+                    name,
+                    name
+                    if name in {"completed", "suspended", "terminated", "idle"}
+                    else "completed",
+                    user_id=user_id,
+                )
+            elif name == "policy":
+                sessions.update_session(
+                    name,
+                    user_id=user_id,
+                    policy={
+                        "evaluation_policy_version": "legacy",
+                        "allow_tools": ["read"],
+                    },
+                )
+            elif name == "state":
+                sessions.update_status(name, "active", user_id=user_id)
+            before[name] = store.get_by_call_id(name, user_id=user_id)
+
+        # Identical session IDs in another tenant must not borrow this owner's
+        # active session when checking freshness.
+        other = sessions.create(
+            user_id="other-owner", session_id="current", intention="Separate task"
+        )
+        store.insert(
+            call_id="other-call",
+            user_id="other-owner",
+            session_id="current",
+            agent_id=None,
+            tool="write",
+            args_redacted={},
+            classification="write",
+            evaluation_path="llm",
+            decision="escalate",
+            risk="high",
+            reasoning="Separate review",
+            latency_ms=1,
+            evaluation_metadata={
+                "evaluation_policy_version": "hybrid_v1",
+                "policy_revision": other["policy_revision"],
+                "state_revision": other["state_revision"],
+            },
+        )
+        sessions.update_status("current", "completed", user_id="other-owner")
+
+        params = {"decision": "escalate", "resolved": "false", "limit": 1}
+        pages = [
+            client_no_auth.get(
+                "/api/v1/audit", params={**params, "page": page}, headers=headers
+            ).json()
+            for page in range(1, 5)
+        ]
+        assert all(page["total"] == 3 and page["pages"] == 3 for page in pages)
+        assert {row["call_id"] for page in pages for row in page["items"]} == {
+            "current",
+            "legacy",
+            "empty-overlay",
+        }
+        assert pages[-1]["items"] == []
+        assert (
+            client_no_auth.get("/api/v1/stats", headers=headers).json()[
+                "pending_approvals"
+            ]
+            == 3
+        )
+        assert (
+            client_no_auth.get(
+                "/api/v1/stats", params={"agent_id": "pending-agent"}, headers=headers
+            ).json()["pending_approvals"]
+            == 1
+        )
+        assert (
+            client_no_auth.get(
+                "/api/v1/audit", params=params, headers={"X-User-Id": "other-owner"}
+            ).json()["total"]
+            == 0
+        )
+        assert (
+            client_no_auth.get(
+                "/api/v1/audit/current", headers={"X-User-Id": "other-owner"}
+            ).status_code
+            == 404
+        )
+
+        history = client_no_auth.get("/api/v1/audit", headers=headers).json()
+        assert history["total"] == len(names)
+        assert {row["call_id"] for row in history["items"]} == set(names)
+        # Generic unresolved audit browsing keeps its historical semantics.
+        unresolved = client_no_auth.get(
+            "/api/v1/audit", params={"resolved": "false"}, headers=headers
+        ).json()
+        assert "completed" in {row["call_id"] for row in unresolved["items"]}
+        for name in ("completed", "policy", "state"):
+            for verdict in ("approve", "deny"):
+                response = client_no_auth.post(
+                    "/api/v1/decision",
+                    json={"call_id": name, "decision": verdict},
+                    headers=headers,
+                )
+                assert response.status_code == 409, response.text
+                assert response.json()["detail"]["code"] == "stale_resolution"
+        for name in names:
+            response = client_no_auth.get(f"/api/v1/audit/{name}", headers=headers)
+            assert response.status_code == 200
+            assert store.get_by_call_id(name, user_id=user_id) == before[name]
+
+    def test_pending_receipts_reuse_task_context_watermark_freshness(
+        self, client_no_auth
+    ):
+        from intaris.audit import AuditStore
+        from intaris.server import _get_db
+        from intaris.session import SessionStore
+        from intaris.task_context import decision_watermark
+
+        user_id, session_id = "watermark-owner", "work"
+        headers = {"X-User-Id": user_id}
+        db = _get_db()
+        sessions, store = SessionStore(db), AuditStore(db)
+        sessions.create(
+            user_id=user_id, session_id=session_id, intention="Review local changes"
+        )
+        with db.cursor() as cur:
+            old_watermark = decision_watermark(cur, user_id, session_id)
+
+        def insert(call_id, metadata=None):
+            store.insert(
+                call_id=call_id,
+                user_id=user_id,
+                session_id=session_id,
+                agent_id=None,
+                tool="write",
+                args_redacted={},
+                classification="write",
+                evaluation_path="llm",
+                decision="escalate",
+                risk="high",
+                reasoning="Review required",
+                latency_ms=1,
+                evaluation_metadata=metadata,
+            )
+
+        insert("earlier-decision")
+        store.resolve_escalation(
+            "earlier-decision",
+            "deny",
+            user_note="Keep local changes bounded",
+            user_id=user_id,
+        )
+        session = sessions.get(session_id, user_id=user_id)
+        with db.cursor() as cur:
+            current_watermark = decision_watermark(cur, user_id, session_id)
+        assert current_watermark != old_watermark
+        for call_id, watermark in (
+            ("obsolete-context", old_watermark),
+            ("current-context", current_watermark),
+        ):
+            insert(
+                call_id,
+                {
+                    "evaluation_policy_version": "hybrid_v1",
+                    "policy_revision": session["policy_revision"],
+                    "state_revision": session["state_revision"],
+                    "task_context": {"watermarks": {"decisions": watermark}},
+                },
+            )
+        pending = client_no_auth.get(
+            "/api/v1/audit",
+            params={"decision": "escalate", "resolved": "false"},
+            headers=headers,
+        ).json()
+        assert pending["total"] == 1
+        assert [row["call_id"] for row in pending["items"]] == ["current-context"]
+        assert (
+            client_no_auth.get("/api/v1/stats", headers=headers).json()[
+                "pending_approvals"
+            ]
+            == 1
+        )
+        assert client_no_auth.get("/api/v1/audit", headers=headers).json()["total"] == 3
+        response = client_no_auth.post(
+            "/api/v1/decision",
+            json={"call_id": "obsolete-context", "decision": "deny"},
+            headers=headers,
+        )
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "stale_task_context"
+        assert (
+            store.get_by_call_id("obsolete-context", user_id=user_id)["user_decision"]
+            is None
+        )
+
+    def test_pending_backlog_uses_minimal_projection_and_hydrates_only_page(
+        self, client_no_auth, monkeypatch
+    ):
+        from intaris import audit, task_context
+        from intaris.server import _get_db
+        from intaris.session import SessionStore
+
+        db = _get_db()
+        sessions, store = SessionStore(db), audit.AuditStore(db)
+        user_id = "backlog-owner"
+        headers = {"X-User-Id": user_id}
+        active_ids = set()
+        for session_id, count in (("active", 8), ("obsolete", 16)):
+            session = sessions.create(
+                user_id=user_id,
+                session_id=session_id,
+                intention="Review bounded local changes",
+            )
+            with db.cursor() as cur:
+                watermark = task_context.decision_watermark(cur, user_id, session_id)
+            for index in range(count + (session_id == "active")):
+                stale_context = session_id == "active" and index == count
+                call_id = f"{session_id}-{index}"
+                if session_id == "active" and not stale_context:
+                    active_ids.add(call_id)
+                store.insert(
+                    call_id=call_id,
+                    user_id=user_id,
+                    session_id=session_id,
+                    agent_id="review-agent",
+                    tool="write",
+                    args_redacted={"content": "SYNTHETIC_LARGE_PAYLOAD" * 1024},
+                    classification="write",
+                    evaluation_path="llm",
+                    decision="escalate",
+                    risk="high",
+                    reasoning="Review required",
+                    latency_ms=1,
+                    evaluation_metadata={
+                        "evaluation_policy_version": "hybrid_v1",
+                        "policy_revision": session["policy_revision"],
+                        "state_revision": session["state_revision"],
+                        "task_context": {
+                            "watermarks": {
+                                "decisions": "older-context"
+                                if stale_context
+                                else watermark
+                            }
+                        },
+                        "stages": [{"details": "SYNTHETIC_LARGE_PAYLOAD" * 1024}],
+                    },
+                )
+            if session_id == "obsolete":
+                sessions.update_status(session_id, "completed", user_id=user_id)
+        # Exercise UUID text tie-ordering through the pending timeline wrapper.
+        with db.cursor() as cur:
+            cur.execute(
+                "UPDATE audit_log SET timestamp = ? WHERE user_id = ?",
+                ("2026-01-01T00:00:00+00:00", user_id),
+            )
+        expected = [
+            row["call_id"]
+            for row in store.query(user_id=user_id)["items"]
+            if row["call_id"] in active_ids
+        ]
+
+        projections, hydrated, decoded = [], [], []
+        original_cursor = db.cursor
+        original_decode = audit._row_to_dict
+        original_watermark = task_context.decision_watermark
+        watermark_calls = []
+
+        class ObservedCursor:
+            def __init__(self, cursor):
+                self.cursor = cursor
+
+            def __getattr__(self, name):
+                return getattr(self.cursor, name)
+
+            def fetchall(self):
+                rows = self.cursor.fetchall()
+                if rows:
+                    columns = set(rows[0].keys())
+                    if "task_watermark" in columns:
+                        projections.append([dict(row) for row in rows])
+                    if "evaluation_metadata" in columns:
+                        hydrated.append([row["call_id"] for row in rows])
+                return rows
+
+        @contextlib.contextmanager
+        def observe_cursor():
+            with original_cursor() as cur:
+                yield ObservedCursor(cur)
+
+        def observe_decode(row):
+            decoded.append(row["call_id"])
+            return original_decode(row)
+
+        def observe_watermark(cur, user_id, session_id, **kwargs):
+            watermark_calls.append((user_id, session_id))
+            return original_watermark(cur, user_id, session_id, **kwargs)
+
+        monkeypatch.setattr(db, "cursor", observe_cursor)
+        monkeypatch.setattr(audit, "_row_to_dict", observe_decode)
+        monkeypatch.setattr(task_context, "decision_watermark", observe_watermark)
+        response = client_no_auth.get(
+            "/api/v1/audit",
+            headers=headers,
+            params={
+                "source": "all",
+                "decision": "escalate",
+                "resolved": "false",
+                "page": 3,
+                "limit": 2,
+            },
+        )
+        assert response.status_code == 200, response.text
+        data = response.json()
+        assert (data["total"], data["pages"], data["page"]) == (8, 4, 3)
+        assert [row["call_id"] for row in data["items"]] == expected[4:6]
+        assert hydrated == [expected[4:6]] and decoded == expected[4:6]
+        assert watermark_calls == [(user_id, "active")]
+        assert len(projections) == 1 and len(projections[0]) == 9
+        for row in projections[0]:
+            assert row["session_id"] == "active"
+            assert (
+                not {
+                    "evaluation_metadata",
+                    "args_redacted",
+                    "reasoning",
+                    "content",
+                    "stages",
+                }
+                & row.keys()
+            )
+
+        # Stats requests limit=1; they must not rehydrate the backlog either.
+        projections.clear()
+        hydrated.clear()
+        decoded.clear()
+        watermark_calls.clear()
+        stats = client_no_auth.get("/api/v1/stats", headers=headers)
+        assert stats.status_code == 200, stats.text
+        assert stats.json()["pending_approvals"] == 8
+        assert hydrated == [expected[:1]] and decoded == expected[:1]
+        assert watermark_calls == [(user_id, "active")]
+
+        paged = []
+        for page in range(1, 5):
+            response = client_no_auth.get(
+                "/api/v1/audit",
+                headers=headers,
+                params={
+                    "decision": "escalate",
+                    "resolved": "false",
+                    "page": page,
+                    "limit": 2,
+                },
+            )
+            assert response.status_code == 200, response.text
+            paged.extend(row["call_id"] for row in response.json()["items"])
+        assert paged == expected
+        assert len(paged) == len(set(paged))
+
 
 # ── Analysis Disabled ─────────────────────────────────────────────────
 
