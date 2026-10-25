@@ -21,6 +21,50 @@ function ui() {
 
 function plain(value) { return JSON.parse(JSON.stringify(value)); }
 
+function apiClient(response, auth) {
+  const Alpine = { store() { return auth; } };
+  const context = vm.createContext({
+    fetch: async () => response,
+    localStorage: { getItem() { return null; } },
+    window: { Alpine },
+    Alpine,
+  });
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '../intaris/ui/static/js/api.js'), 'utf8'), context);
+  return vm.runInContext('IntarisAPI', context);
+}
+
+test('API errors extract HybridError messages without serializing structured details', async () => {
+  const message = 'Cannot resolve an approval for a completed session.';
+  const api = apiClient({ ok: false, status: 409, json: async () => ({ detail: {
+    code: 'stale_resolution', message, execution_state: 'not_dispatched', retryable: false,
+  } }) });
+  await assert.rejects(api._fetch('/decision'), { message });
+});
+
+test('API errors preserve string, validation and non-JSON HTTP messages', async () => {
+  for (const [body, expected] of [
+    [{ detail: 'Not found' }, 'Not found'],
+    [{ error: 'Request rejected' }, 'Request rejected'],
+    [{ detail: [{ msg: 'Field required' }, { msg: 'Invalid value' }] }, 'Field required; Invalid value'],
+    [{ detail: { code: 'unknown', payload: 'not for display' } }, 'HTTP 409'],
+    [{ error: { message: { payload: 'not for display' } } }, 'HTTP 409'],
+  ]) {
+    const api = apiClient({ ok: false, status: 409, json: async () => body });
+    await assert.rejects(api._fetch('/decision'), { message: expected });
+  }
+  const api = apiClient({ ok: false, status: 502, json: async () => { throw new SyntaxError('Not JSON'); } });
+  await assert.rejects(api._fetch('/decision'), { message: 'HTTP 502' });
+});
+
+test('API 401 still logs out and reports Unauthorized without parsing the body', async () => {
+  let logouts = 0;
+  const api = apiClient({ ok: false, status: 401,
+    json: async () => { assert.fail('401 body must not be parsed'); },
+  }, { logout() { logouts++; } });
+  await assert.rejects(api._fetch('/decision'), { message: 'Unauthorized' });
+  assert.equal(logouts, 1);
+});
+
 test('Audit backend labels use persisted routes without guessing old or fast paths', () => {
   const tab = ui().auditTab();
   assert.equal(tab.backendLabel({ evaluation_path: 'alignment',

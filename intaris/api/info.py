@@ -11,7 +11,6 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from intaris.api.deps import SessionContext, get_session_context
-from intaris.decision import UNATTENDED_JUDGE_REVIEW
 
 logger = logging.getLogger(__name__)
 
@@ -95,16 +94,16 @@ def _compute_stats(
             else 0.0
         )
 
-        # Pending approvals (escalated + unresolved)
-        with db.cursor() as cur:
-            cur.execute(
-                "SELECT COUNT(*) FROM audit_log "
-                "WHERE user_id = ? AND decision = 'escalate' "
-                "AND user_decision IS NULL "
-                f"AND (outcome_override IS NULL OR outcome_override != ?){audit_agent_cond}",
-                (ctx.user_id, UNATTENDED_JUDGE_REVIEW, *audit_agent_params),
-            )
-            pending_approvals = cur.fetchone()[0]
+        # Share receipt freshness and judge-only filtering with the approvals list.
+        from intaris.audit import AuditStore
+
+        pending_approvals = AuditStore(db).query(
+            user_id=ctx.user_id,
+            agent_id=agent_id,
+            decision="escalate",
+            resolved=False,
+            limit=1,
+        )["total"]
 
         # Average latency
         with db.cursor() as cur:
