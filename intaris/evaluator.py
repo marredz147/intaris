@@ -493,6 +493,7 @@ class Evaluator:
         if (
             not isinstance(exc, HybridError)
             or exc.code != "policy_state_changed"
+            or not exc.retryable
             or attempt >= _PARENT_CONFLICT_RETRIES
             or kwargs.get("expected_policy_revision") is not None
             or kwargs.get("expected_policy_hash") is not None
