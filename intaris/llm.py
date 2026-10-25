@@ -315,6 +315,9 @@ class LLMClient:
             # Parameter repairs adapt the transport; they are not new attempts.
             max_repairs = 3
             for repair in range(1 + max_repairs):
+                if repair:
+                    # A retry may fail before reaching the provider.
+                    metrics["calls"] = 0
                 try:
                     response = self._call_with_transient_retries(
                         params,

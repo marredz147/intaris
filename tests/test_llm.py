@@ -666,6 +666,27 @@ class TestParameterAdaptation:
             ]
         assert all(call["response_format"]["type"] == "json_schema" for call in calls)
 
+    def test_single_attempt_counts_only_calls_reaching_provider(self, monkeypatch):
+        from intaris import model_retry
+
+        calls = []
+
+        def create(**params):
+            calls.append(params)
+            raise _ParameterError("temperature")
+
+        client = _parameter_client(monkeypatch, create)
+        retry_timeout = model_retry.retry_timeout
+        monkeypatch.setattr(
+            model_retry,
+            "retry_timeout",
+            lambda *args, **kwargs: None if calls else retry_timeout(*args, **kwargs),
+        )
+        with pytest.raises(LLMTemporaryError):
+            client.generate([], single_attempt=True)
+        assert len(calls) == 1
+        assert client.generation_metrics["calls"] == 1
+
     def test_single_attempt_does_not_retry_unrelated_400(self, monkeypatch):
         calls = []
 
