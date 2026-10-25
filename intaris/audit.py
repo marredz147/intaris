@@ -548,17 +548,9 @@ class AuditStore:
         with self._db.cursor() as cur:
             offset = (page - 1) * limit
             if resolved is False and decision == "escalate":
-                # Task-context freshness includes a Python decision digest.
-                # Filter the complete pending set before counting/pagination,
-                # not just the selected page. This path performs no mutations.
-                cur.execute(
-                    f"SELECT * FROM audit_log {where} ORDER BY timestamp DESC, id DESC",
-                    params,
+                items, total = self._pending_page(
+                    cur, where, params, user_id=user_id, offset=offset, limit=limit
                 )
-                candidates = [_row_to_dict(row) for row in cur.fetchall()]
-                current = self._current_pending(cur, candidates, user_id=user_id)
-                total = len(current)
-                items = current[offset : offset + limit]
             else:
                 cur.execute(f"SELECT COUNT(*) FROM audit_log {where}", params)
                 total = cur.fetchone()[0]
@@ -581,51 +573,85 @@ class AuditStore:
             "pages": pages,
         }
 
-    def _current_pending(
-        self, cur: Any, records: list[dict[str, Any]], *, user_id: str
-    ) -> list[dict[str, Any]]:
-        """Select revision-bound receipts still eligible for resolution, read-only."""
-        from intaris.policy_activation import HybridError
-        from intaris.task_context import validate_freshness
+    def _pending_page(
+        self,
+        cur: Any,
+        where: str,
+        params: list[Any],
+        *,
+        user_id: str,
+        offset: int,
+        limit: int,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Filter pending receipt freshness before hydrating only the requested page."""
+        from intaris.task_context import decision_watermark
 
-        current = []
-        session_freshness = {}
-        for record in records:
-            metadata = record.get("evaluation_metadata") or {}
-            # Match resolve_escalation's freshness gate without imposing new
-            # revision requirements on historical legacy receipts.
-            if metadata.get("evaluation_policy_version") == "hybrid_v1" or metadata.get(
-                "overlay"
-            ):
-                key = (
-                    record["session_id"],
-                    metadata.get("policy_revision"),
-                    metadata.get("state_revision"),
-                )
-                if key not in session_freshness:
-                    cur.execute(
-                        "SELECT 1 FROM sessions WHERE user_id = ? AND session_id = ? "
-                        "AND policy_revision = ? AND state_revision = ? AND status = 'active'",
-                        (user_id, *key),
+        metadata = "NULLIF(audit_log.evaluation_metadata, '')"
+        if self._db.backend == "postgresql":
+            metadata += "::jsonb"
+            version = f"({metadata} ->> 'evaluation_policy_version')"
+            overlay_truthy = f"""({metadata} -> 'overlay') NOT IN (
+                'null'::jsonb, 'false'::jsonb, '0'::jsonb, '""'::jsonb,
+                '[]'::jsonb, '{{}}'::jsonb)"""
+            policy_revision = f"({metadata} ->> 'policy_revision')::bigint"
+            state_revision = f"({metadata} ->> 'state_revision')::bigint"
+            watermark = f"({metadata} #>> '{{task_context,watermarks,decisions}}')"
+        else:
+            version = f"json_extract({metadata}, '$.evaluation_policy_version')"
+            overlay = f"json_extract({metadata}, '$.overlay')"
+            overlay_type = f"json_type({metadata}, '$.overlay')"
+            overlay_truthy = f"""CASE
+                WHEN {overlay_type} IN ('object', 'array')
+                    THEN EXISTS (SELECT 1 FROM json_each({metadata}, '$.overlay'))
+                WHEN {overlay_type} = 'text' THEN length({overlay}) > 0
+                ELSE COALESCE({overlay} != 0, FALSE) END"""
+            policy_revision = f"json_extract({metadata}, '$.policy_revision')"
+            state_revision = f"json_extract({metadata}, '$.state_revision')"
+            watermark = (
+                f"json_extract({metadata}, '$.task_context.watermarks.decisions')"
+            )
+        revision_bound = f"(COALESCE({version} = 'hybrid_v1', FALSE) OR COALESCE(({overlay_truthy}), FALSE))"
+        eligible = f"""(NOT {revision_bound} OR EXISTS (
+            SELECT 1 FROM sessions s
+            WHERE s.user_id = audit_log.user_id AND s.session_id = audit_log.session_id
+              AND s.status = 'active' AND s.policy_revision = {policy_revision}
+              AND s.state_revision = {state_revision}))"""
+        cur.execute(
+            f"""SELECT call_id, session_id,
+                       CASE WHEN {revision_bound} THEN {watermark} END AS task_watermark
+                FROM audit_log {where} AND {eligible}
+                ORDER BY timestamp DESC, id DESC""",
+            params,
+        )
+        candidates = cur.fetchall()
+        watermarks = {}
+        selected = []
+        total = 0
+        for candidate in candidates:
+            expected = candidate["task_watermark"]
+            if expected is not None:
+                session_id = candidate["session_id"]
+                if session_id not in watermarks:
+                    # Pending calls have no user_decision, so they cannot appear
+                    # in the resolved human decisions hashed by decision_watermark.
+                    # Excluding each pending call therefore yields this same hash.
+                    watermarks[session_id] = decision_watermark(
+                        cur, user_id, session_id
                     )
-                    session_freshness[key] = cur.fetchone() is not None
-                if not session_freshness[key]:
+                if expected != watermarks[session_id]:
                     continue
-                if metadata.get("task_context"):
-                    try:
-                        validate_freshness(
-                            cur,
-                            metadata,
-                            user_id,
-                            record["session_id"],
-                            exclude_call_id=record["call_id"],
-                        )
-                    except HybridError as exc:
-                        if exc.code != "stale_task_context":
-                            raise
-                        continue
-            current.append(record)
-        return current
+            if offset <= total < offset + limit:
+                selected.append(candidate["call_id"])
+            total += 1
+        if not selected:
+            return [], total
+        placeholders = ", ".join("?" for _ in selected)
+        cur.execute(
+            f"SELECT * FROM audit_log {where} AND call_id IN ({placeholders}) "
+            "ORDER BY timestamp DESC, id DESC",
+            params + selected,
+        )
+        return [_row_to_dict(row) for row in cur.fetchall()], total
 
     def get_recent(
         self,
