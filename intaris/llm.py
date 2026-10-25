@@ -342,11 +342,15 @@ class LLMClient:
             self._raise_protocol_mismatch(exc)
             body = _provider_error_body(exc)
             logger.warning(
-                "LLM request rejected for model %s (status=%s, code=%s, param=%s)",
+                "LLM request rejected for model %s (status=%s, code=%s, param=%s%s)",
                 self._model,
                 getattr(exc, "status_code", None),
                 body.get("code"),
                 body.get("param"),
+                # Schema rejections describe our schema, not request content.
+                f", message={str(body.get('message') or '')[:300]!r}"
+                if body.get("param") == "response_format"
+                else "",
             )
             # Cache only a format incompatibility, not arbitrary invalid parameters.
             if _is_unsupported_schema_error(exc) and not is_output_validation_error(
