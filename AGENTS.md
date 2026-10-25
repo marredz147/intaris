@@ -33,9 +33,7 @@
 intaris/
 ├── integrations/
 │   ├── opencode/
-│   │   ├── intaris.ts     # V1 plugin entry (build before installing)
-│   │   ├── intaris-v2.ts  # V2 Effect plugin entry
-│   │   ├── src/core.ts    # Shared guard and session logic
+│   │   ├── intaris.ts     # TypeScript plugin (tool.execute.before interception)
 │   │   ├── opencode.json  # MCP proxy config example
 │   │   └── README.md      # Setup and usage guide
 │   └── claude-code/
@@ -1261,11 +1259,11 @@ Client integrations live in `integrations/` and provide two approaches for each 
 
 ### OpenCode
 
-- **Plugin**: `integrations/opencode/intaris.ts` (V1 1.18.29) and `integrations/opencode/intaris-v2.ts` (V2 2.0.26) are separate entries sharing `integrations/opencode/src/core.ts`. They gate supported direct tool calls before execution, track parent/child sessions and send checkpoints and completion signals. The V2 CodeMode outer `execute` call is rejected pending coverage of its separate HTTP extension; do not load both entries.
+- **Plugin**: `integrations/opencode/intaris.ts` — TypeScript plugin using `tool.execute.before` hook. Creates Intaris sessions on `session.created` (including child sessions with `parent_session_id`), evaluates every tool call before execution, sends periodic checkpoints, and signals session completion on `session.deleted`.
 - **MCP config**: `integrations/opencode/opencode.json` — Remote MCP server pointing at `/mcp`.
-- **Env vars**: `INTARIS_URL`, `INTARIS_API_KEY` or opt-in `INTARIS_API_KEY_FILE`, `INTARIS_AGENT_ID` (default: `opencode`), `INTARIS_USER_ID`, `INTARIS_FAIL_OPEN` (default: `false`; `true` is unsafe), `INTARIS_INTENTION`, `INTARIS_ALLOW_PATHS` (comma-separated parent dirs for cross-project reads, e.g., `~/src`), `INTARIS_CHECKPOINT_INTERVAL` (default: `25`, `0`=disabled).
-- **Install**: From `integrations/opencode/`, build `dist/intaris-v1.js` for the V1 autoload plugin directory, or build `dist/v2/index.js` and configure its **directory** as a V2 local plugin with its pinned runtime dependencies available. Do not copy raw TypeScript siblings into an autoload directory. See `integrations/opencode/README.md` for build and validation limits.
-- **OpenCode permissions**: Retain role-specific built-in restrictions; do not set blanket `"permission": "allow"`. The V2 host may continue if plugin loading fails; use `/plugins` or `opencode plugin list` for load status, not evaluator health. See [OpenCode Permissions](https://opencode.ai/docs/permissions/).
+- **Env vars**: `INTARIS_URL`, `INTARIS_API_KEY`, `INTARIS_AGENT_ID` (default: `opencode`), `INTARIS_USER_ID`, `INTARIS_FAIL_OPEN` (default: `false`), `INTARIS_INTENTION`, `INTARIS_ALLOW_PATHS` (comma-separated parent dirs for cross-project reads, e.g., `~/src`), `INTARIS_CHECKPOINT_INTERVAL` (default: `25`, `0`=disabled).
+- **Install**: Copy `intaris.ts` to `~/.config/opencode/plugins/` (global) or `.opencode/plugins/` (project).
+- **OpenCode permissions**: Set `"permission": "allow"` in `opencode.jsonc` to disable OpenCode's built-in approval prompts and let Intaris be the sole gatekeeper. See [OpenCode Permissions](https://opencode.ai/docs/permissions/).
 - **Behavioral analysis**: Tracks per-session statistics (call count, approve/deny/escalate breakdown, recent tools). Sends periodic checkpoints via `POST /checkpoint`. Signals completion via `PATCH /session/{id}/status` + `POST /session/{id}/agent-summary` on session deletion.
 
 ### Claude Code
