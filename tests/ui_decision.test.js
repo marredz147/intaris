@@ -21,6 +21,127 @@ function ui() {
 
 function plain(value) { return JSON.parse(JSON.stringify(value)); }
 
+function apiClient(response, auth) {
+  const Alpine = { store() { return auth; } };
+  const context = vm.createContext({
+    fetch: async () => response,
+    localStorage: { getItem() { return null; } },
+    window: { Alpine },
+    Alpine,
+  });
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '../intaris/ui/static/js/api.js'), 'utf8'), context);
+  return vm.runInContext('IntarisAPI', context);
+}
+
+test('API errors extract HybridError messages without serializing structured details', async () => {
+  const message = 'Cannot resolve an approval for a completed session.';
+  const api = apiClient({ ok: false, status: 409, json: async () => ({ detail: {
+    code: 'stale_resolution', message, execution_state: 'not_dispatched', retryable: false,
+  } }) });
+  await assert.rejects(api._fetch('/decision'), { message });
+});
+
+test('API errors preserve string, validation and non-JSON HTTP messages', async () => {
+  for (const [body, expected] of [
+    [{ detail: 'Not found' }, 'Not found'],
+    [{ error: 'Request rejected' }, 'Request rejected'],
+    [{ detail: [{ msg: 'Field required' }, { msg: 'Invalid value' }] }, 'Field required; Invalid value'],
+    [{ detail: { code: 'unknown', payload: 'not for display' } }, 'HTTP 409'],
+    [{ error: { message: { payload: 'not for display' } } }, 'HTTP 409'],
+  ]) {
+    const api = apiClient({ ok: false, status: 409, json: async () => body });
+    await assert.rejects(api._fetch('/decision'), { message: expected });
+  }
+  const api = apiClient({ ok: false, status: 502, json: async () => { throw new SyntaxError('Not JSON'); } });
+  await assert.rejects(api._fetch('/decision'), { message: 'HTTP 502' });
+});
+
+test('API 401 still logs out and reports Unauthorized without parsing the body', async () => {
+  let logouts = 0;
+  const api = apiClient({ ok: false, status: 401,
+    json: async () => { assert.fail('401 body must not be parsed'); },
+  }, { logout() { logouts++; } });
+  await assert.rejects(api._fetch('/decision'), { message: 'Unauthorized' });
+  assert.equal(logouts, 1);
+});
+
+test('Audit backend labels use persisted routes without guessing old or fast paths', () => {
+  const tab = ui().auditTab();
+  assert.equal(tab.backendLabel({ evaluation_path: 'alignment',
+    evaluation_metadata: { backend_provenance: { route: 'decisions_to_llm' } },
+  }), 'Decisions → LLM');
+  for (const [route, label] of [
+    ['llm', 'LLM'], ['decisions', 'Decisions'],
+    ['decisions_to_llm', 'Decisions → LLM'], ['unknown', ''],
+  ]) {
+    assert.equal(tab.backendLabel({ evaluation_path: 'llm',
+      evaluation_metadata: { backend_provenance: { route } },
+    }), label);
+  }
+  for (const record of [null, {}, { evaluation_path: 'llm' },
+    { evaluation_path: 'llm', evaluation_metadata: null },
+    { evaluation_path: 'llm', evaluation_metadata: { backend_provenance: { final_model: 'decisions-model' } } },
+    ...['reasoning', 'checkpoint', 'summary'].map(record_type => ({ record_type,
+      evaluation_path: 'llm', evaluation_metadata: { backend_provenance: { route: 'decisions' } },
+    })),
+    { source: 'event', evaluation_path: 'llm', evaluation_metadata: { backend_provenance: { route: 'decisions' } } },
+    ...['fast', 'critical'].map(evaluation_path => ({ evaluation_path,
+      evaluation_metadata: { backend_provenance: { route: 'decisions' } },
+    })),
+  ]) assert.equal(tab.backendLabel(record), '');
+});
+
+test('Audit explains forwarding without displaying provider diagnostic text', () => {
+  const tab = ui().auditTab();
+  for (const [code, expected] of [
+    ['low_confidence', 'Low confidence in the Decisions assessment.'],
+    ['temporary_unavailable', 'Decisions was temporarily unavailable.'],
+    ['optional_escalation', 'Optional review of a Decisions escalation.'],
+    ['<img src=x onerror=alert(1)>', ''],
+    ['constructor', ''],
+  ]) {
+    const record = { evaluation_path: 'llm', evaluation_metadata: { backend_provenance: {
+      route: 'decisions_to_llm', final_backend: 'llm',
+      fallback_reason: { code, message: '<script>unsafe()</script>' },
+    } } };
+    assert.equal(tab.backendReviewReason(record), expected);
+  }
+  assert.equal(tab.backendReviewReason({ evaluation_path: 'llm' }), '');
+});
+
+test('Failed optional LLM review labels the retained Decisions result truthfully', () => {
+  const tab = ui().auditTab();
+  const provenance = { route: 'decisions_to_llm', final_backend: 'decisions',
+    fallback_reason: { code: 'optional_escalation' }, attempts: [
+      { backend: 'decisions', status: 'completed' }, { backend: 'llm', status: 'failed' },
+    ],
+  };
+  const record = { evaluation_path: 'alignment', evaluation_metadata: { backend_provenance: provenance } };
+  assert.equal(tab.backendLabel(record), 'Decisions');
+  assert.equal(tab.backendReviewReason(record),
+    'Optional review of a Decisions escalation. LLM review failed; Decisions result retained.');
+  provenance.final_backend = 'llm';
+  provenance.attempts[1].status = 'completed';
+  assert.equal(tab.backendLabel(record), 'Decisions → LLM');
+  assert.equal(tab.backendReviewReason(record), 'Optional review of a Decisions escalation.');
+});
+
+test('Live Audit rows fetch persisted backend provenance after evaluation', async () => {
+  const context = ui();
+  const tab = context.auditTab();
+  tab.initialized = true;
+  const fresh = { call_id: 'live-call', evaluation_path: 'llm',
+    evaluation_metadata: { backend_provenance: { route: 'decisions_to_llm' } },
+  };
+  context.IntarisAPI.getAuditRecord = async callId => {
+    assert.equal(callId, fresh.call_id);
+    return fresh;
+  };
+  tab._handleWsEvent({ type: 'evaluated', call_id: fresh.call_id, path: 'llm' });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(tab.backendLabel(tab.records[0]), 'Decisions → LLM');
+});
+
 test('Judge headline and exact cites come only from the latest structured stage', () => {
   const context = ui();
   assert.equal(context.judgePresentation({ reasoning: 'User simulator: approve; basis=explicit_request' }), null);

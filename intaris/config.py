@@ -181,6 +181,32 @@ class JevConfig:
 
 
 @dataclass
+class DecisionsConfig:
+    """Dedicated native Decisions endpoint, independent of generative routing."""
+
+    model: str = field(default_factory=lambda: _env("DECISIONS_MODEL", "gpt-6-luna"))
+    base_url: str = field(
+        default_factory=lambda: _env("DECISIONS_BASE_URL", "https://api.openai.com/v1")
+    )
+    api_key: str = field(default_factory=lambda: _env("DECISIONS_API_KEY"))
+    timeout_ms: int = field(
+        default_factory=lambda: _env_int("DECISIONS_TIMEOUT_MS", 2000)
+    )
+    minimum_confidence: float = field(
+        default_factory=lambda: _env_float("DECISIONS_MINIMUM_CONFIDENCE", 0.8)
+    )
+    l1_review_enabled: bool = field(
+        default_factory=lambda: _env_bool("DECISIONS_L1_REVIEW_ENABLED", False)
+    )
+    hybrid_minimum_posterior: float = field(
+        default_factory=lambda: _env_float("DECISIONS_HYBRID_MINIMUM_POSTERIOR", 0.6)
+    )
+    hybrid_minimum_margin: float = field(
+        default_factory=lambda: _env_float("DECISIONS_HYBRID_MINIMUM_MARGIN", 0.1)
+    )
+
+
+@dataclass
 class DBConfig:
     """Database configuration.
 
@@ -720,6 +746,7 @@ class Config:
 
     llm: LLMConfig = field(default_factory=LLMConfig)
     jev: JevConfig = field(default_factory=JevConfig)
+    decisions: DecisionsConfig = field(default_factory=DecisionsConfig)
     llm_analysis: LLMConfig = field(default_factory=_build_analysis_llm_config)
     llm_l3_analysis: LLMConfig = field(default_factory=_build_l3_analysis_llm_config)
     llm_judge: LLMConfig = field(default_factory=_build_judge_llm_config)
@@ -795,10 +822,10 @@ class Config:
         from intaris.inference import managed_endpoint
 
         evaluator_backend = evaluator_backend_mode()
-        if evaluator_backend not in ("llm", "jev", "auto"):
+        if evaluator_backend not in ("llm", "jev", "auto", "decisions"):
             raise ValueError(
                 f"EVALUATOR_BACKEND={evaluator_backend} is not supported. "
-                "Use 'llm', 'jev', or 'auto'."
+                "Use 'llm', 'jev', 'auto', or 'decisions'."
             )
         if evaluator_backend == "auto" and not managed_endpoint():
             raise ValueError(
@@ -810,6 +837,26 @@ class Config:
                 "JEV_API_KEY or TYPESAFE_API_KEY is required when "
                 "EVALUATOR_BACKEND=jev."
             )
+        if evaluator_backend == "decisions":
+            if not self.decisions.api_key:
+                raise ValueError(
+                    "DECISIONS_API_KEY is required for EVALUATOR_BACKEND=decisions."
+                )
+            if not self.decisions.model.strip():
+                raise ValueError("DECISIONS_MODEL must not be empty.")
+            if self.decisions.timeout_ms < 500:
+                raise ValueError("DECISIONS_TIMEOUT_MS must be at least 500.")
+            if not all(
+                0 <= value <= 1
+                for value in (
+                    self.decisions.minimum_confidence,
+                    self.decisions.hybrid_minimum_posterior,
+                    self.decisions.hybrid_minimum_margin,
+                )
+            ):
+                raise ValueError(
+                    "DECISIONS confidence thresholds must be between 0 and 1."
+                )
         if self.jev.enabled:
             if self.jev.timeout_ms < 500:
                 raise ValueError(

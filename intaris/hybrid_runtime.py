@@ -10,7 +10,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
-from intaris import policy_assessment, read_only
+from intaris import l1_review, policy_assessment, read_only
 from intaris.authorization import scope_sources
 from intaris.classifier import observe_hybrid
 from intaris.decision import cap_outcome, clamp_outcome
@@ -117,8 +117,47 @@ def _observe_action(tool: str, args: dict, **kwargs) -> dict:
 
 
 def classify(llm, jev, evidence: dict) -> tuple[dict, dict]:
-    if jev is not None:
-        return jev.classify_hybrid(state=evidence)
+    from intaris import l1_review
+    from intaris.decisions import DecisionsTemporaryError
+
+    with l1_review.review_deadline(jev, llm):
+        if jev is not None:
+            try:
+                with l1_review.primary_deadline(jev):
+                    assessment, diagnostics = jev.classify_hybrid(state=evidence)
+            except DecisionsTemporaryError as exc:
+                if not l1_review.is_decisions(jev) or llm is None:
+                    raise
+                assessment = None
+                diagnostics = {"failure": l1_review.failure(exc)}
+                reason = l1_review.temporary_reason(exc)
+            else:
+                reason = (
+                    jev.low_confidence(diagnostics)
+                    if l1_review.is_decisions(jev)
+                    else None
+                )
+            if not l1_review.is_decisions(jev):
+                return assessment, diagnostics
+            attempts = [l1_review.attempt(jev, diagnostics)]
+        else:
+            attempts, reason = [], None
+        if jev is None or reason:
+            assessment, diagnostics = _classify_chat(llm, evidence)
+            attempts.append(l1_review.attempt(llm, diagnostics))
+        if isinstance(attempts[-1]["model_view"], dict):
+            diagnostics["model_view"] = attempts[-1]["model_view"]
+        if reason:
+            diagnostics["model_view"] = l1_review.preserve_restrictions(
+                attempts[-1]["model_view"] or {}, attempts[0]["model_view"]
+            )
+        diagnostics["backend_provenance"] = l1_review.provenance(attempts, reason)
+        if l1_review.is_decisions(jev):
+            diagnostics = l1_review.redact_metadata(diagnostics)
+        return assessment, diagnostics
+
+
+def _classify_chat(llm, evidence: dict) -> tuple[dict, dict]:
     schema = Assessment.model_json_schema()
     schema["required"] = list(Assessment.model_fields)
     raw = llm.generate(
@@ -478,6 +517,7 @@ class HybridRuntime:
             )
         return question
 
+    @l1_review.runtime_deadline
     def evaluate(
         self,
         *,
@@ -808,7 +848,9 @@ class HybridRuntime:
                         "assessment_failed", "Hybrid assessment failed", 503
                     ) from exc
                 assessment = {}
-                diagnostics = {"validation_error": "jev_response_invalid"}
+                diagnostics = {
+                    "validation_error": f"{getattr(type(self.jev), 'provider', 'jev')}_response_invalid"
+                }
                 state = state.model_copy(update={"assessment_failed": True})
             except Exception as exc:
                 import httpx
@@ -837,6 +879,30 @@ class HybridRuntime:
                 }
             )
             result = evaluate_policy(rules, state, snapshot["profile"], assessed=True)
+            review_reason = l1_review.optional_reason(
+                self.jev,
+                diagnostics,
+                escalated=result.outcome == "escalate",
+                critical=assessment.get("risk") == "critical",
+            )
+            if review_reason:
+                assessment, diagnostics, _ = policy_assessment.review_native(
+                    self.llm, question, (assessment, diagnostics, {}), review_reason
+                )
+                stages[-1] = {
+                    "stage": "l1",
+                    "classification": assessment,
+                    **diagnostics,
+                }
+                state = state.model_copy(
+                    update={
+                        "assessment": assessment,
+                        "confidences": diagnostics.get("distributions", {}),
+                    }
+                )
+                result = evaluate_policy(
+                    rules, state, snapshot["profile"], assessed=True
+                )
         state = state.model_copy(update={"human_approved": human_approved})
         if not workspace_edit:
             result = evaluate_policy(rules, state, snapshot["profile"], assessed=True)
@@ -952,6 +1018,14 @@ class HybridRuntime:
             "mandatory_rule_ids": result.mandatory_rule_ids,
             "reason_codes": result.matched_rules + result.unresolved_rules,
             "stages": stages,
+            **next(
+                (
+                    {"backend_provenance": stage["backend_provenance"]}
+                    for stage in stages
+                    if "backend_provenance" in stage
+                ),
+                {},
+            ),
             "static_facts": original_facts,
             "authorization_sources": redact(sources),
             "facts": facts,

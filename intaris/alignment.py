@@ -52,7 +52,7 @@ from intaris.sanitize import (
 from intaris.session import SessionStore
 
 if TYPE_CHECKING:
-    from intaris.jev import JevClient
+    from intaris.finite_questions import FiniteQuestionClient
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +140,7 @@ def check_intention_alignment(
     child_assignment: Any = None,
     parent_user_evidence: Any = None,
     child_user_evidence: Any = None,
-    jev: JevClient | None = None,
+    jev: FiniteQuestionClient | None = None,
     fail_closed: bool = False,
     evaluator_backend: EvaluatorBackend | None = None,
 ) -> tuple[bool, str]:
@@ -189,7 +189,7 @@ def check_intention_alignment(
             if result[0] is True:
                 return result
             logger.info(
-                "Non-positive Jev alignment routed to independent alignment review"
+                "Non-positive finite alignment routed to independent alignment review"
             )
         # The analysis model classifies compatibility. It never decides: policy
         # weighs the verdict per profile and Judge reviews it like any other
@@ -307,7 +307,7 @@ class AlignmentBarrier:
         *,
         db: Database,
         llm: LLMClient | None,
-        jev: JevClient | None = None,
+        jev: FiniteQuestionClient | None = None,
         timeout_ms: int = _DEFAULT_ALIGNMENT_TIMEOUT_MS,
         evaluator_backend: EvaluatorBackend | None = None,
     ) -> None:

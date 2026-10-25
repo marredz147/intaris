@@ -329,7 +329,7 @@ def test_jitter_is_bounded_and_retry_after_is_capped():
 
 
 def _jev(handler, monkeypatch):
-    monkeypatch.setattr("intaris.jev.time.sleep", lambda _s: None)
+    monkeypatch.setattr("intaris.finite_questions.time.sleep", lambda _s: None)
 
     def transport(request):
         if request.method == "GET":

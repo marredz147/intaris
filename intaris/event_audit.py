@@ -224,6 +224,7 @@ class EventAuditStore:
         event_only_filters = event_type is not None or event_source is not None
 
         if source in {"all", "evaluations"} and not event_only_filters:
+            pending = decision == "escalate" and resolved is False
             audit_result = AuditStore(self._db).query(
                 user_id=user_id,
                 session_id=session_id,
@@ -236,13 +237,17 @@ class EventAuditStore:
                 from_ts=from_ts,
                 to_ts=to_ts,
                 resolved=resolved,
-                page=1,
-                limit=branch_limit,
+                page=page if pending else 1,
+                limit=limit if pending else branch_limit,
             )
             total += audit_result["total"]
             for item in audit_result["items"]:
                 item["source"] = "evaluation"
                 items.append(item)
+            if pending:
+                # Decision filters exclude the event branch: no merged timeline
+                # pagination is needed, and earlier pages need not be hydrated.
+                return audit_result
 
         if source in {"all", "events"} and not decision_only_filters:
             event_result = self._query_events(

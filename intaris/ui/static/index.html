@@ -1156,8 +1156,8 @@
         <div class="space-y-2">
           <template x-for="r in records" :key="r.id || r.call_id">
             <div class="card cursor-pointer" @click="toggleExpand(r)">
-              <div class="flex items-center justify-between">
-                <div class="flex items-center gap-3">
+              <div class="flex flex-wrap items-center justify-between gap-3">
+                <div class="flex flex-wrap items-center gap-3 min-w-0">
                   <span :class="sourceBadgeClass(r.source)"
                         x-text="r.source === 'event' ? 'event' : 'evaluation'"></span>
                   <span x-show="r.decision"
@@ -1169,11 +1169,13 @@
                         :class="recordTypeBadgeClass(r.record_type)" x-text="r.record_type"></span>
                   <span :class="riskBadgeClass(r.risk)" x-text="r.risk" x-show="r.risk"></span>
                   <span x-show="r.evaluation_path"
-                        :class="pathBadgeClass(r.evaluation_path)" x-text="r.evaluation_path"></span>
+                        :class="backendLabel(r) ? 'badge badge-llm' : pathBadgeClass(r.evaluation_path)"
+                        :title="backendLabel(r) ? 'Evaluation backend' : 'Evaluation path'"
+                        x-text="backendLabel(r) || r.evaluation_path"></span>
                 </div>
-                <div class="flex items-center gap-3 text-xs text-muted">
+                <div class="flex flex-wrap items-center gap-3 text-xs text-muted min-w-0">
                   <span x-show="r.agent_id" class="font-mono" x-text="r.agent_id"></span>
-                  <span class="text-brand-accent hover:underline cursor-pointer"
+                  <span class="text-brand-accent hover:underline cursor-pointer break-words min-w-0"
                         @click.stop="goToSession(r.session_id)"
                         x-text="r.session_id"></span>
                   <span x-text="formatTime(r.timestamp)"></span>
@@ -1187,6 +1189,16 @@
 
                 <!-- Expanded Detail -->
               <div x-show="expandedId === (r.id || r.call_id)" x-cloak class="mt-4 pt-4 border-t border-brand-border">
+                <template x-if="backendLabel(expandedRecord)">
+                  <div class="mb-3">
+                    <div class="text-xs text-muted mb-1">Evaluation</div>
+                    <div class="text-sm bg-brand-elevated rounded p-3">
+                      <div class="text-xs text-muted" x-text="'Pipeline path: ' + expandedRecord.evaluation_path"></div>
+                      <div x-show="backendReviewReason(expandedRecord)" class="mt-1"
+                           x-text="backendReviewReason(expandedRecord)"></div>
+                    </div>
+                  </div>
+                </template>
                 <!-- Content (for reasoning/checkpoint/summary records) -->
                 <template x-if="expandedRecord?.content">
                   <div class="mb-3">
