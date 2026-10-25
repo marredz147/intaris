@@ -1,0 +1,1656 @@
+/**
+ * intaris — Guardrails plugin for OpenCode.
+ *
+ * This plugin intercepts every tool call and evaluates it through
+ * Intaris's safety pipeline before allowing execution. Tool calls
+ * that are denied or escalated are blocked with an error message.
+ *
+ * Flow:
+ * 1. session.created: Creates an Intaris session via POST /api/v1/intention
+ *    (including child sessions with parent_session_id)
+ * 2. chat.message: Captures agent name per session for sub-agent identification
+ * 3. tool.execute.before: Evaluates every tool call via POST /api/v1/evaluate
+ *    - approve: tool executes normally
+ *    - deny: throws error with reasoning (blocks execution)
+ *    - escalate: polls only when /evaluate still returns unresolved escalation
+ *    - Periodic checkpoints sent every N calls (configurable)
+ * 4. session.updated: Updates Intaris intention when session title changes
+ * 5. session.deleted / session.idle: Updates session lifecycle in Intaris
+ *    - session.idle marks parent sessions idle and completes idle child sessions
+ *    - session.deleted completes the session and sends an agent summary
+ *
+ * Configuration via environment variables:
+ *   INTARIS_URL                  - Intaris server URL (default: http://localhost:8060)
+ *   INTARIS_API_KEY              - API key for authentication (required)
+ *   INTARIS_AGENT_ID             - Agent ID (default: opencode)
+ *   INTARIS_USER_ID              - User ID (optional if API key maps to user)
+ *   INTARIS_FAIL_OPEN            - Allow tool calls if Intaris is unreachable (default: false)
+ *   INTARIS_INTENTION            - Session intention override (default: auto-generated)
+ *   INTARIS_ALLOW_PATHS          - Comma-separated parent directories to allow reads from (e.g., ~/src)
+ *   INTARIS_CHECKPOINT_INTERVAL  - Evaluate calls between checkpoints (default: 25, 0=disabled)
+ *   INTARIS_ESCALATION_TIMEOUT   - Max seconds to wait for escalation approval (default: 0=no timeout)
+ *   INTARIS_SESSION_RECORDING    - Enable session recording (default: false)
+ *   INTARIS_RECORDING_FLUSH_SIZE - Events per recording batch (default: 50)
+ *   INTARIS_RECORDING_FLUSH_MS   - Recording flush interval in ms (default: 10000)
+ */
+
+import { closeSync, fstatSync, openSync, readFileSync, realpathSync } from "node:fs"
+import { constants } from "node:fs"
+
+export interface Host {
+  client?: {
+    app?: { log: (input: any) => Promise<any> }
+    tui?: { showToast: (input: any) => Promise<any> }
+  }
+  worktree?: string
+  directory?: string
+  sessionDirectory?: (id: string) => Promise<string | null>
+  resolveSessionMetadata?: (sessionID: string) => Promise<{
+    workingDirectory: string
+    parentID?: string
+    agent?: string
+    title?: string
+  } | null>
+}
+
+/**
+ * Readable text from an Intaris error body's `detail`: a string, the
+ * structured `{code, message}` envelope, or a validation list (`msg` only).
+ * Other shapes return null so raw server content is never surfaced.
+ */
+export function formatErrorDetail(value: unknown): string | null {
+  let text: string | null = null
+  if (typeof value === "string") text = value
+  else if (Array.isArray(value)) {
+    text = value.map(item => item && typeof item === "object" && typeof item.msg === "string" ? item.msg : "").filter(Boolean).join("; ")
+  } else if (value && typeof value === "object") {
+    const { code, message } = value as { code?: unknown; message?: unknown }
+    if (typeof message === "string") text = typeof code === "string" && code ? `${code}: ${message}` : message
+  }
+  return text?.trim() ? text.trim().slice(0, 300) : null
+}
+
+export function loadApiKey(env: NodeJS.ProcessEnv = process.env): string {
+  const path = env.INTARIS_API_KEY_FILE
+  if (!path) return env.INTARIS_API_KEY || ""
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+  try {
+    const stat = fstatSync(fd)
+    if (!stat.isFile() || stat.uid !== process.getuid?.() || (stat.mode & 0o077) !== 0) {
+      throw new Error("INTARIS_API_KEY_FILE must be owner-only regular file")
+    }
+    const key = readFileSync(fd, "utf8").replace(/\r?\n$/, "")
+    if (!key || key.includes("\n") || key.includes("\r")) throw new Error("INTARIS_API_KEY_FILE must contain one nonempty line")
+    return key
+  } finally {
+    closeSync(fd)
+  }
+}
+
+interface RecordingEvent {
+  type: string
+  data: Record<string, any>
+}
+
+interface SessionState {
+  workingDirectory: string
+  cancelled: boolean
+  reasoningError: boolean
+  intarisSessionId: string | null
+  sessionCreated: boolean
+  callCount: number
+  approvedCount: number
+  deniedCount: number
+  escalatedCount: number
+  recentTools: string[]
+  parentSessionId: string | null
+  lastError: string | null
+  agentName: string | null
+  sessionTitle: string | null
+  intentionUpdated: boolean
+  intentionPending: boolean
+  isIdle: boolean
+  // Last assistant response text for intention context
+  lastAssistantText: string
+  // Tracks recent message roles so part events can distinguish user vs assistant text.
+  messageRoles: Map<string, string>
+  recentMessageText: Map<string, string>
+  // Pending user message captured from events when chat.message does not fire.
+  pendingUserMessageId: string | null
+  pendingUserText: string
+  reasoningSentForMessageId: string | null
+  // Recording buffer
+  recordingBuffer: RecordingEvent[]
+  recordingFlush?: Promise<boolean>
+  metadataReady?: Promise<void>
+  toolCallAuditIds: Map<string, string>
+}
+
+interface EvaluateResponse {
+  call_id: string
+  decision: "approve" | "deny" | "escalate"
+  reasoning?: string
+  risk?: string
+  path: string
+  latency_ms: number
+}
+
+export const createCore = async ({ client: hostClient, worktree, directory, sessionDirectory, resolveSessionMetadata }: Host) => {
+  const log = (body: any): Promise<void> => hostClient?.app?.log({ body }).then(() => {}, () => {}) ?? Promise.resolve()
+  const notify = (body: any): void => { void hostClient?.tui?.showToast({ body }).catch(() => {}) }
+  const client = { app: { log: ({ body }: any) => log(body) }, tui: { showToast: ({ body }: any) => { notify(body); return Promise.resolve() } } }
+  // -- Configuration --------------------------------------------------------
+  const baseUrl = process.env.INTARIS_URL || "http://localhost:8060"
+  const apiKey = loadApiKey()
+  const agentId = process.env.INTARIS_AGENT_ID || "opencode"
+  const userId = process.env.INTARIS_USER_ID || ""
+  const failOpen =
+    (process.env.INTARIS_FAIL_OPEN || "false").toLowerCase() === "true"
+  const intentionOverride = process.env.INTARIS_INTENTION || ""
+  const workingDirectory = worktree || directory || ""
+  const rawInterval = parseInt(
+    process.env.INTARIS_CHECKPOINT_INTERVAL || "25",
+    10,
+  )
+  const checkpointInterval = isNaN(rawInterval) ? 25 : rawInterval
+  const rawEscalationTimeout = parseInt(
+    process.env.INTARIS_ESCALATION_TIMEOUT || "0",
+    10,
+  )
+  const escalationTimeoutMs = isNaN(rawEscalationTimeout)
+    ? 0
+    : Math.max(0, rawEscalationTimeout * 1000)
+  const sessionRecording =
+    (process.env.INTARIS_SESSION_RECORDING || "false").toLowerCase() === "true"
+  const rawRecordingFlushSize = parseInt(
+    process.env.INTARIS_RECORDING_FLUSH_SIZE || "50",
+    10,
+  )
+  const recordingFlushSize = isNaN(rawRecordingFlushSize) ? 50 : rawRecordingFlushSize
+  const rawRecordingFlushMs = parseInt(
+    process.env.INTARIS_RECORDING_FLUSH_MS || "10000",
+    10,
+  )
+  const recordingFlushMs = isNaN(rawRecordingFlushMs) ? 10000 : rawRecordingFlushMs
+  const allowPathsRaw = process.env.INTARIS_ALLOW_PATHS || ""
+
+  // -- State ----------------------------------------------------------------
+  // Track Intaris session per OpenCode session.
+  // Bounded to prevent unbounded growth in long-running instances.
+  const MAX_SESSIONS = 100
+  const MAX_RECENT_TOOLS = 10
+  const sessions = new Map<string, SessionState>()
+
+  // -- API Client -----------------------------------------------------------
+
+  interface ApiResult {
+    data: any | null
+    error: string | null
+    status: number | null
+  }
+
+  async function callApi(
+    method: string,
+    path: string,
+    payload: object | null,
+    timeoutMs: number = 5000,
+    extraHeaders?: Record<string, string>,
+    signal?: AbortSignal,
+  ): Promise<ApiResult> {
+    const headers: Record<string, string> = {
+      "X-Agent-Id": agentId,
+      ...extraHeaders,
+    }
+    if (payload !== null) {
+      headers["Content-Type"] = "application/json"
+    }
+    if (apiKey) {
+      headers["Authorization"] = `Bearer ${apiKey}`
+    }
+    if (userId) {
+      headers["X-User-Id"] = userId
+    }
+
+    try {
+      const fetchOptions: RequestInit = {
+        method,
+        headers,
+        signal: signal ? AbortSignal.any([AbortSignal.timeout(timeoutMs), signal]) : AbortSignal.timeout(timeoutMs),
+      }
+      if (payload !== null) {
+        fetchOptions.body = JSON.stringify(payload)
+      }
+      const resp = await fetch(`${baseUrl}${path}`, fetchOptions)
+      if (resp.ok) return { data: await resp.json(), error: null, status: resp.status }
+
+      let detail = `HTTP ${resp.status}`
+      try {
+        const parsed = JSON.parse(await resp.text())
+        const formatted = formatErrorDetail(parsed?.detail)
+        if (formatted) detail = `${detail}: ${formatted}`
+      } catch {}
+
+      await client.app
+        .log({
+          body: {
+            service: "intaris",
+            level: "warn",
+            message: `API ${method} ${path} returned ${resp.status}: ${detail}`,
+            extra: { status: resp.status },
+          },
+        })
+        .catch(() => {})
+      return { data: null, error: detail, status: resp.status }
+    } catch (err) {
+      await client.app
+        .log({
+          body: {
+            service: "intaris",
+            level: "warn",
+            message: `API ${method} ${path} failed`,
+          },
+        })
+        .catch(() => {})
+      return { data: null, error: "network error", status: null }
+    }
+  }
+
+  /**
+   * Call API with retries and exponential backoff.
+   * Retries on network errors and 5xx responses. Does NOT retry 4xx.
+   */
+  async function callApiWithRetry(
+    method: string,
+    path: string,
+    payload: object | null,
+    timeoutMs: number = 30000,
+    maxRetries: number = 3,
+  ): Promise<ApiResult> {
+    const backoffMs = [1000, 2000, 4000]
+    let lastResult: ApiResult = { data: null, error: "no attempts", status: null }
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      lastResult = await callApi(method, path, payload, timeoutMs)
+
+      // Success — return immediately
+      if (lastResult.data !== null) return lastResult
+
+      // 4xx client errors — do not retry (auth, validation, not found)
+      if (lastResult.status !== null && lastResult.status >= 400 && lastResult.status < 500) {
+        return lastResult
+      }
+
+      // 5xx or network error — retry with backoff (unless last attempt)
+      if (attempt < maxRetries) {
+        const delay = backoffMs[Math.min(attempt, backoffMs.length - 1)]
+        await client.app
+          .log({
+            body: {
+              service: "intaris",
+              level: "warn",
+              message: `API ${method} ${path} failed (attempt ${attempt + 1}/${maxRetries + 1}), retrying in ${delay}ms`,
+            },
+          })
+          .catch(() => {})
+        await new Promise((resolve) => setTimeout(resolve, delay))
+      }
+    }
+
+    return lastResult
+  }
+
+  // -- Toast Notifications --------------------------------------------------
+
+  /**
+   * Show a visible toast notification in the OpenCode TUI.
+   * Fire-and-forget — never blocks or throws.
+   */
+  function showToast(
+    message: string,
+    variant: "info" | "success" | "warning" | "error",
+    duration?: number,
+  ): void {
+    client.tui
+      .showToast({
+        body: {
+          title: "Intaris",
+          message,
+          variant,
+          duration: duration ?? (variant === "error" ? 8000 : 5000),
+        },
+      })
+      .catch(() => {})
+  }
+
+  async function waitForEscalationResolution(
+    tool: string,
+    callId: string,
+    reason: string,
+    cancelled: () => boolean,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    await client.app
+      .log({
+        body: {
+          service: "intaris",
+          level: "warn",
+          message: `ESCALATED ${tool} (${callId}): ${reason}. Waiting for approval in Intaris UI...`,
+        },
+      })
+      .catch(() => {})
+    showToast(
+      `Tool "${tool}" escalated — approve or deny in Intaris UI.\n${reason}`,
+      "warning",
+      10000,
+    )
+
+    const pollBackoffMs = [2000, 4000, 8000, 16000, 30000]
+    const startTime = Date.now()
+    let pollAttempt = 0
+    let lastReminderAt = startTime
+
+    while (true) {
+      if (disposed || cancelled() || signal?.aborted) throw new Error("[intaris] Approval cancelled")
+      if (escalationTimeoutMs > 0 && Date.now() - startTime > escalationTimeoutMs) {
+        throw new Error(
+          `[intaris] ESCALATION TIMEOUT (${callId}): ${reason}\n` +
+            `No response within ${rawEscalationTimeout}s. Approve or deny in the Intaris UI.`,
+        )
+      }
+
+      const now = Date.now()
+      if (now - lastReminderAt >= 60000) {
+        const waitSec = Math.round((now - startTime) / 1000)
+        await client.app
+          .log({
+            body: {
+              service: "intaris",
+              level: "warn",
+              message: `Still waiting for escalation approval for ${tool} (${callId})... ${waitSec}s elapsed`,
+            },
+          })
+          .catch(() => {})
+        showToast(
+          `Still waiting for approval of "${tool}"... (${waitSec}s)`,
+          "info",
+        )
+        lastReminderAt = now
+      }
+
+      const delay = pollBackoffMs[Math.min(pollAttempt, pollBackoffMs.length - 1)]
+      await wait(delay, signal)
+      pollAttempt++
+
+      const { data: auditRecord } = await callApi(
+        "GET",
+        `/api/v1/audit/${encodeURIComponent(callId)}`,
+        null,
+        5000,
+        undefined,
+        signal,
+      )
+
+      if (!auditRecord) continue
+
+      if (disposed || cancelled() || signal?.aborted) throw new Error("[intaris] Approval cancelled")
+      if (auditRecord.user_decision === "approve") {
+        await client.app
+          .log({
+            body: {
+              service: "intaris",
+              level: "info",
+              message: `Escalation approved: ${tool} (${callId})`,
+            },
+          })
+          .catch(() => {})
+        showToast(`Tool "${tool}" approved — proceeding`, "success")
+        if (disposed || cancelled() || signal?.aborted) throw new Error("[intaris] Approval cancelled")
+        return
+      }
+
+      if (auditRecord.user_decision === "deny") {
+        const denyNote = auditRecord.user_note
+          ? ` — ${auditRecord.user_note}`
+          : ""
+        showToast(`Tool "${tool}" denied by user`, "error")
+        throw new Error(
+          `[intaris] DENIED by user (${callId}): ${reason}${denyNote}`,
+        )
+      }
+    }
+  }
+
+  // -- Helpers --------------------------------------------------------------
+
+  function wait(ms: number, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) return Promise.reject(new Error("[intaris] Approval cancelled"))
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { signal?.removeEventListener("abort", abort); resolve() }, ms)
+      const abort = () => { clearTimeout(timer); reject(new Error("[intaris] Approval cancelled")) }
+      signal?.addEventListener("abort", abort, { once: true })
+    })
+  }
+
+  function getOrCreateState(sessionId: string): SessionState {
+    let state = sessions.get(sessionId)
+    if (!state) {
+      state = {
+        workingDirectory,
+        cancelled: false,
+        reasoningError: false,
+        intarisSessionId: null,
+        sessionCreated: false,
+        callCount: 0,
+        approvedCount: 0,
+        deniedCount: 0,
+        escalatedCount: 0,
+        recentTools: [],
+        parentSessionId: null,
+        lastError: null,
+        agentName: null,
+        sessionTitle: null,
+        intentionUpdated: false,
+        intentionPending: false,
+        isIdle: false,
+        lastAssistantText: "",
+        messageRoles: new Map(),
+        recentMessageText: new Map(),
+        pendingUserMessageId: null,
+        pendingUserText: "",
+        reasoningSentForMessageId: null,
+        recordingBuffer: [],
+        toolCallAuditIds: new Map(),
+      }
+      sessions.set(sessionId, state)
+      // Evict oldest entries if over limit
+      if (sessions.size > MAX_SESSIONS) {
+        const excess = sessions.size - MAX_SESSIONS
+        let count = 0
+        for (const key of sessions.keys()) {
+          if (count >= excess) break
+          sessions.delete(key)
+          count++
+        }
+      }
+    }
+    return state
+  }
+
+  function initializeMetadata(sessionId: string, state: SessionState): Promise<void> {
+    if (!state.metadataReady) {
+      state.metadataReady = (async () => {
+        let resolvedDirectory = false
+        if (resolveSessionMetadata) {
+          const metadata = await resolveSessionMetadata(sessionId)
+          if (metadata) {
+            state.workingDirectory = metadata.workingDirectory
+            resolvedDirectory = Boolean(metadata.workingDirectory)
+            if (metadata.parentID && !state.parentSessionId) state.parentSessionId = `oc-${metadata.parentID}`
+            if (metadata.agent && !state.agentName) state.agentName = metadata.agent
+            if (metadata.title && !state.sessionTitle) state.sessionTitle = metadata.title
+          }
+        }
+        if (!resolvedDirectory && sessionDirectory) {
+          state.workingDirectory = (await sessionDirectory(sessionId)) || ""
+          resolvedDirectory = Boolean(state.workingDirectory)
+        }
+        if ((resolveSessionMetadata || sessionDirectory) && !resolvedDirectory) {
+          throw new Error("[intaris] Cannot resolve session working directory")
+        }
+      })()
+    }
+    return state.metadataReady
+  }
+
+  /**
+   * Build the session intention string.
+   * Uses Session.title if available, falls back to working directory.
+   */
+  function buildIntention(state: SessionState): string {
+    if (intentionOverride) return intentionOverride
+
+    // For child sessions, include agent type and parent reference
+    if (state.parentSessionId) {
+      const agent = state.agentName || "sub-agent"
+      const title = state.sessionTitle
+      if (title) {
+        return `OpenCode ${agent}: ${title}`
+      }
+      return `OpenCode ${agent} session in ${state.workingDirectory || "unknown"}`
+    }
+
+    // For main sessions, use title if available
+    if (state.sessionTitle) {
+      return state.sessionTitle
+    }
+
+    if (state.workingDirectory) {
+      return `OpenCode coding session in ${state.workingDirectory}`
+    }
+    return "OpenCode coding session"
+  }
+
+  /**
+   * Build session details including agent type.
+   */
+  function buildDetails(state: SessionState): Record<string, any> {
+    const details: Record<string, any> = {
+      source: "opencode",
+      working_directory: state.workingDirectory,
+    }
+    if (state.agentName) {
+      details.agent_type = state.agentName
+    }
+    return details
+  }
+
+  /**
+   * Build session policy from INTARIS_ALLOW_PATHS.
+   * Expands ~ to home directory and converts each path to a glob pattern.
+   * E.g., "~/src" → "/Users/name/src/*"
+   *
+   * Always includes ~/.local/share/opencode/* (tool output storage),
+   * common OS temp directories, and $TMPDIR so transient scratch
+   * artifacts created by shell commands do not look out-of-policy.
+   */
+  // Adds `${dir}/*` plus its resolved physical-path form if that differs.
+  // On macOS, /tmp, /var/tmp and $TMPDIR are symlinks into /private/... —
+  // a literal "/tmp/*" pattern never matches an already-resolved real path
+  // like /private/tmp/claude-501/.../scratchpad, which is exactly where
+  // Claude Code's own tool scratchpad lives (the equivalent gap exists for
+  // opencode's own tool-scratch paths under $TMPDIR). Silently falls back
+  // to the literal form only if the directory doesn't exist or can't be
+  // resolved.
+  function globPatternsFor(dir: string): string[] {
+    const literal = dir.replace(/\/$/, "")
+    const patterns = [`${literal}/*`]
+    try {
+      const real = realpathSync(literal).replace(/\/$/, "")
+      if (real && real !== literal) patterns.push(`${real}/*`)
+    } catch {
+      // Directory doesn't exist yet — literal form only.
+    }
+    return patterns
+  }
+
+  function buildPolicy(workingDirectory: string): Record<string, any> | null {
+    const home = process.env.HOME || process.env.USERPROFILE || ""
+    const builtinPaths: string[] = [...globPatternsFor("/tmp"), ...globPatternsFor("/var/tmp")]
+    const tmpDir = process.env.TMPDIR
+    if (tmpDir) {
+      builtinPaths.push(...globPatternsFor(tmpDir))
+    }
+    if (home) {
+      builtinPaths.push(`${home}/.local/share/opencode/*`)
+    }
+    if (workingDirectory) {
+      builtinPaths.push(`${workingDirectory}/*`)
+    }
+    const userPatterns = allowPathsRaw
+      ? allowPathsRaw
+          .split(",")
+          .map((p) => p.trim())
+          .filter(Boolean)
+          .map((p) => {
+            // Expand ~ to home directory
+            if (p.startsWith("~/") || p === "~") {
+              p = home + p.slice(1)
+            }
+            // Ensure trailing /* for glob matching
+            if (!p.endsWith("*")) {
+              p = p.endsWith("/") ? p + "*" : p + "/*"
+            }
+            return p
+          })
+      : []
+    const patterns = [...builtinPaths, ...userPatterns]
+    if (patterns.length === 0) return null
+    return { allow_paths: patterns }
+  }
+
+  /**
+   * Update the session intention on the server after gathering context.
+   * Called after the first few tool calls to refine the generic intention.
+   */
+  function updateIntention(
+    intarisSessionId: string,
+    state: SessionState,
+  ): void {
+    if (state.intentionUpdated) return
+    if (intentionOverride) return
+    // Only update after enough calls to have context
+    if (state.callCount < 3) return
+
+    state.intentionUpdated = true
+
+    const intention = buildIntention(state)
+    const details = buildDetails(state)
+
+    callApi(
+      "PATCH",
+      `/api/v1/session/${encodeURIComponent(intarisSessionId)}`,
+      { intention, details },
+      2000,
+    ).catch(() => {})
+  }
+
+  /**
+   * Build a checkpoint content string with enriched session statistics.
+   */
+  function buildCheckpointContent(state: SessionState): string {
+    const interval = Math.floor(state.callCount / checkpointInterval)
+    const tools = state.recentTools.join(", ") || "none"
+    return (
+      `Checkpoint #${interval}: ${state.callCount} calls ` +
+      `(${state.approvedCount} approved, ${state.deniedCount} denied, ` +
+      `${state.escalatedCount} escalated). Recent tools: ${tools}`
+    )
+  }
+
+  /**
+   * Build an agent summary string with session statistics.
+   */
+  function buildAgentSummary(state: SessionState): string {
+    const agent = state.agentName ? ` (${state.agentName})` : ""
+    return (
+      `OpenCode session${agent} completed. ${state.callCount} tool calls ` +
+      `(${state.approvedCount} approved, ${state.deniedCount} denied, ` +
+      `${state.escalatedCount} escalated). ` +
+      `Working directory: ${state.workingDirectory || "unknown"}`
+    )
+  }
+
+  function rememberMessageRole(state: SessionState, messageId: string, role: string): void {
+    state.messageRoles.set(messageId, role)
+    if (state.messageRoles.size <= 100) return
+
+    const oldest = state.messageRoles.keys().next().value
+    if (oldest) {
+      state.messageRoles.delete(oldest)
+    }
+  }
+
+  function rememberMessageText(state: SessionState, messageId: string, text: string): void {
+    state.recentMessageText.set(messageId, text)
+    if (state.recentMessageText.size <= 100) return
+
+    const oldest = state.recentMessageText.keys().next().value
+    if (oldest) {
+      state.recentMessageText.delete(oldest)
+    }
+  }
+
+  async function resumeSessionIfIdle(state: SessionState): Promise<void> {
+    if (!state.isIdle || !state.intarisSessionId) return
+    state.isIdle = false
+    await callApi(
+      "PATCH",
+      `/api/v1/session/${encodeURIComponent(state.intarisSessionId)}/status`,
+      { status: "active" },
+      2000,
+    )
+  }
+
+  async function forwardUserReasoning(
+    sessionId: string,
+    state: SessionState,
+    userText: string,
+    messageId?: string,
+    input?: {
+      agent?: string
+      model?: { providerID: string; modelID: string }
+      messageID?: string
+      sessionID?: string
+    },
+  ): Promise<void> {
+    if (!state.intarisSessionId || !userText) return
+
+    const effectiveMessageId = messageId || input?.messageID || null
+    if (effectiveMessageId && state.reasoningSentForMessageId === effectiveMessageId) {
+      state.pendingUserMessageId = null
+      state.pendingUserText = ""
+      return
+    }
+
+    const assistantContext = state.lastAssistantText || undefined
+    state.lastAssistantText = ""
+
+    let reasoningResult: ApiResult
+
+    if (sessionRecording) {
+      // When session recording is enabled, record the user message
+      // event first, flush synchronously to ensure it's in the event
+      // store, then trigger reasoning with from_events=true to avoid
+      // re-sending the content that's already been recorded.
+      // The flush must complete before the reasoning call so Intaris
+      // can resolve the user message from the event store.
+      recordEvent(sessionId, {
+        type: "message",
+        data: {
+          role: "user",
+          text: userText,
+          agent: input?.agent,
+          model: input?.model,
+          messageID: effectiveMessageId,
+          sessionID: input?.sessionID || sessionId,
+        },
+      })
+
+      if (!await flushRecordingBuffer(sessionId) || state.reasoningError) {
+        state.reasoningError = true
+        return
+      }
+
+      reasoningResult = await callApi(
+        "POST",
+        "/api/v1/reasoning",
+        {
+          session_id: state.intarisSessionId,
+          content: "",
+          from_events: true,
+        },
+        30000,
+      )
+    } else {
+      // Without recording, send the content directly via /reasoning.
+      reasoningResult = await callApi(
+        "POST",
+        "/api/v1/reasoning",
+        {
+          session_id: state.intarisSessionId,
+          content: `User message: ${userText}`,
+          ...(assistantContext && { context: assistantContext }),
+        },
+        30000,
+      )
+
+      recordEvent(sessionId, {
+        type: "message",
+        data: {
+          role: "user",
+          text: userText,
+          agent: input?.agent,
+          model: input?.model,
+          messageID: effectiveMessageId,
+          sessionID: input?.sessionID || sessionId,
+        },
+      })
+    }
+
+    if (reasoningResult.error) {
+      state.reasoningError = true
+      await client.app.log({
+        body: {
+          service: "intaris",
+          level: "error",
+          message: `Intaris: /reasoning failed — ${reasoningResult.error} (status=${reasoningResult.status}, contextLen=${assistantContext ? assistantContext.length : 0})`,
+        },
+      }).catch(() => {})
+      return
+    }
+
+    state.reasoningError = false
+    state.intentionPending = true
+    state.reasoningSentForMessageId = effectiveMessageId
+    state.pendingUserMessageId = null
+    state.pendingUserText = ""
+  }
+
+  // -- Recording Helpers ---------------------------------------------------
+
+  /**
+   * Queue a recording event for a session. Events are buffered and
+   * flushed in batches to reduce API calls. No-op if recording is disabled.
+   */
+  function recordEvent(
+    sessionId: string,
+    event: RecordingEvent,
+  ): void {
+    if (!sessionRecording) return
+    const state = sessions.get(sessionId)
+    if (!state?.intarisSessionId) return
+
+    state.recordingBuffer.push(event)
+
+    // Auto-flush when buffer reaches threshold
+    if (state.recordingBuffer.length >= recordingFlushSize) {
+      flushRecordingBuffer(sessionId)
+    }
+  }
+
+  /**
+   * Flush the recording buffer for a session (fire-and-forget).
+   * Sends buffered events to POST /session/{id}/events.
+   */
+  function flushRecordingBuffer(sessionId: string): Promise<boolean> {
+    const state = sessions.get(sessionId)
+    if (!state?.intarisSessionId) return Promise.resolve(false)
+    if (state.recordingBuffer.length === 0) return state.recordingFlush || Promise.resolve(true)
+    const intarisSessionId = state.intarisSessionId
+
+    // Drain the buffer
+    const events = state.recordingBuffer.splice(0)
+
+    state.recordingFlush = (state.recordingFlush || Promise.resolve(true)).then(async (priorOk) => {
+      const { error, status } = await callApi(
+        "POST", `/api/v1/session/${encodeURIComponent(intarisSessionId)}/events`,
+        events, 5000, { "X-Intaris-Source": "opencode" },
+      )
+      if (error) {
+        state.reasoningError = true
+        await client.app.log({
+            body: {
+              service: "intaris",
+              level: "warn",
+              message: `Recording flush failed for ${intarisSessionId}: ${error} (HTTP ${status})`,
+              extra: { eventCount: events.length },
+            },
+          }).catch(() => {})
+      }
+      return priorOk && !error
+    })
+    return state.recordingFlush
+  }
+
+  // Periodic recording flush timer (flushes all sessions)
+  let disposed = false
+  let recordingFlushTimer: ReturnType<typeof setInterval> | null = null
+  if (sessionRecording) {
+    recordingFlushTimer = setInterval(() => {
+      for (const [sessionId] of sessions) {
+        flushRecordingBuffer(sessionId)
+      }
+    }, recordingFlushMs)
+  }
+
+  /**
+   * Ensure an Intaris session exists for the given OpenCode session.
+   * Creates one via POST /api/v1/intention if needed.
+   * Returns the Intaris session_id, or null on failure.
+   */
+  async function ensureSession(
+    sessionId: string,
+    state: SessionState,
+  ): Promise<string | null> {
+    await initializeMetadata(sessionId, state)
+    if (state.cancelled || disposed) throw new Error("[intaris] Session cancelled")
+    if (state.intarisSessionId) return state.intarisSessionId
+
+    // Generate a deterministic Intaris session ID from the OpenCode session
+    const intarisSessionId = `oc-${sessionId}`
+
+    const intentionBody: Record<string, any> = {
+      session_id: intarisSessionId,
+      intention: buildIntention(state),
+      details: buildDetails(state),
+    }
+
+    // Include allow_paths policy from INTARIS_ALLOW_PATHS
+    const policy = buildPolicy(state.workingDirectory)
+    if (policy) {
+      intentionBody.policy = policy
+    }
+
+    // Include parent_session_id for child sessions (session continuation chains)
+    if (state.parentSessionId) {
+      intentionBody.parent_session_id = state.parentSessionId
+    }
+
+    const { data, error, status } = await callApiWithRetry(
+      "POST",
+      "/api/v1/intention",
+      intentionBody,
+      5000, // 5s timeout for session creation
+      2,    // 2 retries
+    )
+
+    if (data) {
+      state.intarisSessionId = intarisSessionId
+      state.sessionCreated = true
+      if (buildIntention(state) !== intentionBody.intention) {
+        await callApi("PATCH", `/api/v1/session/${encodeURIComponent(intarisSessionId)}`,
+          { intention: buildIntention(state), details: buildDetails(state) }, 2000)
+      }
+      await client.app
+        .log({
+          body: {
+            service: "intaris",
+            level: "info",
+            message: `Session created: ${intarisSessionId}`,
+          },
+        })
+        .catch(() => {})
+    } else if (status === 409) {
+      // Session already exists (resumed OpenCode session) — reuse it
+      state.intarisSessionId = intarisSessionId
+      await client.app
+        .log({
+          body: {
+            service: "intaris",
+            level: "info",
+            message: `Session already exists, reusing: ${intarisSessionId}`,
+          },
+        })
+        .catch(() => {})
+
+      // Re-activate the session (may have been swept to idle/completed)
+      // and update intention in case the title changed since creation
+      callApi(
+        "PATCH",
+        `/api/v1/session/${encodeURIComponent(intarisSessionId)}/status`,
+        { status: "active" },
+        2000,
+      ).catch(() => {})
+      callApi(
+        "PATCH",
+        `/api/v1/session/${encodeURIComponent(intarisSessionId)}`,
+        { intention: buildIntention(state), details: buildDetails(state) },
+        2000,
+      ).catch(() => {})
+    } else if (status !== null && status >= 400 && status < 500) {
+      // Client error (auth, validation) — propagate detail, don't retry
+      state.lastError = error || `HTTP ${status}`
+      return null
+    } else {
+      // Server error or network issue — try using it anyway
+      state.intarisSessionId = intarisSessionId
+    }
+
+    return state.intarisSessionId
+  }
+
+  /**
+   * Send a periodic checkpoint to Intaris (fire-and-forget).
+   */
+  function sendCheckpoint(
+    intarisSessionId: string,
+    state: SessionState,
+  ): void {
+    if (checkpointInterval <= 0) return
+    if (state.callCount % checkpointInterval !== 0) return
+
+    callApi(
+      "POST",
+      "/api/v1/checkpoint",
+      {
+        session_id: intarisSessionId,
+        content: buildCheckpointContent(state),
+      },
+      2000,
+    ).catch(() => {})
+  }
+
+  /**
+   * Signal session completion to Intaris (fire-and-forget).
+   * Flushes recording buffer, then sends status update and agent summary.
+   */
+  function signalCompletion(
+    intarisSessionId: string,
+    state: SessionState,
+    sessionId?: string,
+  ): void {
+    // Flush recording buffer before completion
+    if (sessionId) {
+      flushRecordingBuffer(sessionId)
+    }
+
+    // Fire both calls in parallel — neither blocks the other
+    Promise.all([
+      callApi(
+        "PATCH",
+        `/api/v1/session/${encodeURIComponent(intarisSessionId)}/status`,
+        { status: "completed" },
+        2000,
+      ),
+      callApi(
+        "POST",
+        `/api/v1/session/${encodeURIComponent(intarisSessionId)}/agent-summary`,
+        { summary: buildAgentSummary(state) },
+        2000,
+      ),
+    ]).catch(() => {})
+  }
+
+  /**
+   * Find and complete all child sessions of a given parent.
+   */
+  function completeChildSessions(parentIntarisId: string): void {
+    for (const [childId, childState] of sessions) {
+      if (childState.parentSessionId === parentIntarisId) {
+        childState.cancelled = true
+        if (childState.intarisSessionId) signalCompletion(childState.intarisSessionId, childState, childId)
+        sessions.delete(childId)
+      }
+    }
+  }
+
+  // -- Initialization -------------------------------------------------------
+
+  if (!apiKey) {
+    await client.app
+      .log({
+        body: {
+          service: "intaris",
+          level: "warn",
+          message:
+            "INTARIS_API_KEY not set — plugin will fail to authenticate",
+        },
+      })
+      .catch(() => {})
+  }
+
+  if (failOpen) {
+    await client.app
+      .log({
+        body: {
+          service: "intaris",
+          level: "warn",
+          message:
+            "INTARIS_FAIL_OPEN=true — tool calls will proceed unchecked if Intaris is unreachable",
+        },
+      })
+      .catch(() => {})
+  }
+
+  await client.app
+    .log({
+      body: {
+        service: "intaris",
+        level: "info",
+        message: "Plugin initialized",
+        extra: { baseUrl, agentId, failOpen, checkpointInterval, sessionRecording },
+      },
+    })
+    .catch(() => {})
+
+  // -- Hooks ----------------------------------------------------------------
+
+  return {
+    dispose: () => {
+      disposed = true
+      if (recordingFlushTimer) clearInterval(recordingFlushTimer)
+    },
+    // -- Agent Name Capture + User Message Forwarding -----------------------
+    "chat.message": async (
+      input: {
+        sessionID: string
+        agent?: string
+        model?: { providerID: string; modelID: string }
+        messageID?: string
+      },
+      output: { message?: any; parts?: any[] },
+    ) => {
+      if (!input.sessionID) return
+      // Use sessions.get() — not getOrCreateState() — to avoid creating
+      // state before session.created fires (which would miss parent_session_id).
+      // If no state exists yet, skip; the session will be created properly later.
+      const state = sessions.get(input.sessionID)
+      if (!state) return
+
+      // Ensure Intaris session exists. After plugin reload, state may exist
+      // (created by tool.execute.before via getOrCreateState) but
+      // intarisSessionId may be null. Call ensureSession to recover.
+      if (state.intarisSessionId === null) {
+        const sid = await ensureSession(input.sessionID, state)
+        if (!sid) return  // Session creation failed — skip
+      }
+
+      // Capture agent name on first message
+      if (input.agent && !state.agentName) {
+        state.agentName = input.agent
+        // If session already created, update intention with agent info
+        if (state.intarisSessionId && !state.intentionUpdated) {
+          state.intentionUpdated = true
+          const intention = buildIntention(state)
+          const details = buildDetails(state)
+          callApi(
+            "PATCH",
+            `/api/v1/session/${encodeURIComponent(state.intarisSessionId)}`,
+            { intention, details },
+            2000,
+          ).catch(() => {})
+        }
+      }
+
+      // Resume session from idle when user provides new input.
+      // This transitions the Intaris session back to active before any
+      // tool calls execute, making the UI reflect that work is starting.
+      await resumeSessionIfIdle(state).catch(() => {})
+
+      // Extract user message text from parts and send as reasoning record.
+      // This gives Intaris visibility into what the user is asking the agent
+      // to do, enabling better intention tracking and safety evaluation.
+      if (state.intarisSessionId && output?.parts && Array.isArray(output.parts)) {
+        const userText = output.parts
+          .filter((p: any) => p.type === "text" && !p.synthetic)
+          .map((p: any) => p.text)
+          .join("\n")
+          .trim()
+
+        if (userText) {
+          await forwardUserReasoning(input.sessionID, state, userText, input.messageID, input)
+        }
+      }
+    },
+
+    // -- Session Lifecycle --------------------------------------------------
+    event: async ({ event }: { event: { type: string; properties: any } }) => {
+      if (event.type === "session.created") {
+        const sessionId: string = event.properties?.info?.id
+        if (!sessionId) return
+
+        const state = getOrCreateState(sessionId)
+        // Capture session title for smarter intention
+        const title: string | undefined = event.properties?.info?.title
+        if (title) {
+          state.sessionTitle = title
+        }
+
+        // Track parent session for child sessions (subagent tasks).
+        // Child sessions are created with parent_session_id for session
+        // chain analysis, rather than being skipped.
+        const parentID: string | undefined = event.properties?.info?.parentID
+        if (parentID) {
+          state.parentSessionId = `oc-${parentID}`
+        }
+
+        await initializeMetadata(sessionId, state)
+        // Pre-create the Intaris session (best-effort, non-blocking)
+        ensureSession(sessionId, state).catch(() => {})
+      }
+
+      // Update Intaris intention when session title changes.
+      // OpenCode starts with a generic title and updates it after the
+      // first user message (e.g., "New session" → "Fix login bug").
+      if (event.type === "session.updated") {
+        const sessionId: string = event.properties?.info?.id
+        if (!sessionId) return
+
+        const title: string | undefined = event.properties?.info?.title
+        const state = sessions.get(sessionId)
+        if (state && title && title !== state.sessionTitle) {
+          state.sessionTitle = title
+          if (state.intarisSessionId) {
+            callApi(
+              "PATCH",
+              `/api/v1/session/${encodeURIComponent(state.intarisSessionId)}`,
+              { intention: buildIntention(state), details: buildDetails(state) },
+              2000,
+            ).catch(() => {})
+          }
+        }
+      }
+
+      // Signal session completion when explicitly deleted.
+      if (event.type === "session.deleted") {
+        const sessionId: string = event.properties?.info?.id
+        if (!sessionId) return
+
+        const state = sessions.get(sessionId)
+        if (state) state.cancelled = true
+        if (!state?.intarisSessionId) return
+
+        // Complete this session
+        signalCompletion(state.intarisSessionId, state, sessionId)
+        // Also complete any child sessions that are still active
+        completeChildSessions(state.intarisSessionId)
+        state.messageRoles.clear()
+        state.recentMessageText.clear()
+        sessions.delete(sessionId)
+      }
+
+      // Handle session.idle — transition parent sessions to idle,
+      // complete child sessions. OpenCode fires this when a session
+      // becomes idle (waiting for user input, no more activity).
+      if (event.type === "session.idle") {
+        const sessionId: string = event.properties?.sessionID
+        if (!sessionId) return
+
+        const state = sessions.get(sessionId)
+        if (!state?.intarisSessionId) return
+
+        if (state.parentSessionId) {
+          // Child sessions (sub-agents): idle means the task is done
+          state.cancelled = true
+          signalCompletion(state.intarisSessionId, state, sessionId)
+          sessions.delete(sessionId)
+        } else {
+          // Parent sessions: transition to idle so the UI shows the
+          // session is waiting for user input, not actively working
+          if (!state.isIdle) {
+            state.isIdle = true
+            callApi(
+              "PATCH",
+              `/api/v1/session/${encodeURIComponent(state.intarisSessionId)}/status`,
+              { status: "idle" },
+              2000,
+            ).catch(() => {})
+          }
+        }
+      }
+
+      // -- Session Recording: capture part updates --------------------------
+      // message.part.updated fires for every part creation/update including
+      // streaming deltas. Captures assistant text, step-start/finish, tool
+      // invocations, and all other part types for full session fidelity.
+      if (event.type === "message.part.updated") {
+        const part = event.properties?.part
+        if (!part) return
+
+        const sessionId: string = part.sessionID
+        if (!sessionId) return
+
+        // Track text parts so we can capture assistant context and fall back
+        // to event-driven reasoning when chat.message is not fired (web mode).
+        if (part.type === "text" && typeof part.text === "string") {
+          const state = sessions.get(sessionId)
+          if (state) {
+            rememberMessageText(state, part.messageID, part.text)
+            const role = state.messageRoles.get(part.messageID)
+            if (role === "user") {
+              if (state.pendingUserMessageId !== part.messageID) {
+                state.pendingUserMessageId = part.messageID
+              }
+              state.pendingUserText = part.text
+            } else if (role === "assistant" || !role) {
+              // Unknown role can happen due to event ordering; keep the
+              // previous behavior so assistant context is not lost.
+              state.lastAssistantText = part.text
+            }
+          }
+        }
+
+        recordEvent(sessionId, {
+          type: "part",
+          data: {
+            sessionID: sessionId,
+            messageID: part.messageID,
+            part,
+            delta: event.properties?.delta,
+          },
+        })
+      }
+
+      // message.updated captures full message metadata (role, model, tokens)
+      if (event.type === "message.updated") {
+        const info = event.properties?.info
+        if (!info) return
+
+        const sessionId: string = info.sessionID
+        if (!sessionId) return
+
+        const state = getOrCreateState(sessionId)
+        rememberMessageRole(state, info.id, info.role)
+
+        if (info.role === "user") {
+          state.pendingUserMessageId = info.id
+          state.pendingUserText = state.recentMessageText.get(info.id) || ""
+          await resumeSessionIfIdle(state).catch(() => {})
+        } else if (info.role === "assistant") {
+          const latestText = state.recentMessageText.get(info.id)
+          if (latestText) {
+            state.lastAssistantText = latestText
+          }
+        }
+
+        recordEvent(sessionId, {
+          type: "message",
+          data: {
+            sessionID: sessionId,
+            messageID: info.id,
+            role: info.role,
+            model: "modelID" in info ? info.modelID : undefined,
+            metadata: info,
+          },
+        })
+      }
+    },
+
+    // -- Tool Interception --------------------------------------------------
+    "tool.execute.before": async (
+      input: { tool: string; sessionID: string; callID: string; signal?: AbortSignal },
+      _output: { args: any },
+    ) => {
+      const { tool, sessionID } = input
+      if (!sessionID || disposed) throw new Error("[intaris] Missing session identity or plugin unloaded")
+
+      const state = getOrCreateState(sessionID)
+      const checkCancelled = () => {
+        if (disposed || input.signal?.aborted || state.cancelled) throw new Error("[intaris] Session cancelled")
+      }
+      checkCancelled()
+
+      // Ensure session exists (lazy creation for resumed sessions)
+      const intarisSessionId = await ensureSession(sessionID, state)
+      checkCancelled()
+      if (!intarisSessionId) {
+        if (failOpen) { checkCancelled(); return }
+        const detail = state.lastError || "unknown error"
+        throw new Error(
+          `[intaris] Cannot create session: ${detail}`,
+        )
+      }
+
+      // In web mode, chat.message does not fire. The event stream still
+      // captures the user's message parts, so forward them here before the
+      // first tool call to keep intention tracking and recording intact.
+      if (state.pendingUserText) {
+        await forwardUserReasoning(
+          sessionID,
+          state,
+          state.pendingUserText,
+          state.pendingUserMessageId || undefined,
+        )
+      }
+      checkCancelled()
+      if (state.reasoningError) throw new Error("[intaris] User intention submission failed")
+
+      // Record tool call event (before evaluation, fire-and-forget)
+      recordEvent(sessionID, {
+        type: "tool_call",
+        data: {
+          tool,
+          args: _output.args || {},
+          call_id: input.callID,
+          callID: input.callID,
+          sessionID,
+        },
+      })
+      if (sessionRecording && (!await flushRecordingBuffer(sessionID) || state.reasoningError)) {
+        throw new Error("[intaris] Recording submission failed")
+      }
+      checkCancelled()
+
+      // Evaluate the tool call with a single long timeout.
+      // When intentionPending is true, the server waits for the
+      // /reasoning call to arrive before evaluating (race condition fix).
+      const intentionPending = state.intentionPending
+      const { data: result, error: evalError, status: evalStatus } = await callApi(
+        "POST",
+        "/api/v1/evaluate",
+        {
+          session_id: intarisSessionId,
+          tool,
+          args: _output.args || {},
+          ...(intentionPending && { intention_pending: true }),
+        },
+        60000,
+        undefined,
+        input.signal,
+      )
+      checkCancelled()
+
+      // Clear the flag after the first evaluate call — subsequent tool
+      // calls in this turn benefit from the already-updated intention.
+      if (intentionPending) {
+        state.intentionPending = false
+      }
+
+      if (!result) {
+        // Distinguish config errors (4xx) from transient failures (5xx/network)
+        if (evalStatus !== null && evalStatus >= 400 && evalStatus < 500) {
+          throw new Error(
+            `[intaris] Evaluation rejected for ${tool}: ${evalError}`,
+          )
+        }
+        // Intaris unreachable or server error
+        if (failOpen) {
+          await client.app
+            .log({
+              body: {
+                service: "intaris",
+                level: "warn",
+                message: `Evaluate failed for ${tool} — allowing (fail-open)`,
+              },
+            })
+            .catch(() => {})
+          checkCancelled()
+          return
+        }
+        throw new Error(
+          `[intaris] Evaluation failed for ${tool}: ${evalError || "server unreachable"} (INTARIS_FAIL_OPEN=false)`,
+        )
+      }
+      if (!["approve", "deny", "escalate"].includes(result.decision)) throw new Error("[intaris] Invalid evaluation decision")
+      if (result.decision === "escalate" && (typeof result.call_id !== "string" || !result.call_id.trim())) throw new Error("[intaris] Missing escalation call ID")
+
+      // Track decision statistics
+      state.callCount++
+      if (input.callID && result.call_id) {
+        state.toolCallAuditIds.set(input.callID, result.call_id)
+      }
+      if (result.decision === "approve") state.approvedCount++
+      else if (result.decision === "deny") state.deniedCount++
+      else if (result.decision === "escalate") state.escalatedCount++
+
+      // Track recent tool names (bounded to last MAX_RECENT_TOOLS)
+      state.recentTools = [...state.recentTools, tool].slice(-MAX_RECENT_TOOLS)
+
+      await client.app
+        .log({
+          body: {
+            service: "intaris",
+            level: "info",
+            message: `${tool}: ${result.decision} (${result.path}, ${result.latency_ms}ms)`,
+            extra: {
+              call_id: result.call_id,
+              risk: result.risk,
+            },
+          },
+        })
+        .catch(() => {})
+
+      // Send periodic checkpoint (fire-and-forget, non-blocking)
+      sendCheckpoint(intarisSessionId, state)
+
+      // Try to update intention after gathering enough context
+      updateIntention(intarisSessionId, state)
+
+      if (result.decision === "deny") {
+        // Handle session-level suspension: wait for user action
+        // (reactivation or termination) rather than dying immediately.
+        if (result.session_status === "suspended") {
+          const statusReason = result.status_reason || "Session suspended"
+          await client.app
+            .log({
+              body: {
+                service: "intaris",
+                level: "warn",
+                message: `Session suspended: ${statusReason}. Waiting for approval in Intaris UI...`,
+              },
+            })
+            .catch(() => {})
+          showToast(
+            `Session suspended: ${statusReason}. Reactivate in Intaris UI.`,
+            "warning",
+            10000,
+          )
+
+          // Poll GET /session/{id} with exponential backoff
+          const suspendBackoffMs = [2000, 4000, 8000, 16000, 30000]
+          const suspendStart = Date.now()
+          let suspendAttempt = 0
+          let suspendLastReminder = suspendStart
+
+          while (true) {
+            checkCancelled()
+            // Check timeout (reuse escalation timeout)
+            if (escalationTimeoutMs > 0 && Date.now() - suspendStart > escalationTimeoutMs) {
+              throw new Error(
+                `[intaris] SESSION SUSPENSION TIMEOUT: ${statusReason}\n` +
+                  `No response within ${rawEscalationTimeout}s. Reactivate or terminate in the Intaris UI.`,
+              )
+            }
+
+            // Periodic reminder every 60s
+            const suspendNow = Date.now()
+            if (suspendNow - suspendLastReminder >= 60000) {
+              const waitSec = Math.round((suspendNow - suspendStart) / 1000)
+              await client.app
+                .log({
+                  body: {
+                    service: "intaris",
+                    level: "warn",
+                    message: `Still waiting for session approval... ${waitSec}s elapsed. Reason: ${statusReason}`,
+                  },
+                })
+                .catch(() => {})
+              showToast(
+                `Session still suspended... (${waitSec}s)`,
+                "info",
+              )
+              suspendLastReminder = suspendNow
+            }
+
+            // Wait with exponential backoff
+            const suspendDelay = suspendBackoffMs[Math.min(suspendAttempt, suspendBackoffMs.length - 1)]
+            await wait(suspendDelay, input.signal)
+            checkCancelled()
+            suspendAttempt++
+
+            // Poll session status
+            const { data: sessionData } = await callApi(
+              "GET",
+              `/api/v1/session/${encodeURIComponent(intarisSessionId)}`,
+              null,
+              5000,
+              undefined,
+              input.signal,
+            )
+            checkCancelled()
+
+            if (!sessionData) continue // Server unreachable — keep polling
+
+            if (sessionData.status === "active") {
+              checkCancelled()
+              // Session reactivated — re-evaluate this tool call.
+              // The user explicitly approved the session, but we still
+              // need to evaluate this specific tool call for safety.
+              await client.app
+                .log({
+                  body: {
+                    service: "intaris",
+                    level: "info",
+                    message: `Session reactivated — re-evaluating ${tool}`,
+                  },
+                })
+                .catch(() => {})
+              showToast("Session reactivated — re-evaluating...", "success")
+
+              const { data: reResult } = await callApi(
+                "POST",
+                "/api/v1/evaluate",
+                {
+                  session_id: intarisSessionId,
+                  tool,
+                  args: _output.args || {},
+                },
+                60000,
+                undefined,
+                input.signal,
+              )
+              checkCancelled()
+
+              if (!reResult) {
+                if (failOpen) { checkCancelled(); return }
+                throw new Error(`[intaris] Re-evaluation failed for ${tool} after session reactivation`)
+              }
+              if (!["approve", "deny", "escalate"].includes(reResult.decision)) throw new Error("[intaris] Invalid re-evaluation decision")
+              if (reResult.decision === "escalate" && (typeof reResult.call_id !== "string" || !reResult.call_id.trim())) throw new Error("[intaris] Missing escalation call ID")
+
+              if (reResult.decision === "deny") {
+                throw new Error(`[intaris] DENIED: ${reResult.reasoning || "Tool call denied after session reactivation"}`)
+              }
+              if (input.callID && reResult.call_id) {
+                state.toolCallAuditIds.set(input.callID, reResult.call_id)
+              }
+              if (reResult.decision === "escalate") {
+                await waitForEscalationResolution(
+                  tool,
+                  reResult.call_id,
+                  reResult.reasoning || "Tool call requires human approval",
+                  () => state.cancelled,
+                  input.signal,
+                )
+                checkCancelled()
+                return
+              }
+              // Approved — let tool proceed
+              checkCancelled()
+              return
+            }
+
+            if (sessionData.status === "terminated") {
+              showToast("Session terminated", "error")
+              throw new Error(
+                `[intaris] Session terminated: ${sessionData.status_reason || "terminated by user"}`,
+              )
+            }
+            // Still suspended — continue polling
+          }
+        }
+
+        // Handle session termination: hard kill
+        if (result.session_status === "terminated") {
+          showToast("Session terminated", "error")
+          throw new Error(
+            `[intaris] Session terminated: ${result.status_reason || "terminated by user"}`,
+          )
+        }
+
+        const reason = result.reasoning || "Tool call denied by safety evaluation"
+        showToast(`Tool "${tool}" denied: ${reason}`, "error")
+        throw new Error(
+          `[intaris] DENIED: ${reason}`,
+        )
+      }
+
+      if (result.decision === "escalate") {
+        const reason =
+          result.reasoning ||
+          "Tool call requires human approval"
+        await waitForEscalationResolution(tool, result.call_id, reason, () => state.cancelled, input.signal)
+      }
+
+      checkCancelled()
+      // decision === "approve" (or escalation approved) — tool call proceeds normally
+    },
+
+    // -- Tool Result Recording ------------------------------------------------
+    "tool.execute.after": async (
+      input: {
+        tool: string
+        sessionID: string
+        callID: string
+      },
+      output: {
+        output?: any
+        isError?: boolean
+        title?: string
+        metadata?: Record<string, any>
+      },
+    ) => {
+      if (!input.sessionID) return
+
+      const state = sessions.get(input.sessionID)
+      const auditCallId = state?.toolCallAuditIds.get(input.callID) || input.callID
+      state?.toolCallAuditIds.delete(input.callID)
+
+      recordEvent(input.sessionID, {
+        type: "tool_result",
+        data: {
+          tool: input.tool,
+          audit_call_id: auditCallId,
+          call_id: input.callID,
+          callID: input.callID,
+          sessionID: input.sessionID,
+          output: output.output,
+          is_error: output.isError || false,
+          isError: output.isError || false,
+          title: output.title,
+          metadata: output.metadata,
+        },
+      })
+    },
+  }
+}

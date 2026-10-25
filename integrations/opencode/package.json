@@ -1,0 +1,19 @@
+{
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:v1": "bun build ./intaris.ts --target=bun --outfile=dist/intaris-v1.js",
+    "build:v2": "bun build ./intaris-v2.ts --target=bun --external @opencode/plugin/effect --external @opencode/schema/tool --external effect --outfile=dist/v2/index.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@opencode/plugin": "2.0.26",
+    "@opencode/schema": "2.0.26",
+    "effect": "4.0.0-rc.112"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "1.18.29",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.0"
+  }
+}
