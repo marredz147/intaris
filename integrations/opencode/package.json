@@ -2,18 +2,19 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build:v1": "bun build ./intaris.ts --target=bun --outfile=dist/intaris-v1.js",
-    "build:v2": "bun build ./intaris-v2.ts --target=bun --external @opencode/plugin/effect --external @opencode/schema/tool --external effect --outfile=dist/v2/index.js",
-    "typecheck": "tsc --noEmit"
+    "test": "bun test ./intaris.test.ts",
+    "typecheck": "tsc --noEmit --target ES2022 --module ESNext --moduleResolution Bundler --types node --strict --skipLibCheck ./intaris.ts",
+    "build:v1": "bun build ./intaris.ts --target=bun --external effect --external @opencode/schema/tool --external @opencode/schema/session-message --outfile=dist/v1/intaris.js",
+    "build:v2": "bun build ./intaris.ts --target=bun --external effect --external @opencode/schema/tool --external @opencode/schema/session-message --outfile=dist/v2/index.js"
   },
   "dependencies": {
-    "@opencode/plugin": "2.0.26",
-    "@opencode/schema": "2.0.26",
-    "effect": "4.0.0-rc.112"
+    "@opencode/schema": "2.0.32",
+    "effect": "4.0.1"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "1.18.29",
-    "@types/node": "^22.0.0",
-    "typescript": "^5.9.0"
+    "@opencode/plugin": "2.0.32",
+    "@types/node": "22.20.5",
+    "typescript": "5.9.3"
   }
 }
