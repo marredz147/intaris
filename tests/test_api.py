@@ -4937,6 +4937,170 @@ class TestAuditResolvedFilter:
             is None
         )
 
+    def test_pending_backlog_uses_minimal_projection_and_hydrates_only_page(
+        self, client_no_auth, monkeypatch
+    ):
+        from intaris import audit, task_context
+        from intaris.server import _get_db
+        from intaris.session import SessionStore
+
+        db = _get_db()
+        sessions, store = SessionStore(db), audit.AuditStore(db)
+        user_id = "backlog-owner"
+        headers = {"X-User-Id": user_id}
+        active_ids = set()
+        for session_id, count in (("active", 8), ("obsolete", 16)):
+            session = sessions.create(
+                user_id=user_id,
+                session_id=session_id,
+                intention="Review bounded local changes",
+            )
+            with db.cursor() as cur:
+                watermark = task_context.decision_watermark(cur, user_id, session_id)
+            for index in range(count + (session_id == "active")):
+                stale_context = session_id == "active" and index == count
+                call_id = f"{session_id}-{index}"
+                if session_id == "active" and not stale_context:
+                    active_ids.add(call_id)
+                store.insert(
+                    call_id=call_id,
+                    user_id=user_id,
+                    session_id=session_id,
+                    agent_id="review-agent",
+                    tool="write",
+                    args_redacted={"content": "SYNTHETIC_LARGE_PAYLOAD" * 1024},
+                    classification="write",
+                    evaluation_path="llm",
+                    decision="escalate",
+                    risk="high",
+                    reasoning="Review required",
+                    latency_ms=1,
+                    evaluation_metadata={
+                        "evaluation_policy_version": "hybrid_v1",
+                        "policy_revision": session["policy_revision"],
+                        "state_revision": session["state_revision"],
+                        "task_context": {
+                            "watermarks": {
+                                "decisions": "older-context"
+                                if stale_context
+                                else watermark
+                            }
+                        },
+                        "stages": [{"details": "SYNTHETIC_LARGE_PAYLOAD" * 1024}],
+                    },
+                )
+            if session_id == "obsolete":
+                sessions.update_status(session_id, "completed", user_id=user_id)
+        # Exercise UUID text tie-ordering through the pending timeline wrapper.
+        with db.cursor() as cur:
+            cur.execute(
+                "UPDATE audit_log SET timestamp = ? WHERE user_id = ?",
+                ("2026-01-01T00:00:00+00:00", user_id),
+            )
+        expected = [
+            row["call_id"]
+            for row in store.query(user_id=user_id)["items"]
+            if row["call_id"] in active_ids
+        ]
+
+        projections, hydrated, decoded = [], [], []
+        original_cursor = db.cursor
+        original_decode = audit._row_to_dict
+        original_watermark = task_context.decision_watermark
+        watermark_calls = []
+
+        class ObservedCursor:
+            def __init__(self, cursor):
+                self.cursor = cursor
+
+            def __getattr__(self, name):
+                return getattr(self.cursor, name)
+
+            def fetchall(self):
+                rows = self.cursor.fetchall()
+                if rows:
+                    columns = set(rows[0].keys())
+                    if "task_watermark" in columns:
+                        projections.append([dict(row) for row in rows])
+                    if "evaluation_metadata" in columns:
+                        hydrated.append([row["call_id"] for row in rows])
+                return rows
+
+        @contextlib.contextmanager
+        def observe_cursor():
+            with original_cursor() as cur:
+                yield ObservedCursor(cur)
+
+        def observe_decode(row):
+            decoded.append(row["call_id"])
+            return original_decode(row)
+
+        def observe_watermark(cur, user_id, session_id, **kwargs):
+            watermark_calls.append((user_id, session_id))
+            return original_watermark(cur, user_id, session_id, **kwargs)
+
+        monkeypatch.setattr(db, "cursor", observe_cursor)
+        monkeypatch.setattr(audit, "_row_to_dict", observe_decode)
+        monkeypatch.setattr(task_context, "decision_watermark", observe_watermark)
+        response = client_no_auth.get(
+            "/api/v1/audit",
+            headers=headers,
+            params={
+                "source": "all",
+                "decision": "escalate",
+                "resolved": "false",
+                "page": 3,
+                "limit": 2,
+            },
+        )
+        assert response.status_code == 200, response.text
+        data = response.json()
+        assert (data["total"], data["pages"], data["page"]) == (8, 4, 3)
+        assert [row["call_id"] for row in data["items"]] == expected[4:6]
+        assert hydrated == [expected[4:6]] and decoded == expected[4:6]
+        assert watermark_calls == [(user_id, "active")]
+        assert len(projections) == 1 and len(projections[0]) == 9
+        for row in projections[0]:
+            assert row["session_id"] == "active"
+            assert (
+                not {
+                    "evaluation_metadata",
+                    "args_redacted",
+                    "reasoning",
+                    "content",
+                    "stages",
+                }
+                & row.keys()
+            )
+
+        # Stats requests limit=1; they must not rehydrate the backlog either.
+        projections.clear()
+        hydrated.clear()
+        decoded.clear()
+        watermark_calls.clear()
+        stats = client_no_auth.get("/api/v1/stats", headers=headers)
+        assert stats.status_code == 200, stats.text
+        assert stats.json()["pending_approvals"] == 8
+        assert hydrated == [expected[:1]] and decoded == expected[:1]
+        assert watermark_calls == [(user_id, "active")]
+
+        paged = []
+        for page in range(1, 5):
+            response = client_no_auth.get(
+                "/api/v1/audit",
+                headers=headers,
+                params={
+                    "decision": "escalate",
+                    "resolved": "false",
+                    "page": page,
+                    "limit": 2,
+                },
+            )
+            assert response.status_code == 200, response.text
+            paged.extend(row["call_id"] for row in response.json()["items"])
+        assert paged == expected
+        assert len(paged) == len(set(paged))
+
 
 # ── Analysis Disabled ─────────────────────────────────────────────────
 
