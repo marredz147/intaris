@@ -70,6 +70,10 @@ cp intaris.ts .opencode/plugins/
 
 Local plugins are loaded automatically -- no config entry needed.
 
+For OpenCode V1 **1.18.29 or later** and V2 **2.0.0 or later** (within each major version), see
+[installation and CodeMode security limitations](../../integrations/opencode/README.md#opencode-v1-and-v2).
+Keep native role-specific permissions in V2; the permission-disabling guidance below is for V1 only.
+
 ### 3. Disable OpenCode's Built-in Approvals
 
 OpenCode has its own permission system that prompts for approval on certain actions. When using the Intaris plugin, this creates double prompting. To let Intaris be the sole gatekeeper:
