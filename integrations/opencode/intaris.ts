@@ -242,7 +242,14 @@ const IntarisPlugin = async (
     data: any | null
     error: string | null
     status: number | null
+    code?: string
   }
+
+  // Session or parent state that changes while a call is evaluated rejects it
+  // before anything is recorded. A fresh /evaluate passes the server's
+  // intention and alignment barriers again, so retry these few times.
+  const AUTHORIZATION_CONFLICTS = new Set(["policy_state_changed", "stale_policy_revision", "stale_admission"])
+  const CONFLICT_RETRY_DELAYS_MS = [250, 1000]
 
   async function callApi(
     method: string,
@@ -281,9 +288,11 @@ const IntarisPlugin = async (
       // Non-OK response — extract server error detail
       const body = await resp.text().catch(() => "")
       let detail = `HTTP ${resp.status}`
+      let code: string | undefined
       try {
         const parsed = JSON.parse(body)
         detail = formatErrorDetail(parsed.detail) ?? formatErrorDetail(parsed.error) ?? detail
+        if (typeof parsed.detail?.code === "string") code = parsed.detail.code
       } catch {
         if (body) detail = body.slice(0, 200)
       }
@@ -298,7 +307,7 @@ const IntarisPlugin = async (
           },
         })
         .catch(() => {})
-      return { data: null, error: detail, status: resp.status }
+      return { data: null, error: detail, status: resp.status, code }
     } catch (err) {
       await client.app
         .log({
@@ -1518,20 +1527,33 @@ const IntarisPlugin = async (
       // /reasoning call to arrive before evaluating (race condition fix).
       const intentionPending = state.intentionPending
       assertCurrent()
-      const { data: result, error: evalError, status: evalStatus } = await callApi(
-        "POST",
-        "/api/v1/evaluate",
-        {
-          session_id: intarisSessionId,
-          tool,
-          args: _output.args || {},
-          ...(intentionPending && { intention_pending: true }),
-        },
-        60000,
-        undefined,
-        input.signal,
-      )
-      assertCurrent()
+      let evaluation: ApiResult
+      for (let attempt = 0; ; attempt++) {
+        evaluation = await callApi(
+          "POST",
+          "/api/v1/evaluate",
+          {
+            session_id: intarisSessionId,
+            tool,
+            args: _output.args || {},
+            ...(intentionPending && { intention_pending: true }),
+          },
+          60000,
+          undefined,
+          input.signal,
+        )
+        assertCurrent()
+        const delay = CONFLICT_RETRY_DELAYS_MS[attempt]
+        if (evaluation.status !== 409 || !AUTHORIZATION_CONFLICTS.has(evaluation.code ?? "") || delay === undefined) break
+        await new Promise<void>((resolve, reject) => {
+          if (input.signal?.aborted) return reject(new Error("[intaris] Execution cancelled"))
+          const timer = setTimeout(() => { input.signal?.removeEventListener("abort", cancel); resolve() }, delay)
+          const cancel = () => { clearTimeout(timer); reject(new Error("[intaris] Execution cancelled")) }
+          input.signal?.addEventListener("abort", cancel, { once: true })
+        })
+        assertCurrent()
+      }
+      const { data: result, error: evalError, status: evalStatus } = evaluation
       if (input.signal?.aborted) throw new Error("[intaris] Execution cancelled")
 
       // Clear the flag after the first evaluate call — subsequent tool

@@ -576,6 +576,30 @@ test("structured evaluator error detail is readable", async () => {
   })))
 })
 
+for (const [name, conflicts, codes, calls, succeeds] of [
+  ["retries a parent authorization race, then evaluates", 1, ["policy_state_changed"], 2, true],
+  ["retries session conflicts at most twice", 3, ["stale_admission"], 3, false],
+  ["does not retry other conflicts", 1, ["stale_policy_hash"], 1, false],
+] as const) {
+  test(`evaluate conflict: ${name}`, async () => {
+    const fx = fixture()
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      yield* entry.effect(fx.ctx as any)
+      const base = globalThis.fetch
+      let evaluations = 0
+      globalThis.fetch = (async (url: string, init: RequestInit) => {
+        if (new URL(url).pathname !== "/api/v1/evaluate" || evaluations++ >= conflicts) return base(url, init)
+        return Response.json({ detail: { code: codes[0], message: "Session changed during evaluation", retryable: true } }, { status: 409 })
+      }) as typeof fetch
+      const exit = yield* Effect.exit(fx.hooks["execute.before"](fx.call("read", "root", "first", { path: "/repo/a" })))
+      globalThis.fetch = base
+      expect(evaluations).toBe(calls)
+      expect(Exit.isSuccess(exit)).toBe(succeeds)
+      if (!succeeds) expect(Exit.isFailure(exit) ? Cause.pretty(exit.cause) : "").toContain(codes[0])
+    })))
+  })
+}
+
 test("delivered user blocks compacted receipt; synthetic and manual compaction do not masquerade as users", async () => {
   const fx = fixture()
   const queue = await Effect.runPromise(Queue.unbounded<any>())
