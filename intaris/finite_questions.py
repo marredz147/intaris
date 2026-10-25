@@ -381,6 +381,7 @@ class FiniteQuestionClient(ABC):
                     "effects, including repository/config overrides; inherited context "
                     "and generated summaries are not independent publication grants."
                 )
+        questions = self._hybrid_questions(questions)
         # Selection options belong to the typed questions on the wire. Keep
         # them locally for response validation, not as duplicate model context.
         wire_state = {
@@ -491,6 +492,12 @@ class FiniteQuestionClient(ABC):
                 "margin": self._hybrid_minimum_margin,
             },
         }
+
+    def _hybrid_questions(
+        self, questions: dict[str, dict[str, Any]]
+    ) -> dict[str, dict[str, Any]]:
+        """Provider hook for hybrid question wording; labels stay unchanged."""
+        return questions
 
     def check_alignment(
         self,
