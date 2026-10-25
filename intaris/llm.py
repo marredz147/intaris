@@ -281,8 +281,9 @@ class LLMClient:
     def _single_call(
         self, messages, schema, temperature, max_tokens, effort, mode=None
     ):
-        """One logical attempt (transient failures still retry); unsupported
-        formats fall back on the next update."""
+        """One logical attempt (transient failures still retry, and rejected
+        parameters are adapted as in ``_call``); unsupported formats fall back
+        on the next update."""
         response_format = (
             {"type": "json_schema", "json_schema": schema}
             if schema and self._supports_structured is not False
@@ -308,12 +309,24 @@ class LLMClient:
         }
         self._generation_metrics.set(metrics)
         start = time.monotonic()
+        # Calls made by attempts that ended in a parameter repair.
+        repaired_calls = 0
         try:
-            response = self._call_with_transient_retries(
-                params,
-                max_attempts=self._transient_retries + 1,
-                metrics=metrics,
-            )
+            # Parameter repairs adapt the transport; they are not new attempts.
+            max_repairs = 3
+            for repair in range(1 + max_repairs):
+                try:
+                    response = self._call_with_transient_retries(
+                        params,
+                        max_attempts=self._transient_retries + 1,
+                        metrics=metrics,
+                    )
+                    break
+                except BadRequestError as e:
+                    if repair < max_repairs and self._try_fix_params(e, params):
+                        repaired_calls += metrics["calls"]
+                        continue
+                    raise
             if response.usage is not None:
                 metrics.update(
                     prompt_tokens=response.usage.prompt_tokens,
@@ -324,6 +337,14 @@ class LLMClient:
             return _clean_response(response.choices[0].message.content or "")
         except BadRequestError as exc:
             self._raise_protocol_mismatch(exc)
+            body = _provider_error_body(exc)
+            logger.warning(
+                "LLM request rejected for model %s (status=%s, code=%s, param=%s)",
+                self._model,
+                getattr(exc, "status_code", None),
+                body.get("code"),
+                body.get("param"),
+            )
             # Cache only a format incompatibility, not arbitrary invalid parameters.
             if _is_unsupported_schema_error(exc) and not is_output_validation_error(
                 exc
@@ -331,6 +352,7 @@ class LLMClient:
                 self._supports_structured = False
             raise
         finally:
+            metrics["calls"] += repaired_calls
             metrics["latency_ms"] = round((time.monotonic() - start) * 1000)
 
     def _call(
