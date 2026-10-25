@@ -89,7 +89,10 @@ const IntarisAPI = {
         // Pydantic validation errors — extract human-readable messages.
         msg = body.detail.map(e => e.msg || JSON.stringify(e)).join('; ');
       } else {
-        msg = body.detail || body.error || `HTTP ${response.status}`;
+        const detail = body.detail || body.error;
+        msg = typeof detail === 'string' ? detail :
+          (typeof detail?.message === 'string' ? detail.message : '');
+        msg = msg || `HTTP ${response.status}`;
       }
       throw new Error(msg);
     }

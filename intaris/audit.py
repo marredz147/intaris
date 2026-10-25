@@ -494,6 +494,8 @@ class AuditStore:
                 records with a user_decision set, ``False`` returns only
                 unresolved records (user_decision IS NULL). ``None`` (default)
                 returns all records regardless of resolution status.
+                With decision='escalate', unresolved revision-bound receipts
+                must also satisfy current session/task-context freshness.
 
         Returns:
             Dict with 'items', 'total', 'page', 'pages'.
@@ -544,30 +546,86 @@ class AuditStore:
             where = "WHERE " + " AND ".join(conditions)
 
         with self._db.cursor() as cur:
-            # Count total matching records
-            cur.execute(f"SELECT COUNT(*) FROM audit_log {where}", params)
-            total = cur.fetchone()[0]
-
-            # Fetch page
             offset = (page - 1) * limit
-            cur.execute(
-                f"""
-                SELECT * FROM audit_log
-                {where}
-                ORDER BY timestamp DESC, id DESC
-                LIMIT ? OFFSET ?
-                """,
-                params + [limit, offset],
-            )
-            rows = cur.fetchall()
+            if resolved is False and decision == "escalate":
+                # Task-context freshness includes a Python decision digest.
+                # Filter the complete pending set before counting/pagination,
+                # not just the selected page. This path performs no mutations.
+                cur.execute(
+                    f"SELECT * FROM audit_log {where} ORDER BY timestamp DESC, id DESC",
+                    params,
+                )
+                candidates = [_row_to_dict(row) for row in cur.fetchall()]
+                current = self._current_pending(cur, candidates, user_id=user_id)
+                total = len(current)
+                items = current[offset : offset + limit]
+            else:
+                cur.execute(f"SELECT COUNT(*) FROM audit_log {where}", params)
+                total = cur.fetchone()[0]
+                cur.execute(
+                    f"""
+                    SELECT * FROM audit_log
+                    {where}
+                    ORDER BY timestamp DESC, id DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    params + [limit, offset],
+                )
+                items = [_row_to_dict(row) for row in cur.fetchall()]
 
         pages = max(1, (total + limit - 1) // limit)
         return {
-            "items": [_row_to_dict(row) for row in rows],
+            "items": items,
             "total": total,
             "page": page,
             "pages": pages,
         }
+
+    def _current_pending(
+        self, cur: Any, records: list[dict[str, Any]], *, user_id: str
+    ) -> list[dict[str, Any]]:
+        """Select revision-bound receipts still eligible for resolution, read-only."""
+        from intaris.policy_activation import HybridError
+        from intaris.task_context import validate_freshness
+
+        current = []
+        session_freshness = {}
+        for record in records:
+            metadata = record.get("evaluation_metadata") or {}
+            # Match resolve_escalation's freshness gate without imposing new
+            # revision requirements on historical legacy receipts.
+            if metadata.get("evaluation_policy_version") == "hybrid_v1" or metadata.get(
+                "overlay"
+            ):
+                key = (
+                    record["session_id"],
+                    metadata.get("policy_revision"),
+                    metadata.get("state_revision"),
+                )
+                if key not in session_freshness:
+                    cur.execute(
+                        "SELECT 1 FROM sessions WHERE user_id = ? AND session_id = ? "
+                        "AND policy_revision = ? AND state_revision = ? AND status = 'active'",
+                        (user_id, *key),
+                    )
+                    session_freshness[key] = cur.fetchone() is not None
+                if not session_freshness[key]:
+                    continue
+                if metadata.get("task_context"):
+                    try:
+                        validate_freshness(
+                            cur,
+                            metadata,
+                            user_id,
+                            record["session_id"],
+                            exclude_call_id=record["call_id"],
+                        )
+                    except HybridError as exc:
+                        if exc.code != "stale_task_context":
+                            raise
+                        continue
+            current.append(record)
+        return current
 
     def get_recent(
         self,
