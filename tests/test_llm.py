@@ -627,6 +627,79 @@ class TestParameterAdaptation:
         assert client._supports_structured is expected
         assert len(calls) == 1
 
+    @pytest.mark.parametrize("param", ["max_tokens", "temperature", "reasoning_effort"])
+    def test_single_attempt_repairs_rejected_parameter_and_caches_fix(
+        self, monkeypatch, param
+    ):
+        calls = []
+
+        def create(**params):
+            calls.append(params.copy())
+            if param in params:
+                raise _ParameterError(param)
+            response = _make_response("ok")
+            response.usage = None
+            return response
+
+        client = _parameter_client(
+            monkeypatch,
+            create,
+            reasoning_effort="low" if param == "reasoning_effort" else None,
+        )
+        schema = {"name": "x", "schema": {"type": "object"}}
+        assert (
+            client.generate([], json_schema=schema, max_tokens=20, single_attempt=True)
+            == "ok"
+        )
+        assert client.generation_metrics["calls"] == 2
+        assert (
+            client.generate([], json_schema=schema, max_tokens=30, single_attempt=True)
+            == "ok"
+        )
+        assert client.generation_metrics["calls"] == 1
+        assert [param in call for call in calls] == [True, False, False]
+        if param == "max_tokens":
+            assert [call.get("max_completion_tokens") for call in calls] == [
+                None,
+                20,
+                30,
+            ]
+        assert all(call["response_format"]["type"] == "json_schema" for call in calls)
+
+    def test_single_attempt_counts_only_calls_reaching_provider(self, monkeypatch):
+        from intaris import model_retry
+
+        calls = []
+
+        def create(**params):
+            calls.append(params)
+            raise _ParameterError("temperature")
+
+        client = _parameter_client(monkeypatch, create)
+        retry_timeout = model_retry.retry_timeout
+        monkeypatch.setattr(
+            model_retry,
+            "retry_timeout",
+            lambda *args, **kwargs: None if calls else retry_timeout(*args, **kwargs),
+        )
+        with pytest.raises(LLMTemporaryError):
+            client.generate([], single_attempt=True)
+        assert len(calls) == 1
+        assert client.generation_metrics["calls"] == 1
+
+    def test_single_attempt_does_not_retry_unrelated_400(self, monkeypatch):
+        calls = []
+
+        def create(**params):
+            calls.append(params)
+            raise _ParameterError("messages", code="invalid_request_error")
+
+        client = _parameter_client(monkeypatch, create)
+        with pytest.raises(_ParameterError):
+            client.generate([], single_attempt=True)
+        assert len(calls) == 1
+        assert client.generation_metrics["calls"] == 1
+
 
 class TestTransientLLMFailures:
     def test_generate_retries_rate_limit_and_succeeds(self, monkeypatch):
