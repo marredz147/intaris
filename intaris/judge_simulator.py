@@ -256,6 +256,32 @@ class Answer(BaseModel):
     corrected_assessment: CorrectedAssessment | None = None
 
 
+# Keywords strict structured outputs reject; Answer validation still enforces them.
+_STRICT_UNSUPPORTED = ("default", "minLength", "maxLength")
+
+
+def _strict(node):
+    """Make a schema valid for strict structured outputs.
+
+    Strict mode requires every property to be listed in ``required``; optional
+    Answer fields are already nullable, so the model returns null instead of
+    omitting them.
+    """
+    if isinstance(node, list):
+        return [_strict(item) for item in node]
+    if not isinstance(node, dict):
+        return node
+    node = {
+        key: _strict(value)
+        for key, value in node.items()
+        if key not in _STRICT_UNSUPPORTED
+    }
+    if "properties" in node:
+        node["required"] = list(node["properties"])
+        node["additionalProperties"] = False
+    return node
+
+
 def schema(source_count=0):
     output = Answer.model_json_schema()
     output["required"] = list(
@@ -272,7 +298,7 @@ def schema(source_count=0):
     return {
         "name": "user_simulator",
         "strict": True,
-        "schema": output,
+        "schema": _strict(output),
     }
 
 
