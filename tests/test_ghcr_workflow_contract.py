@@ -23,7 +23,11 @@ def test_ghcr_publication_workflow_contract():
     assert r"^v[0-9]+\.[0-9]+\.[0-9]+$" in workflow
     assert "git merge-base --is-ancestor" in workflow
     assert "linux/amd64,linux/arm64" in workflow
-    assert "ghcr.io/fpytloun/intaris:${{ steps.image.outputs.tag }}" in workflow
+    assert (
+        "ghcr.io/${{ vars.GHCR_IMAGE || github.repository }}:${{ steps.image.outputs.tag }}"
+        in workflow
+    )
+    assert "fpytloun" not in workflow
     assert (
         "org.opencontainers.image.source=https://github.com/${{ github.repository }}"
         in workflow

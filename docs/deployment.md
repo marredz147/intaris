@@ -57,6 +57,8 @@ Before first use, an owner must set the GHCR package visibility to **Public** in
 GitHub Packages settings (`fpytloun/intaris`). Then pull the image with
 `docker pull ghcr.io/fpytloun/intaris:latest` or
 `docker pull ghcr.io/fpytloun/intaris:v0.14.1`.
+Forks publish under their own repository path; set the `GHCR_IMAGE` repository
+variable (for example `example-org/intaris`) to choose another image name.
 
 ### Custom Docker Compose
 
