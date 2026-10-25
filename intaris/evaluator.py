@@ -71,6 +71,14 @@ from intaris.session import SessionStore
 if TYPE_CHECKING:
     from intaris.finite_questions import FiniteQuestionClient
 
+# An ancestor write (policy, user evidence, lifecycle) that lands while a child
+# evaluates rejects the whole evaluation before anything is recorded, and busy
+# parents change often. Re-run it against the fresh chain a bounded number of
+# times. The session's own changes stay with the client, whose new /evaluate
+# passes the intention and alignment barriers again; callers that pin a
+# revision or hash keep their fence.
+_PARENT_CONFLICT_RETRIES = 2
+
 # Escalation retry: reuse approval if same tool+args approved within this window.
 _ESCALATION_RETRY_TTL_MINUTES = 10
 
@@ -440,31 +448,66 @@ class Evaluator:
         original_args: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Evaluate synchronously using the canonical resumable pipeline."""
-        return run_sync(
-            self._evaluation_flow(
-                user_id=user_id,
-                session_id=session_id,
-                agent_id=agent_id,
-                tool=tool,
-                args=args,
-                context=context,
-                tool_preferences=tool_preferences,
-                minimum_outcome=minimum_outcome,
-                approval_call_id=approval_call_id,
-                judge_unattended=judge_unattended,
-                evaluation_policy_version=evaluation_policy_version,
-                logical_call_id=logical_call_id,
-                expected_policy_revision=expected_policy_revision,
-                expected_policy_hash=expected_policy_hash,
-                controller_context=controller_context,
-                process_lifecycle=process_lifecycle,
-                original_args=original_args,
-            )
+        kwargs = dict(
+            user_id=user_id,
+            session_id=session_id,
+            agent_id=agent_id,
+            tool=tool,
+            args=args,
+            context=context,
+            tool_preferences=tool_preferences,
+            minimum_outcome=minimum_outcome,
+            approval_call_id=approval_call_id,
+            judge_unattended=judge_unattended,
+            evaluation_policy_version=evaluation_policy_version,
+            logical_call_id=logical_call_id,
+            expected_policy_revision=expected_policy_revision,
+            expected_policy_hash=expected_policy_hash,
+            controller_context=controller_context,
+            process_lifecycle=process_lifecycle,
+            original_args=original_args,
         )
+        for attempt in range(_PARENT_CONFLICT_RETRIES + 1):
+            try:
+                return run_sync(self._evaluation_flow(**kwargs))
+            except Exception as exc:
+                if not self._retry_conflict(exc, attempt, kwargs):
+                    raise
+        raise AssertionError("unreachable")
 
     async def evaluate_async(self, **kwargs: Any) -> dict[str, Any]:
         """Evaluate without retaining worker slots during metadata waits."""
-        return await run_async(self._evaluation_flow(**kwargs))
+        for attempt in range(_PARENT_CONFLICT_RETRIES + 1):
+            try:
+                return await run_async(self._evaluation_flow(**kwargs))
+            except Exception as exc:
+                if not self._retry_conflict(exc, attempt, kwargs):
+                    raise
+        raise AssertionError("unreachable")
+
+    @staticmethod
+    def _retry_conflict(exc: Exception, attempt: int, kwargs: dict[str, Any]) -> bool:
+        """Whether an unpinned evaluation lost a parent-chain race."""
+        from intaris.policy_activation import HybridError
+
+        if (
+            not isinstance(exc, HybridError)
+            or exc.code != "policy_state_changed"
+            or not exc.retryable
+            or attempt >= _PARENT_CONFLICT_RETRIES
+            or kwargs.get("expected_policy_revision") is not None
+            or kwargs.get("expected_policy_hash") is not None
+        ):
+            return False
+        logger.info(
+            "Re-running evaluation after parent authorization conflict "
+            "(code=%s, session=%s, tool=%s, attempt=%d)",
+            exc.code,
+            kwargs.get("session_id"),
+            kwargs.get("tool"),
+            attempt + 1,
+        )
+        return True
 
     def _deny_inactive_parent(
         self,
