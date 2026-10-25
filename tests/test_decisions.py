@@ -898,3 +898,50 @@ def test_provider_metadata_is_redacted_on_persist_without_key_or_reference_loss(
     finally:
         backend.close()
         db.close()
+
+
+def test_native_hybrid_questions_describe_fields_and_every_choice():
+    options = {
+        "relationship": ["directly_serves_intent", "supports_intent", "unclear"],
+        "target_scope": ["consistent", "conflicts", "unresolved"],
+        "target_reference": ["none", "proposed action", "target 1"],
+        "restriction_reference": ["none", "session assignment"],
+        "effect_transmit": ["yes", "no", "unknown"],
+        "risk": ["low", "medium", "high", "critical", "unknown"],
+    }
+    client, requests = client_for()
+    try:
+        client.classify_hybrid(state={"prompt": "Review", "selective_options": options})
+        questions = {q["name"]: q for q in json.loads(requests[0].content)["questions"]}
+        assert set(questions) == set(options)
+        for name, labels in options.items():
+            choices = questions[name]["choices"]
+            assert [row["value"] for row in choices] == labels
+            for row in choices:
+                assert row["description"] != row["value"].replace("_", " ")
+            # The shared factual-label contract follows the field definition.
+            assert questions[name]["instructions"].endswith(
+                "Return a factual label, never a permission verdict."
+            )
+        assert (
+            "only when target_scope is conflicts"
+            in (questions["target_reference"]["instructions"])
+        )
+        assert (
+            "'target 1'" in questions["target_reference"]["choices"][2]["description"]
+        )
+        assert (
+            "uploads and remote/target overrides"
+            in (questions["effect_transmit"]["instructions"])
+        )
+    finally:
+        client.close()
+
+
+def test_base_hybrid_questions_hook_keeps_provider_wording():
+    from intaris.finite_questions import FiniteQuestionClient
+    from intaris.jev import JevClient
+
+    assert JevClient._hybrid_questions is FiniteQuestionClient._hybrid_questions
+    questions = {"risk": {"type": "choice", "instructions": "x", "criteria": {}}}
+    assert FiniteQuestionClient._hybrid_questions(None, questions) is questions
