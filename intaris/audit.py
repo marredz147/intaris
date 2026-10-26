@@ -653,6 +653,30 @@ class AuditStore:
         )
         return [_row_to_dict(row) for row in cur.fetchall()], total
 
+    def is_obsolete_escalation(self, call_id: str, *, user_id: str) -> bool:
+        """Whether a pending escalation can no longer be resolved.
+
+        Uses the pending-approvals freshness rule: the session's authorization
+        moved past the receipt, so neither a human nor the Judge can resolve it
+        and the client must re-evaluate the call. Staleness is permanent
+        (revisions only increase), so a resolution can only commit before the
+        freshness check, and the re-read lets it win.
+        """
+        where = (
+            "WHERE user_id = ? AND call_id = ? AND decision = 'escalate' "
+            "AND user_decision IS NULL "
+            "AND (outcome_override IS NULL OR outcome_override != ?)"
+        )
+        params = [user_id, call_id, UNATTENDED_JUDGE_REVIEW]
+        with self._db.cursor() as cur:
+            _, current = self._pending_page(
+                cur, where, params, user_id=user_id, offset=0, limit=0
+            )
+            if current:
+                return False
+            cur.execute(f"SELECT 1 FROM audit_log {where}", params)
+            return cur.fetchone() is not None
+
     def get_recent(
         self,
         session_id: str,

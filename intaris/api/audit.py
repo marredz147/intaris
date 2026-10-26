@@ -89,6 +89,10 @@ async def get_audit_record(
         record = await asyncio.to_thread(
             store.get_by_call_id, call_id, user_id=ctx.user_id
         )
+        if record.get("decision") == "escalate" and record.get("user_decision") is None:
+            record["obsolete"] = await asyncio.to_thread(
+                store.is_obsolete_escalation, call_id, user_id=ctx.user_id
+            )
         return AuditRecord(**record)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e

@@ -4847,10 +4847,14 @@ class TestAuditResolvedFilter:
                 )
                 assert response.status_code == 409, response.text
                 assert response.json()["detail"]["code"] == "stale_resolution"
+        stale = {"completed", "suspended", "terminated", "idle", "policy", "state"}
         for name in names:
             response = client_no_auth.get(f"/api/v1/audit/{name}", headers=headers)
             assert response.status_code == 200
+            # Exactly the receipts the pending list hides as unresolvable.
+            assert response.json()["obsolete"] is (name in stale)
             assert store.get_by_call_id(name, user_id=user_id) == before[name]
+        assert all(row["obsolete"] is None for row in history["items"])
 
     def test_pending_receipts_reuse_task_context_watermark_freshness(
         self, client_no_auth
@@ -4936,6 +4940,95 @@ class TestAuditResolvedFilter:
             store.get_by_call_id("obsolete-context", user_id=user_id)["user_decision"]
             is None
         )
+        for call_id, obsolete in (
+            ("obsolete-context", True),
+            ("current-context", False),
+            ("earlier-decision", None),
+        ):
+            record = client_no_auth.get(f"/api/v1/audit/{call_id}", headers=headers)
+            assert record.json()["obsolete"] is obsolete
+
+    def _hybrid_receipt(self, user_id, session_id, outcome_override=None):
+        from intaris.audit import AuditStore
+        from intaris.server import _get_db
+        from intaris.session import SessionStore
+
+        sessions, store = SessionStore(_get_db()), AuditStore(_get_db())
+        session = sessions.create(
+            user_id=user_id, session_id=session_id, intention="Review local changes"
+        )
+        store.insert(
+            call_id=session_id,
+            user_id=user_id,
+            session_id=session_id,
+            agent_id=None,
+            tool="write",
+            args_redacted={},
+            classification="write",
+            evaluation_path="llm",
+            decision="escalate",
+            risk="high",
+            reasoning="Review required",
+            latency_ms=1,
+            evaluation_metadata={
+                "evaluation_policy_version": "hybrid_v1",
+                "policy_revision": session["policy_revision"],
+                "state_revision": session["state_revision"],
+            },
+            outcome_override=outcome_override,
+        )
+        return sessions, store
+
+    def test_stale_judge_only_receipt_is_not_obsolete(self, client_no_auth):
+        from intaris.decision import UNATTENDED_JUDGE_REVIEW
+
+        user_id = "judge-owner"
+        sessions, store = self._hybrid_receipt(
+            user_id, "unattended", UNATTENDED_JUDGE_REVIEW
+        )
+        sessions.update_status("unattended", "completed", user_id=user_id)
+        # Judge-only provisional calls are settled by the Judge, never re-run.
+        assert not store.is_obsolete_escalation("unattended", user_id=user_id)
+
+    def test_resolved_receipt_is_never_obsolete(self, client_no_auth):
+        user_id = "resolved-owner"
+        headers = {"X-User-Id": user_id}
+        sessions, _ = self._hybrid_receipt(user_id, "resolved")
+        response = client_no_auth.post(
+            "/api/v1/decision",
+            json={"call_id": "resolved", "decision": "approve", "note": "Fine"},
+            headers=headers,
+        )
+        assert response.status_code == 200, response.text
+        # The approval itself moved the session past the receipt's revision.
+        sessions.update_status("resolved", "completed", user_id=user_id)
+        record = client_no_auth.get("/api/v1/audit/resolved", headers=headers).json()
+        assert record["user_decision"] == "approve"
+        assert record["obsolete"] is None
+
+    def test_resolution_racing_the_freshness_check_wins(
+        self, client_no_auth, monkeypatch
+    ):
+        from intaris.audit import AuditStore
+
+        user_id = "race-owner"
+        sessions, store = self._hybrid_receipt(user_id, "raced")
+        assert not store.is_obsolete_escalation("raced", user_id=user_id)
+
+        def resolve_then_check(self, cur, *args, **kwargs):
+            # A resolution commits right after the freshness check saw no row.
+            cur.execute(
+                "UPDATE audit_log SET user_decision = 'deny' WHERE call_id = ?",
+                ("raced",),
+            )
+            return [], 0
+
+        monkeypatch.setattr(AuditStore, "_pending_page", resolve_then_check)
+        assert not store.is_obsolete_escalation("raced", user_id=user_id)
+        monkeypatch.undo()
+        sessions.update_status("raced", "completed", user_id=user_id)
+        assert not store.is_obsolete_escalation("raced", user_id=user_id)
+        assert not store.is_obsolete_escalation("missing", user_id=user_id)
 
     def test_pending_backlog_uses_minimal_projection_and_hydrates_only_page(
         self, client_no_auth, monkeypatch
