@@ -1106,6 +1106,52 @@ class TestJudgeReviewer:
 
         asyncio.run(_test())
 
+    def test_review_for_evaluate_returns_resolution_made_during_freshness_check(
+        self,
+        mock_llm,
+        audit_store,
+        session_store,
+        mock_evaluator,
+        mock_metrics,
+    ):
+        """A human decision committed during the obsolete check is returned."""
+
+        async def _test():
+            _create_session(session_store)
+            _create_escalated_record(audit_store)
+            reviewer = self._make_reviewer(
+                mock_llm=mock_llm,
+                audit_store=audit_store,
+                session_store=session_store,
+                mock_evaluator=mock_evaluator,
+                mock_metrics=mock_metrics,
+            )
+
+            async def review(**kwargs):
+                raise ValueError("Escalation already resolved")
+
+            def resolve_during_check(call_id, *, user_id):
+                audit_store.resolve_escalation(
+                    call_id,
+                    "deny",
+                    user_note="Human denied meanwhile",
+                    user_id=user_id,
+                    resolved_by="user",
+                )
+                return False
+
+            reviewer._do_review = review
+            audit_store.is_obsolete_escalation = resolve_during_check
+            outcome = await reviewer.review_for_evaluate(
+                call_id="test-call",
+                user_id="test-user",
+                session_id="test-session",
+            )
+            assert outcome.decision == "deny"
+            assert outcome.reasoning == "Human denied meanwhile"
+
+        asyncio.run(_test())
+
     def test_review_for_evaluate_keeps_fresh_skips_as_escalations(
         self,
         mock_llm,

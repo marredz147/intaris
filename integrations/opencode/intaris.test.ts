@@ -658,6 +658,7 @@ for (const [name, reevaluation, failOpen, message] of [
   ["a denial", [200, { decision: "deny", call_id: "a2", path: "llm", latency_ms: 1, reasoning: "No" }], false, "DENIED"],
   ["an outage even with FAIL_OPEN", [503, { detail: "unavailable" }], true, "Re-evaluation failed"],
   ["an escalation without a receipt", [200, { decision: "escalate", path: "llm", latency_ms: 1 }], false, "Invalid re-evaluation response"],
+  ["an approval without a receipt", [200, { decision: "approve", path: "llm", latency_ms: 1 }], false, "Invalid re-evaluation response"],
   ["a suspended session", [200, { decision: "deny", call_id: "a2", path: "fast", latency_ms: 1, session_status: "suspended" }], false, "Session suspended"],
 ] as const) {
   test(`V1 obsolete escalation fails closed on ${name}`, async () => {

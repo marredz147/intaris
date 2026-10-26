@@ -1663,7 +1663,7 @@ const IntarisPlugin = async (
           throw new Error(`[intaris] DENIED: ${next.reasoning || "Tool call denied on re-evaluation"}`)
         }
         if (next.decision !== "approve" && next.decision !== "escalate") throw new Error("[intaris] Execution not approved")
-        if (next.decision === "escalate" && (typeof next.call_id !== "string" || !next.call_id.trim())) {
+        if (typeof next.call_id !== "string" || !next.call_id.trim()) {
           throw new Error("[intaris] Invalid re-evaluation response")
         }
         return next
