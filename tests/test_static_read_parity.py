@@ -2,10 +2,12 @@
 
 import pytest
 
+from intaris import read_only
 from intaris.classifier import (
     _READ_ONLY_TOOLS,
     is_read_only,
     observe_hybrid,
+    verified_read_only,
     verified_read_only_bash,
 )
 from tests.test_hybrid_races import race_store as race_store
@@ -13,6 +15,7 @@ from tests.test_hybrid_races import race_store as race_store
 EXAMPLES = [
     ("get_current_datetime", {"timezone": "UTC"}),
     ("skill_load", {"skill_id": "cognis-coding"}),
+    ("skill", {"name": "architecture-fit"}),
     ("read", {"file_path": "/repo/README.md"}),
     ("grep", {"path": "/repo", "pattern": "test"}),
     ("list_directory", {"path": "/repo"}),
@@ -135,3 +138,36 @@ def test_fast_path_guards(race_store, guard):
             result["evaluation_metadata"]["policy_result"]["permission_basis"]
             != "read_only_static"
         )
+
+
+@pytest.mark.parametrize("tool", ["Skill", "SKILL"])
+def test_only_opencode_skill_loader_is_a_static_read(tool):
+    assert is_read_only("skill", {})
+    assert verified_read_only("skill", {})
+    assert read_only.observe("skill", {}) == "read_only"
+    # Claude Code "Skill" can run shell preprocessing: still assessed.
+    assert not is_read_only(tool, {})
+    assert not verified_read_only(tool, {})
+    assert not observe_hybrid(tool, {}, policy={}, working_directory="/repo")[
+        "static_read"
+    ]
+
+
+@pytest.mark.parametrize("guard", ["strict", "deny"])
+def test_skill_loader_keeps_policy_guards(race_store, guard):
+    sessions, _, _, evaluator, sid = race_store
+    policy = {"strict": {"profile": "strict"}, "deny": {"deny_tools": ["skill"]}}
+    sessions.update_session(sid, user_id="race-owner", policy=policy[guard])
+    result = evaluator.evaluate(
+        user_id="race-owner",
+        session_id=sid,
+        agent_id=None,
+        tool="skill",
+        args={"name": "architecture-fit"},
+    )
+    if guard == "deny":
+        assert result["decision"] == "deny"
+    assert (
+        result["evaluation_metadata"]["policy_result"]["permission_basis"]
+        != "read_only_static"
+    )

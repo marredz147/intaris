@@ -1976,10 +1976,16 @@ def verified_read_only(tool: str, args: dict[str, Any]) -> bool:
         "list_artifacts",
         "list-chats",
     }
-    return base in observational_mcp or (
-        verified_read_only_bash(args)
-        if tool == "bash"
-        else tool.lower() in _READ_ONLY_TOOLS - {"todowrite"}
+    # OpenCode "skill" returns SKILL.md text; case-sensitive so Claude Code
+    # "Skill", whose skills can run shell preprocessing, stays assessed.
+    return (
+        base in observational_mcp
+        or tool == "skill"
+        or (
+            verified_read_only_bash(args)
+            if tool == "bash"
+            else tool.lower() in _READ_ONLY_TOOLS - {"todowrite"}
+        )
     )
 
 
