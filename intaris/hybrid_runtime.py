@@ -835,6 +835,15 @@ class HybridRuntime:
                     overlay=overlay,
                 )
                 projection_used = question.get("projection", "json")
+                question["native_decision"] = l1_review.native_decision_eligible(
+                    self.jev,
+                    state,
+                    result,
+                    profile=snapshot["profile"],
+                    tool=tool,
+                    args=args,
+                    working_directory=working_directory,
+                )
                 if artifact is not None:
                     from intaris.hybrid import digest
 

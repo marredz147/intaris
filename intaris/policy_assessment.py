@@ -460,6 +460,54 @@ def review_native(llm, question: dict, previous: tuple, reason: dict) -> tuple:
     return raw, l1_review.redact_metadata(diagnostics), obligations
 
 
+# A confident native approve stands in for the routine intent assessment only.
+# Fields the three answers cannot ground stay abstentions for the policy.
+_NATIVE_ABSTENTIONS = {
+    "relationship": "unclear",
+    "risk": "unknown",
+    "mutation": "unclear",
+    "effects": ["unknown"],
+    "consequence": "unclear",
+    "contextual_restrictions": "unresolved",
+    "target_scope": "unresolved",
+    "restriction_reference": "none",
+    "target_reference": "none",
+}
+
+
+def _native_decision(question: dict, evaluation) -> tuple[dict, dict]:
+    """Map a native aligned/risk/decision answer onto the requested fields."""
+    metadata = dict(evaluation.metadata or {})
+    approved = (
+        not metadata.get("validation_error")
+        and not metadata.get("classification_uncertainty")
+        and evaluation.aligned
+        and evaluation.decision == "approve"
+        and evaluation.risk in ("low", "medium")
+    )
+    raw = {
+        key: copy.deepcopy(_NATIVE_ABSTENTIONS[key])
+        for key in question["fields"]
+        if key in _NATIVE_ABSTENTIONS
+    }
+    if approved:
+        if "relationship" in raw:
+            raw["relationship"] = "supports_intent"
+        if "risk" in raw:
+            raw["risk"] = evaluation.risk
+    for key, mapping in question.get("reference_mappings", {}).items():
+        if key in raw:
+            # Wire labels; the shared tail maps them back to references.
+            raw[key] = next(label for label, ref in mapping.items() if ref == "none")
+    metadata["native_decision"] = {
+        "approved": approved,
+        "aligned": evaluation.aligned,
+        "risk": evaluation.risk,
+        "decision": evaluation.decision,
+    }
+    return raw, metadata
+
+
 def _classify(llm, jev, question: dict) -> tuple[dict, dict, dict]:
     from intaris.evaluation_context import model_view, request_view
     from intaris.input_budget import located_source, source_sections
@@ -469,7 +517,34 @@ def _classify(llm, jev, question: dict) -> tuple[dict, dict, dict]:
     )
     instructions, _ = model_view(instructions)
     metadata = question.get("model_view") or {}
-    if jev is not None and not question["judge"]:
+    from intaris.l1_review import is_decisions
+
+    if jev is not None and question.get("native_decision") and is_decisions(jev):
+        from intaris.prompts import SAFETY_EVALUATION_SYSTEM_PROMPT
+
+        instructions = SAFETY_EVALUATION_SYSTEM_PROMPT.format(
+            anti_injection=ANTI_INJECTION_PREAMBLE
+        )
+        payload, actual_view = request_view(
+            {
+                "state": {"task_context": question["prompt"]},
+                "evaluation_rules": instructions,
+            },
+            boundary="decisions.evaluate_tool_call",
+            coverage=metadata.get("source_coverage"),
+            witnesses=metadata.get("witnesses"),
+        )
+        if actual_view["overflow"]:
+            raise ValueError("Final native decision input exceeds budget")
+        sections = located_source(
+            question["prompt"],
+            question.get("raw_sources"),
+            path=("state", "tool_call", "task_context"),
+        )
+        with source_sections(sections):
+            evaluation = jev.evaluate_tool_call(**payload)
+        raw, diagnostics = _native_decision(question, evaluation)
+    elif jev is not None and not question["judge"]:
         options = {}
         for key, prop in question["schema"]["properties"].items():
             if key == "effects":
