@@ -45,13 +45,22 @@ def unconfident(payload, name):
             answer["confidence"] = 0.3
 
 
-def client(factual=None, native=None, *, unsure=("relationship",), native_mutate=None):
+def client(
+    factual=None,
+    native=None,
+    *,
+    unsure=("relationship",),
+    native_mutate=None,
+    native_status=200,
+):
     requests = []
 
     def handler(request):
         body = json.loads(request.content)
         names = [q["name"] for q in body["questions"]]
         requests.append(names)
+        if "aligned" in names and native_status != 200:
+            return httpx.Response(native_status, json={"error": {"message": "busy"}})
         if "aligned" in names:
             payload = answer_request(body, native)
             if native_mutate:
@@ -84,11 +93,16 @@ def run(tmp_path, monkeypatch):
         native=None,
         unsure=("relationship",),
         native_mutate=None,
+        native_status=200,
         policy=None,
         working_directory="/repo",
     ):
         decisions, requests = client(
-            factual, native, unsure=unsure, native_mutate=native_mutate
+            factual,
+            native,
+            unsure=unsure,
+            native_mutate=native_mutate,
+            native_status=native_status,
         )
         backend = EvaluatorBackend("decisions", decisions_factory=lambda: decisions)
         db = Database(DBConfig(backend="sqlite", path=str(tmp_path / "native.db")))
@@ -310,3 +324,29 @@ def test_user_restrictions_and_failed_extraction_keep_the_factual_review():
 )
 def test_statically_known_effects_must_stay_local(effects, eligible):
     assert _eligible({}, {"effects": effects} if effects else {}) is eligible
+
+
+def test_unconfident_restrictions_keep_the_generative_review(run):
+    result, requests, llm = run(
+        *BASH, unsure=("relationship", "contextual_restrictions")
+    )
+    assert factual_only(requests)
+    llm.generate.assert_called()
+    assert isinstance(result, HybridError)
+
+
+def test_native_outage_falls_back_to_the_generative_review(run):
+    result, requests, llm = run(*BASH, native_status=503)
+    assert any(names == NATIVE_QUESTIONS for names in requests)
+    llm.generate.assert_called()
+    assert isinstance(result, HybridError) and result.code == "assessment_failed"
+
+
+@pytest.mark.parametrize(
+    "view",
+    [{"source_coverage": "partial"}, {"affirmative_grants_eligible": False}],
+)
+def test_trimmed_input_keeps_the_generative_review(view):
+    routine = {"distributions": {"relationship": {"choice": "supports_intent"}}}
+    assert l1_review.native_answers_eligible(routine)
+    assert not l1_review.native_answers_eligible({**routine, "model_view": view})

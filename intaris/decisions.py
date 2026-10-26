@@ -275,20 +275,6 @@ class DecisionsClient(FiniteQuestionClient):
 
     def low_confidence(self, diagnostics: dict[str, Any]) -> dict[str, Any] | None:
         """Request generative L1 review only for valid, threshold-abstained answers."""
-        native = diagnostics.get("native_decision")
-        if native is not None:
-            # Only a confident aligned approve stands; every other native answer,
-            # including an invalid one, goes to the mandatory factual review.
-            return (
-                None
-                if native["approved"]
-                else {
-                    "code": "native_not_approved",
-                    "fields": {},
-                    "native_decision": native,
-                    "minimum_confidence": self._minimum_confidence,
-                }
-            )
         if diagnostics.get("validation_error"):
             return None
         uncertainty = diagnostics.get("classification_uncertainty", {})

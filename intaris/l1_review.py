@@ -97,6 +97,13 @@ def native_answers_eligible(diagnostics: dict) -> bool:
     """No factual best guess points at a consequential or conflicting call."""
     if diagnostics.get("validation_error"):
         return False
+    # Trimmed input may have dropped a restriction the native model cannot see.
+    view = diagnostics.get("model_view") or {}
+    if (
+        view.get("source_coverage") == "partial"
+        or view.get("affirmative_grants_eligible") is False
+    ):
+        return False
     distributions = diagnostics.get("distributions") or {}
     return not any(
         (distributions.get(key) or {}).get("choice") in blocked

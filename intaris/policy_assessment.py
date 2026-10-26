@@ -419,6 +419,9 @@ def classify(llm, jev, question: dict) -> tuple[dict, dict, dict]:
         if (
             reason
             and reason["code"] == "low_confidence"
+            # The native questions do not ask about restrictions: an
+            # unconfident restriction answer keeps the generative review.
+            and "contextual_restrictions" not in reason["fields"]
             and question.get("native_decision")
             and l1_review.native_answers_eligible(diagnostics)
         ):
@@ -505,7 +508,8 @@ def _native_second_opinion(
         path=("state", "tool_call", "task_context"),
     )
     try:
-        with source_sections(sections):
+        # Half the remaining budget, so the generative review keeps its share.
+        with l1_review.primary_deadline(jev), source_sections(sections):
             evaluation = jev.evaluate_tool_call(**payload)
     except DecisionsTemporaryError as exc:
         attempts.append(l1_review.attempt(jev, {"failure": l1_review.failure(exc)}))
