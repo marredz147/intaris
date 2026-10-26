@@ -1959,6 +1959,25 @@ def verified_read_only_bash(args: dict[str, Any]) -> bool:
     return True
 
 
+def _is_context_compress(tool: str, args: dict[str, Any]) -> bool:
+    """OpenCode context pruning: replaces message ranges of the agent's own
+    conversation with summaries. Matched by exact name and argument shape so
+    a same-named file-compression tool stays assessed."""
+    content = args.get("content")
+    return (
+        tool == "compress"
+        and set(args) <= {"topic", "content"}
+        and isinstance(args.get("topic", ""), str)
+        and isinstance(content, list)
+        and all(
+            isinstance(item, dict)
+            and set(item) <= {"startId", "endId", "summary"}
+            and all(isinstance(value, str) for value in item.values())
+            for item in content
+        )
+    )
+
+
 def verified_read_only(tool: str, args: dict[str, Any]) -> bool:
     """Mutation proof from the canonical local allowlist, not MCP exemptions."""
     # Exact known observational MCP operations, not arbitrary get/list prefixes.
@@ -1981,6 +2000,7 @@ def verified_read_only(tool: str, args: dict[str, Any]) -> bool:
     return (
         base in observational_mcp
         or tool == "skill"
+        or _is_context_compress(tool, args)
         or (
             verified_read_only_bash(args)
             if tool == "bash"
