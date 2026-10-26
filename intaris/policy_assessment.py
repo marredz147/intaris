@@ -510,7 +510,7 @@ def _native_second_opinion(
     try:
         # Half the remaining budget, so the generative review keeps its share.
         with l1_review.primary_deadline(jev), source_sections(sections):
-            evaluation = jev.evaluate_tool_call(**payload)
+            evaluation = jev.evaluate_native(**payload)
     except DecisionsTemporaryError as exc:
         attempts.append(l1_review.attempt(jev, {"failure": l1_review.failure(exc)}))
         return None
