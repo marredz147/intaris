@@ -5023,9 +5023,9 @@ class TestAuditResolvedFilter:
             )
             return [], 0
 
-        monkeypatch.setattr(AuditStore, "_pending_page", resolve_then_check)
-        assert not store.is_obsolete_escalation("raced", user_id=user_id)
-        monkeypatch.undo()
+        with monkeypatch.context() as patched:
+            patched.setattr(AuditStore, "_pending_page", resolve_then_check)
+            assert not store.is_obsolete_escalation("raced", user_id=user_id)
         sessions.update_status("raced", "completed", user_id=user_id)
         assert not store.is_obsolete_escalation("raced", user_id=user_id)
         assert not store.is_obsolete_escalation("missing", user_id=user_id)
