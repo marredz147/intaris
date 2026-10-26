@@ -580,6 +580,7 @@ for (const [name, conflicts, codes, calls, succeeds] of [
   ["retries a parent authorization race, then evaluates", 1, ["policy_state_changed"], 2, true],
   ["retries session conflicts at most twice", 3, ["stale_admission"], 3, false],
   ["retries a receipt obsoleted during Judge review", 1, ["stale_resolution"], 2, true],
+  ["retries a session change during child alignment", 1, ["stale_alignment"], 2, true],
   ["does not retry other conflicts", 1, ["stale_policy_hash"], 1, false],
 ] as const) {
   test(`evaluate conflict: ${name}`, async () => {
@@ -656,6 +657,7 @@ test("V2 obsolete escalation follows the fresh receipt and admits once", async (
 for (const [name, reevaluation, failOpen, message] of [
   ["a denial", [200, { decision: "deny", call_id: "a2", path: "llm", latency_ms: 1, reasoning: "No" }], false, "DENIED"],
   ["an outage even with FAIL_OPEN", [503, { detail: "unavailable" }], true, "Re-evaluation failed"],
+  ["an escalation without a receipt", [200, { decision: "escalate", path: "llm", latency_ms: 1 }], false, "Invalid re-evaluation response"],
   ["a suspended session", [200, { decision: "deny", call_id: "a2", path: "fast", latency_ms: 1, session_status: "suspended" }], false, "Session suspended"],
 ] as const) {
   test(`V1 obsolete escalation fails closed on ${name}`, async () => {

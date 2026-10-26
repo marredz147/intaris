@@ -251,7 +251,7 @@ const IntarisPlugin = async (
   // the Judge reviews it) rejects it as not dispatched. A fresh /evaluate
   // passes the server's intention and alignment barriers again, so retry
   // these few times.
-  const AUTHORIZATION_CONFLICTS = new Set(["policy_state_changed", "stale_policy_revision", "stale_admission", "stale_resolution"])
+  const AUTHORIZATION_CONFLICTS = new Set(["policy_state_changed", "stale_policy_revision", "stale_admission", "stale_alignment", "stale_resolution"])
   const CONFLICT_RETRY_DELAYS_MS = [250, 1000]
   // A pending escalation the server reports obsolete can never be approved;
   // re-evaluate the call this many times before failing closed.
@@ -1644,7 +1644,8 @@ const IntarisPlugin = async (
 
       // Re-submit a call whose pending escalation became obsolete. Failures
       // and denials always throw: INTARIS_FAIL_OPEN never turns a pending
-      // escalation into execution.
+      // escalation into execution. A session suspended while the escalation
+      // was pending fails here instead of waiting for reactivation.
       const reevaluate = async () => {
         const { data: next, error } = await evaluateWithConflictRetry(
           { session_id: intarisSessionId, tool, args: _output.args || {} },
@@ -1662,6 +1663,9 @@ const IntarisPlugin = async (
           throw new Error(`[intaris] DENIED: ${next.reasoning || "Tool call denied on re-evaluation"}`)
         }
         if (next.decision !== "approve" && next.decision !== "escalate") throw new Error("[intaris] Execution not approved")
+        if (next.decision === "escalate" && (typeof next.call_id !== "string" || !next.call_id.trim())) {
+          throw new Error("[intaris] Invalid re-evaluation response")
+        }
         return next
       }
 
