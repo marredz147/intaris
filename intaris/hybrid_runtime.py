@@ -536,6 +536,7 @@ class HybridRuntime:
         controller_context: dict | None = None,
         process_lifecycle: dict | None = None,
         approved_edit_scopes: list[str] | None = None,
+        approved_read_prefixes: list[str] | None = None,
         parent_alignment: dict | None = None,
     ) -> dict[str, Any]:
         started = time.monotonic()
@@ -703,11 +704,12 @@ class HybridRuntime:
         result = evaluate_policy(rules, state, snapshot["profile"])
         from intaris.effect_scope import requires_explicit_grant
 
-        # The Evaluator matched an approved write scope for this revision.
-        # Conservative effects limit this cache, not the default policy.
-        # Rules, checkpoints and floors still bind.
+        # The Evaluator matched an approved write scope for this revision, or
+        # an approved out-of-project read prefix. Conservative effects limit
+        # this cache, not the default policy. Rules, checkpoints and floors
+        # still bind.
         workspace_edit = bool(
-            approved_edit_scopes
+            (approved_edit_scopes or approved_read_prefixes)
             and minimum_outcome is None
             and result.outcome == "needs_assessment"
             and [item.id for item in result.outstanding_obligations]
@@ -719,7 +721,11 @@ class HybridRuntime:
                 update={
                     "outcome": "approve",
                     "outstanding_obligations": [],
-                    "permission_basis": "approved_workspace_edit",
+                    "permission_basis": (
+                        "approved_workspace_edit"
+                        if approved_edit_scopes
+                        else "approved_read_path"
+                    ),
                     "evidence_quality": "deterministic",
                 }
             )
@@ -963,6 +969,8 @@ class HybridRuntime:
             "workflow_scope": workflow,
             **(
                 {"approved_workspace_scopes": approved_edit_scopes}
+                if workspace_edit and approved_edit_scopes
+                else {"approved_read_prefixes": approved_read_prefixes}
                 if workspace_edit
                 else {}
             ),
@@ -1133,6 +1141,9 @@ class HybridRuntime:
             reasoning=(
                 "approved_workspace_edit: follow-up edit inside the approved "
                 f"write scope {', '.join(approved_edit_scopes)}"
+                if workspace_edit and approved_edit_scopes
+                else f"Read-only tool call: {tool} (path approved via prior "
+                f"evaluation: {', '.join(approved_read_prefixes or [])})"
                 if workspace_edit
                 else reasoning
             ),

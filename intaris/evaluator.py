@@ -1242,6 +1242,12 @@ class Evaluator:
         )
 
         if (session_policy or {}).get("evaluation_policy_version") == "hybrid_v1":
+            outside_reads = self._outside_read_paths(tool, args, working_directory)
+            read_prefixes = (
+                self._matched_read_prefixes(user_id, session_id, outside_reads)
+                if outside_reads
+                else None
+            )
             from intaris.hybrid_runtime import HybridRuntime
 
             hybrid_result = HybridRuntime(
@@ -1280,6 +1286,7 @@ class Evaluator:
                 controller_context=controller_context,
                 process_lifecycle=process_lifecycle,
                 approved_edit_scopes=edit_scopes,
+                approved_read_prefixes=read_prefixes,
                 parent_alignment=hybrid_misalignment,
             )
             hybrid_meta = hybrid_result.get("evaluation_metadata") or {}
@@ -1296,6 +1303,19 @@ class Evaluator:
                     edit_targets,
                     working_directory,
                 )
+            if (
+                outside_reads
+                and hybrid_result["decision"] == "approve"
+                and hybrid_meta.get("stages")
+            ):
+                # The L1 model approved an out-of-project read: learn its
+                # prefix so later reads there are fast-pathed.
+                for rp in outside_reads:
+                    self._approve_path_prefix(
+                        user_id,
+                        session_id,
+                        _compute_path_prefix(rp, working_directory),
+                    )
             return hybrid_result
 
         # Step 1-2: Classify (with path awareness via working_directory)
@@ -1925,6 +1945,41 @@ class Evaluator:
             if not any(is_path_within(rp, prefix) for prefix in prefixes):
                 return False
         return True
+
+    def _outside_read_paths(
+        self, tool: str, args: dict[str, Any], working_directory: str | None
+    ) -> list[str]:
+        """Resolved out-of-project targets of a read-only call, or [].
+
+        Credential reads and calls without determinable paths return [] so
+        they are never cached.
+        """
+        if (
+            not working_directory
+            or not is_read_only(tool, args)
+            or reads_secret_location(tool, args, working_directory)
+        ):
+            return []
+        return [
+            rp
+            for rp in resolve_tool_paths(tool, args, working_directory)
+            if not is_path_within(rp, working_directory)
+        ]
+
+    def _matched_read_prefixes(
+        self, user_id: str, session_id: str, paths: list[str]
+    ) -> list[str] | None:
+        """Approved prefixes covering every path, or None if any is uncovered."""
+        with self._approved_paths_lock:
+            prefixes = list(self._approved_paths.get((user_id, session_id), []))
+        matched: list[str] = []
+        for rp in paths:
+            prefix = next((p for p in prefixes if is_path_within(rp, p)), None)
+            if prefix is None:
+                return None
+            if prefix not in matched:
+                matched.append(prefix)
+        return matched
 
     def _approve_path_prefix(
         self,
