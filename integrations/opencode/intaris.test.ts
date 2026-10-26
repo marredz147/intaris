@@ -579,6 +579,8 @@ test("structured evaluator error detail is readable", async () => {
 for (const [name, conflicts, codes, calls, succeeds] of [
   ["retries a parent authorization race, then evaluates", 1, ["policy_state_changed"], 2, true],
   ["retries session conflicts at most twice", 3, ["stale_admission"], 3, false],
+  ["retries a receipt obsoleted during Judge review", 1, ["stale_resolution"], 2, true],
+  ["retries a session change during child alignment", 1, ["stale_alignment"], 2, true],
   ["does not retry other conflicts", 1, ["stale_policy_hash"], 1, false],
 ] as const) {
   test(`evaluate conflict: ${name}`, async () => {
@@ -599,6 +601,91 @@ for (const [name, conflicts, codes, calls, succeeds] of [
     })))
   })
 }
+
+// Scripted /evaluate results and per-receipt audit records for the
+// obsolete-escalation re-evaluation tests.
+function obsoleteFixture(evaluations: Array<[number, any]>, audits: Record<string, any>) {
+  const fx = fixture()
+  const base = globalThis.fetch
+  const evaluated: any[] = []
+  const polled: string[] = []
+  globalThis.fetch = (async (url: string, init: RequestInit) => {
+    const path = new URL(url).pathname
+    if (path === "/api/v1/evaluate") {
+      evaluated.push(JSON.parse(String(init.body)))
+      const [status, body] = evaluations[Math.min(evaluated.length, evaluations.length) - 1]
+      return Response.json(body, { status })
+    }
+    if (path.startsWith("/api/v1/audit/")) {
+      const id = decodeURIComponent(path.slice("/api/v1/audit/".length))
+      polled.push(id)
+      return Response.json(audits[id] ?? { user_decision: null })
+    }
+    return base(url, init)
+  }) as typeof fetch
+  const server = () => entry.server({ client: { app: { log: async () => ({}) }, tui: { showToast: async () => ({}) } }, worktree: "/repo", directory: "/repo" } as any)
+  return { fx, evaluated, polled, server }
+}
+const escalated = (call_id: string) => [200, { decision: "escalate", call_id, path: "llm", latency_ms: 1, reasoning: "Needs review" }] as [number, any]
+const obsolete = { user_decision: null, obsolete: true }
+
+test("V1 obsolete escalation is re-evaluated and runs on the fresh approval", async () => {
+  const { evaluated, polled, server } = obsoleteFixture(
+    [escalated("a1"), [200, { decision: "approve", call_id: "a2", path: "llm", latency_ms: 1 }]],
+    { a1: obsolete },
+  )
+  const hooks = await server()
+  await hooks["tool.execute.before"]({ tool: "skill", sessionID: "root", callID: "load" }, { args: { name: "architecture-fit" } })
+  expect(evaluated).toHaveLength(2)
+  expect(evaluated[1]).toEqual({ session_id: "oc-root", tool: "skill", args: { name: "architecture-fit" } })
+  expect(polled).toEqual(["a1"])
+}, 15000)
+
+test("V2 obsolete escalation follows the fresh receipt and admits once", async () => {
+  const { fx, evaluated, polled } = obsoleteFixture(
+    [escalated("a1"), escalated("a2")],
+    { a1: obsolete, a2: { user_decision: "approve" } },
+  )
+  await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    yield* entry.effect(fx.ctx as any)
+    expect(Exit.isSuccess(yield* Effect.exit(fx.hooks["execute.before"](fx.call("read", "root", "first", { path: "/repo/a" }))))).toBe(true)
+  })))
+  expect(evaluated).toHaveLength(2)
+  expect(polled).toEqual(["a1", "a2"])
+}, 15000)
+
+for (const [name, reevaluation, failOpen, message] of [
+  ["a denial", [200, { decision: "deny", call_id: "a2", path: "llm", latency_ms: 1, reasoning: "No" }], false, "DENIED"],
+  ["an outage even with FAIL_OPEN", [503, { detail: "unavailable" }], true, "Re-evaluation failed"],
+  ["an escalation without a receipt", [200, { decision: "escalate", path: "llm", latency_ms: 1 }], false, "Invalid re-evaluation response"],
+  ["a suspended session", [200, { decision: "deny", call_id: "a2", path: "fast", latency_ms: 1, session_status: "suspended" }], false, "Session suspended"],
+] as const) {
+  test(`V1 obsolete escalation fails closed on ${name}`, async () => {
+    if (failOpen) process.env.INTARIS_FAIL_OPEN = "true"
+    const { evaluated, server } = obsoleteFixture([escalated("a1"), reevaluation as [number, any]], { a1: obsolete })
+    const hooks = await server()
+    await expect(hooks["tool.execute.before"]({ tool: "skill", sessionID: "root", callID: "load" }, { args: { name: "x" } })).rejects.toThrow(message)
+    expect(evaluated).toHaveLength(2)
+  }, 15000)
+}
+
+test("V1 re-evaluation is bounded, then fails closed", async () => {
+  const { evaluated, polled, server } = obsoleteFixture(
+    [escalated("a1"), escalated("a2"), escalated("a3"), escalated("a4")],
+    { a1: obsolete, a2: obsolete, a3: obsolete, a4: obsolete },
+  )
+  const hooks = await server()
+  await expect(hooks["tool.execute.before"]({ tool: "skill", sessionID: "root", callID: "load" }, { args: { name: "x" } })).rejects.toThrow("can no longer be approved")
+  expect(evaluated).toHaveLength(3)
+  expect(polled).toEqual(["a1", "a2", "a3"])
+}, 20000)
+
+test("V1 a resolution wins over the obsolete flag", async () => {
+  const { evaluated, server } = obsoleteFixture([escalated("a1")], { a1: { user_decision: "approve", obsolete: true } })
+  const hooks = await server()
+  await hooks["tool.execute.before"]({ tool: "skill", sessionID: "root", callID: "load" }, { args: { name: "x" } })
+  expect(evaluated).toHaveLength(1)
+}, 15000)
 
 test("delivered user blocks compacted receipt; synthetic and manual compaction do not masquerade as users", async () => {
   const fx = fixture()

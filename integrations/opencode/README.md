@@ -182,6 +182,7 @@ See [OpenCode Permissions](https://opencode.ai/docs/permissions/) for details.
    - **approve**: tool executes normally
    - **deny**: throws an error with reasoning (blocks execution)
    - **escalate**: polls only when `/evaluate` still returns unresolved escalation
+     (if the session changes so the escalation can no longer be approved, the call is re-evaluated up to twice, never approved)
    - Tracks per-decision statistics (approve/deny/escalate counts)
    - Sends periodic checkpoints via `POST /api/v1/checkpoint` (every N calls)
 3. **`session.deleted`**: Signals session completion to Intaris:
