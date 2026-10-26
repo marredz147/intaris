@@ -17,6 +17,7 @@ from tests.test_workflow_scope import workflow as workflow
     [
         "get_current_datetime",
         "skill_load",
+        "skill",
         "mcp_office365-examplecorp__list-chats",
     ],
 )
