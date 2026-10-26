@@ -100,6 +100,10 @@ def test_secret_paths_are_never_static_reads(path, config):
     [
         ("glob", {"pattern": "~/.ssh/*"}),
         ("glob", {"pattern": "*", "path": "~/.aws"}),
+        ("glob", {"pattern": "~/.aws/**/*"}),
+        ("glob", {"pattern": "**/.env*"}),
+        ("glob", {"pattern": "**/id_rsa*"}),
+        ("glob", {"pattern": "*.key"}),
         ("grep", {"pattern": "x", "path": "~/.kube"}),
         ("bash", {"command": "grep -r TOKEN ~/.aws"}),
         ("bash", {"command": "cat /etc/shad*"}),
@@ -108,6 +112,22 @@ def test_secret_paths_are_never_static_reads(path, config):
 def test_secret_directories_and_globs_are_never_static_reads(tool, args, config):
     assert classify(tool, args, **config) == Classification.WRITE
     assert not static_read(tool, args, config)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        {"pattern": "**/*", "path": "/repo", "limit": 80},
+        {"pattern": "tests/**/*"},
+        {"pattern": "docs/**"},
+        {"pattern": ".github/workflows/*", "hidden": True},
+        {"pattern": "*"},
+    ],
+)
+def test_bare_wildcard_glob_listing_is_not_a_secret_read(args):
+    # glob returns names only; a bare wildcard segment lists its directory.
+    assert not reads_secret_location("glob", args, "/repo")
+    assert classify("glob", args, working_directory="/repo") == Classification.READ
 
 
 @pytest.mark.parametrize("config", CONFIGS.values(), ids=CONFIGS.keys())

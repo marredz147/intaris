@@ -644,7 +644,13 @@ def reads_secret_location(
     if tool.lower() == "glob":
         pattern = args.get("pattern")
         if isinstance(pattern, str) and pattern:
-            candidates.append(pattern)
+            # glob lists names only: a bare wildcard segment ("*", "**")
+            # targets whatever its directory holds, so check that directory.
+            parts = pattern.replace("\\", "/").split("/")
+            while parts and parts[-1] and set(parts[-1]) <= {"*", "?"}:
+                parts.pop()
+            if any(parts):
+                candidates.append("/".join(parts))
     if any(_is_sensitive_path(path) for path in candidates):
         return True
     if tool != "bash":
