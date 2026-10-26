@@ -840,6 +840,9 @@ class HybridRuntime:
                     overlay=overlay,
                 )
                 projection_used = question.get("projection", "json")
+                from intaris.decisions import native_operation
+
+                question["native_operation"] = native_operation(tool)
                 question["native_decision"] = l1_review.native_decision_eligible(
                     self.jev,
                     state,
