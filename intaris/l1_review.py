@@ -16,14 +16,24 @@ def is_decisions(client: Any) -> bool:
     return getattr(type(client), "provider", None) == "decisions"
 
 
-# Native single-decision L1: the three-question Decisions form (aligned, risk,
-# decision) answers only calls whose sole open question is the routine intent
-# assessment. Anything the three answers cannot ground stays with the factual
-# L1: strict scope checks, operator or extracted user restrictions, read-only
-# overlays, configured rules, unknown or consequential effects, secrets,
-# protected repository/deploy targets and targets outside the working directory.
+# Native second opinion: when the factual Decisions answers lack confidence,
+# the three-question Decisions form (aligned, risk, decision) is asked before
+# the generative review. Only calls whose sole open question is the routine
+# intent assessment qualify. Strict scope checks, operator or extracted user
+# restrictions, read-only overlays, configured rules, consequential effects,
+# secrets, protected repository/deploy targets and known targets outside the
+# working directory keep the generative review.
 _NATIVE_PROFILES = frozenset({"balanced", "bounded_autonomy"})
 _NATIVE_EFFECTS = frozenset({"read", "write", "execute"})
+# Factual best guesses that keep the generative review even when unconfident.
+_NATIVE_BLOCKING_ANSWERS = {
+    "effect_transmit": {"yes"},
+    "effect_delete": {"yes"},
+    "relationship": {"conflicts_with_intent", "unrelated"},
+    "risk": {"high", "critical"},
+    "target_scope": {"conflicts"},
+    "contextual_restrictions": {"conflicts"},
+}
 
 
 def native_decision_eligible(
@@ -35,8 +45,9 @@ def native_decision_eligible(
     tool: str,
     args: dict,
     working_directory: str | None,
+    interpretation_unavailable: bool = False,
 ) -> bool:
-    """Whether a confident native approve can stand in for the intent assessment."""
+    """Whether a confident native approve may settle the intent assessment."""
     import os
 
     from intaris.classifier import reads_secret_location
@@ -54,15 +65,20 @@ def native_decision_eligible(
         or (state.workflow_scope or {}).get("declared")
     ):
         return False
-    effects = set(state.value("effects", None) or ())
-    if not effects or not effects <= _NATIVE_EFFECTS:
+    # Statically known effects must be local; unknown ones are left to the
+    # factual answers checked by native_answers_eligible.
+    effects = set(state.value("effects", None) or ()) - {"unknown"}
+    if not effects <= _NATIVE_EFFECTS:
         return False
     if state.value("secret_argument") or requires_explicit_grant(state):
         return False
-    for source in state.sources.values():
-        if source.get("constraint_items") or source.get("interpretation_missing"):
-            return False
-    if not state.value("paths_complete") or not working_directory:
+    # A configured extractor that failed may have missed a user restriction.
+    # Without an extractor (mixed context) the balanced policy accepts it.
+    if interpretation_unavailable or any(
+        source.get("constraint_items") for source in state.sources.values()
+    ):
+        return False
+    if not working_directory:
         return False
     root = os.path.normpath(working_directory)
     paths = state.value("paths", None) or []
@@ -75,6 +91,24 @@ def native_decision_eligible(
     ):
         return False
     return not reads_secret_location(tool, args, working_directory)
+
+
+def native_answers_eligible(diagnostics: dict) -> bool:
+    """No factual best guess points at a consequential or conflicting call."""
+    if diagnostics.get("validation_error"):
+        return False
+    # Trimmed input may have dropped a restriction the native model cannot see.
+    view = diagnostics.get("model_view") or {}
+    if (
+        view.get("source_coverage") == "partial"
+        or view.get("affirmative_grants_eligible") is False
+    ):
+        return False
+    distributions = diagnostics.get("distributions") or {}
+    return not any(
+        (distributions.get(key) or {}).get("choice") in blocked
+        for key, blocked in _NATIVE_BLOCKING_ANSWERS.items()
+    )
 
 
 def review_deadline(client: Any, llm: Any = None) -> AbstractContextManager[None]:

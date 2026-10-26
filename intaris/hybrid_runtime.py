@@ -735,6 +735,7 @@ class HybridRuntime:
         )
         prompt_digest = None
         projection_used = None
+        interpretation_unavailable = False
         if (
             result.outcome not in {"approve", "deny"}
             and any(
@@ -747,6 +748,10 @@ class HybridRuntime:
                 artifact = self.task_context.capture(session, parent_intention)
                 from intaris.task_context import evaluation_view
 
+                # The relaxed view relabels a failed extraction as raw.
+                interpretation_unavailable = bool(
+                    artifact and artifact.get("status") == "unavailable"
+                )
                 artifact = evaluation_view(artifact, session)
             if artifact:
                 from intaris.evaluation_context import source_view
@@ -843,6 +848,7 @@ class HybridRuntime:
                     tool=tool,
                     args=args,
                     working_directory=working_directory,
+                    interpretation_unavailable=interpretation_unavailable,
                 )
                 if artifact is not None:
                     from intaris.hybrid import digest

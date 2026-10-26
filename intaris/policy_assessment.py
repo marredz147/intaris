@@ -416,6 +416,18 @@ def classify(llm, jev, question: dict) -> tuple[dict, dict, dict]:
         reason = reason or (
             jev.low_confidence(diagnostics) if jev is not None else None
         )
+        if (
+            reason
+            and reason["code"] == "low_confidence"
+            # The native questions do not ask about restrictions: an
+            # unconfident restriction answer keeps the generative review.
+            and "contextual_restrictions" not in reason["fields"]
+            and question.get("native_decision")
+            and l1_review.native_answers_eligible(diagnostics)
+        ):
+            decided = _native_second_opinion(jev, question, raw, diagnostics, attempts)
+            if decided is not None:
+                return decided[0], l1_review.redact_metadata(decided[1]), obligations
         diagnostics["backend_provenance"] = l1_review.provenance(attempts)
         if reason:
             return review_native(llm, question, (raw, diagnostics, obligations), reason)
@@ -460,52 +472,78 @@ def review_native(llm, question: dict, previous: tuple, reason: dict) -> tuple:
     return raw, l1_review.redact_metadata(diagnostics), obligations
 
 
-# A confident native approve stands in for the routine intent assessment only.
-# Fields the three answers cannot ground stay abstentions for the policy.
-_NATIVE_ABSTENTIONS = {
-    "relationship": "unclear",
-    "risk": "unknown",
-    "mutation": "unclear",
-    "effects": ["unknown"],
-    "consequence": "unclear",
-    "contextual_restrictions": "unresolved",
-    "target_scope": "unresolved",
-    "restriction_reference": "none",
-    "target_reference": "none",
-}
+def _native_second_opinion(
+    jev, question: dict, raw: dict, diagnostics: dict, attempts: list
+) -> tuple[dict, dict] | None:
+    """Ask the three native questions when the factual answers lack confidence.
 
+    A confident aligned approve with low or medium risk settles relationship
+    and risk; every other factual answer keeps its own value or abstention,
+    so the policy still owns the outcome. Anything else, including a native
+    failure, returns None and the generative review runs as before.
+    """
+    from intaris import l1_review
+    from intaris.decisions import DecisionsTemporaryError
+    from intaris.evaluation_context import request_view
+    from intaris.input_budget import located_source, source_sections
+    from intaris.prompts import SAFETY_EVALUATION_SYSTEM_PROMPT
 
-def _native_decision(question: dict, evaluation) -> tuple[dict, dict]:
-    """Map a native aligned/risk/decision answer onto the requested fields."""
-    metadata = dict(evaluation.metadata or {})
-    approved = (
-        not metadata.get("validation_error")
-        and not metadata.get("classification_uncertainty")
+    metadata = question.get("model_view") or {}
+    payload, actual_view = request_view(
+        {
+            "state": {"task_context": question["prompt"]},
+            "evaluation_rules": SAFETY_EVALUATION_SYSTEM_PROMPT.format(
+                anti_injection=ANTI_INJECTION_PREAMBLE
+            ),
+        },
+        boundary="decisions.evaluate_tool_call",
+        coverage=metadata.get("source_coverage"),
+        witnesses=metadata.get("witnesses"),
+    )
+    if actual_view["overflow"]:
+        return None
+    sections = located_source(
+        question["prompt"],
+        question.get("raw_sources"),
+        path=("state", "tool_call", "task_context"),
+    )
+    try:
+        # Half the remaining budget, so the generative review keeps its share.
+        with l1_review.primary_deadline(jev), source_sections(sections):
+            evaluation = jev.evaluate_tool_call(**payload)
+    except DecisionsTemporaryError as exc:
+        attempts.append(l1_review.attempt(jev, {"failure": l1_review.failure(exc)}))
+        return None
+    native = dict(evaluation.metadata or {})
+    approved = bool(
+        not native.get("validation_error")
+        and not native.get("classification_uncertainty")
         and evaluation.aligned
         and evaluation.decision == "approve"
         and evaluation.risk in ("low", "medium")
     )
-    raw = {
-        key: copy.deepcopy(_NATIVE_ABSTENTIONS[key])
-        for key in question["fields"]
-        if key in _NATIVE_ABSTENTIONS
-    }
-    if approved:
-        if "relationship" in raw:
-            raw["relationship"] = "supports_intent"
-        if "risk" in raw:
-            raw["risk"] = evaluation.risk
-    for key, mapping in question.get("reference_mappings", {}).items():
-        if key in raw:
-            # Wire labels; the shared tail maps them back to references.
-            raw[key] = next(label for label, ref in mapping.items() if ref == "none")
-    metadata["native_decision"] = {
+    native["native_decision"] = {
         "approved": approved,
         "aligned": evaluation.aligned,
         "risk": evaluation.risk,
         "decision": evaluation.decision,
     }
-    return raw, metadata
+    attempts.append(l1_review.attempt(jev, native, jev.input_view))
+    diagnostics["native_decision"] = native["native_decision"]
+    if not approved:
+        return None
+    merged = dict(raw)
+    for key, value in (("relationship", "supports_intent"), ("risk", evaluation.risk)):
+        if key in merged:
+            merged[key] = value
+    distributions = {
+        key: value
+        for key, value in diagnostics.get("distributions", {}).items()
+        if key not in {"relationship", "risk"}
+    }
+    decided = {**diagnostics, "distributions": distributions}
+    decided["backend_provenance"] = l1_review.provenance(attempts)
+    return merged, decided
 
 
 def _classify(llm, jev, question: dict) -> tuple[dict, dict, dict]:
@@ -519,32 +557,7 @@ def _classify(llm, jev, question: dict) -> tuple[dict, dict, dict]:
     metadata = question.get("model_view") or {}
     from intaris.l1_review import is_decisions
 
-    if jev is not None and question.get("native_decision") and is_decisions(jev):
-        from intaris.prompts import SAFETY_EVALUATION_SYSTEM_PROMPT
-
-        instructions = SAFETY_EVALUATION_SYSTEM_PROMPT.format(
-            anti_injection=ANTI_INJECTION_PREAMBLE
-        )
-        payload, actual_view = request_view(
-            {
-                "state": {"task_context": question["prompt"]},
-                "evaluation_rules": instructions,
-            },
-            boundary="decisions.evaluate_tool_call",
-            coverage=metadata.get("source_coverage"),
-            witnesses=metadata.get("witnesses"),
-        )
-        if actual_view["overflow"]:
-            raise ValueError("Final native decision input exceeds budget")
-        sections = located_source(
-            question["prompt"],
-            question.get("raw_sources"),
-            path=("state", "tool_call", "task_context"),
-        )
-        with source_sections(sections):
-            evaluation = jev.evaluate_tool_call(**payload)
-        raw, diagnostics = _native_decision(question, evaluation)
-    elif jev is not None and not question["judge"]:
+    if jev is not None and not question["judge"]:
         options = {}
         for key, prop in question["schema"]["properties"].items():
             if key == "effects":
