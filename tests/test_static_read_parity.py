@@ -16,6 +16,13 @@ EXAMPLES = [
     ("get_current_datetime", {"timezone": "UTC"}),
     ("skill_load", {"skill_id": "cognis-coding"}),
     ("skill", {"name": "architecture-fit"}),
+    (
+        "compress",
+        {
+            "topic": "Closed phase",
+            "content": [{"startId": "@27@", "endId": "@56@", "summary": "Done."}],
+        },
+    ),
     ("read", {"file_path": "/repo/README.md"}),
     ("grep", {"path": "/repo", "pattern": "test"}),
     ("list_directory", {"path": "/repo"}),
@@ -170,4 +177,21 @@ def test_skill_loader_keeps_policy_guards(race_store, guard):
     assert (
         result["evaluation_metadata"]["policy_result"]["permission_basis"]
         != "read_only_static"
+    )
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        {"path": "/repo/build", "output": "/repo/build.tgz"},
+        {"topic": "x", "content": [{"startId": "@1@", "path": "/etc/passwd"}]},
+        {"topic": "x", "content": "rm -rf /repo"},
+        {"topic": "x", "content": [], "command": "tar czf /tmp/x.tgz /repo"},
+    ],
+)
+def test_only_the_context_compress_shape_is_a_static_read(args):
+    assert not verified_read_only("compress", args)
+    assert not verified_read_only(
+        "Compress",
+        {"topic": "x", "content": [{"startId": "@1@", "endId": "@2@", "summary": "s"}]},
     )
