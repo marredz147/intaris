@@ -350,3 +350,89 @@ def test_trimmed_input_keeps_the_generative_review(view):
     routine = {"distributions": {"relationship": {"choice": "supports_intent"}}}
     assert l1_review.native_answers_eligible(routine)
     assert not l1_review.native_answers_eligible({**routine, "model_view": view})
+
+
+def native_answers(aligned, decision=None, confidence=1.0):
+    decision = decision or {"approve": 1.0}
+
+    def mutate(payload):
+        for answer in payload["answers"]:
+            if answer["name"] == "aligned":
+                answer["probability"] = aligned
+            if answer["name"] == "decision":
+                answer["choice"] = max(decision, key=decision.get)
+                answer["confidence"] = confidence
+                answer["probabilities"] = [
+                    {
+                        "value": row["value"],
+                        "probability": decision.get(row["value"], 0.0),
+                    }
+                    for row in answer["probabilities"]
+                ]
+
+    return mutate
+
+
+def evaluate_native(mutate, minimum=0.7):
+    requests = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        payload = answer_request(body)
+        mutate(payload)
+        return httpx.Response(200, json=payload)
+
+    decisions = DecisionsClient(
+        DecisionsConfig(api_key="native-test-key", minimum_confidence=minimum),
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        return (
+            decisions.evaluate_native(
+                state={"task_context": "Edit /repo/usage.md"},
+                evaluation_rules="Apply the Intaris rubric.",
+            ),
+            requests,
+        )
+    finally:
+        decisions.close()
+
+
+def test_native_form_uses_chosen_answer_probability_not_margin():
+    # Production shape: aligned 0.79 and approve 0.75 fail a margin rule
+    # (0.58 / 0.5) but pass the pre-hybrid probability rule at 0.7.
+    result, requests = evaluate_native(
+        native_answers(0.79, {"approve": 0.75, "escalate": 0.25}, confidence=0.8)
+    )
+    assert "classification_uncertainty" not in result.metadata
+    assert (result.aligned, result.risk, result.decision) == (True, "low", "approve")
+    assert result.metadata["alignment_confidence"] == pytest.approx(0.79)
+    assert result.metadata["decision_confidence"] == pytest.approx(0.75)
+    instructions = {q["name"]: q["instructions"] for q in requests[0]["questions"]}
+    assert "approve permitted aligned low/medium work" in instructions["decision"]
+
+
+@pytest.mark.parametrize(
+    "aligned,decision,confidence,minimum,certain",
+    [
+        (0.65, {"approve": 1.0}, 1.0, 0.7, False),
+        (0.65, {"approve": 1.0}, 1.0, 0.6, True),
+        (0.95, {"approve": 0.65, "escalate": 0.35}, 1.0, 0.7, False),
+        (0.95, {"approve": 0.9, "escalate": 0.1}, 0.6, 0.7, False),
+        (0.95, {"approve": 0.9, "escalate": 0.1}, 0.6, 0.6, True),
+    ],
+)
+def test_native_threshold_follows_minimum_confidence(
+    aligned, decision, confidence, minimum, certain
+):
+    result, _ = evaluate_native(
+        native_answers(aligned, decision, confidence), minimum=minimum
+    )
+    assert ("classification_uncertainty" not in result.metadata) is certain
+
+
+def test_invalid_native_response_is_never_certain():
+    result, _ = evaluate_native(lambda payload: payload["answers"].pop())
+    assert result.metadata["validation_error"]
+    assert result.decision == "escalate"
