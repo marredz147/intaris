@@ -398,6 +398,13 @@ def extract_paths(args: dict[str, Any]) -> list[str]:
     return paths
 
 
+def is_patch_envelope(tool: str, args: dict[str, Any]) -> bool:
+    """apply_patch, or OpenCode's ``patch`` carrying the same patchText envelope."""
+    return tool == "apply_patch" or (
+        tool == "patch" and isinstance(args.get("patchText"), str)
+    )
+
+
 def extract_apply_patch_paths(patch_text: str) -> list[str]:
     """Extract target paths from apply_patch input.
 
@@ -1290,7 +1297,8 @@ def observe_hybrid(
         "tool": tool,
         "command": _extract_bash_command(args) if tool == "bash" else None,
         "paths": paths,
-        "paths_complete": tool in {"read", "edit", "write", "apply_patch"},
+        "paths_complete": tool in {"read", "edit", "write"}
+        or is_patch_envelope(tool, args),
         "operation": "read" if is_read_only(tool, args) else "unknown",
         "static_read": factual == Classification.READ,
         "configured_deny": bool(
@@ -1365,7 +1373,7 @@ def resolve_tool_paths(
 
     # apply_patch stores target paths inside the patch envelope rather than
     # in a conventional file_path/path argument.
-    if tool == "apply_patch":
+    if is_patch_envelope(tool, args):
         patch_text = args.get("patchText")
         if isinstance(patch_text, str) and patch_text:
             raw_paths.extend(extract_apply_patch_paths(patch_text))
@@ -1959,6 +1967,26 @@ def verified_read_only_bash(args: dict[str, Any]) -> bool:
     return True
 
 
+# OpenCode agent coordination: read a subagent's status or result, ask the
+# user, or wait for the user. Exact names and argument shapes only.
+_AGENT_COORDINATION = {
+    "task_status": ("sessionID", str),
+    "task_result": ("sessionID", str),
+    "question": ("questions", list),
+    "wait_for_user": ("reason", str),
+}
+
+
+def _is_agent_coordination(tool: str, args: dict[str, Any]) -> bool:
+    """A coordination call with no effect beyond the agent's own session."""
+    shape = _AGENT_COORDINATION.get(tool)
+    return (
+        shape is not None
+        and set(args) == {shape[0]}
+        and isinstance(args[shape[0]], shape[1])
+    )
+
+
 def _is_context_compress(tool: str, args: dict[str, Any]) -> bool:
     """OpenCode context pruning: replaces message ranges of the agent's own
     conversation with summaries. Matched by exact name and argument shape so
@@ -1994,6 +2022,9 @@ def verified_read_only(tool: str, args: dict[str, Any]) -> bool:
         "get_artifact_url",
         "list_artifacts",
         "list-chats",
+        "codanna_get_index_info",
+        "serena_initial_instructions",
+        "serena_read_memory",
     }
     # OpenCode "skill" returns SKILL.md text; case-sensitive so Claude Code
     # "Skill", whose skills can run shell preprocessing, stays assessed.
@@ -2001,6 +2032,7 @@ def verified_read_only(tool: str, args: dict[str, Any]) -> bool:
         base in observational_mcp
         or tool == "skill"
         or _is_context_compress(tool, args)
+        or _is_agent_coordination(tool, args)
         or (
             verified_read_only_bash(args)
             if tool == "bash"
