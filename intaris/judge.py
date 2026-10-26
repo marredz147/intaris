@@ -41,6 +41,7 @@ from intaris.policy import (
     effective_policy_for_evaluator,
     normalized_policy_clauses,
 )
+from intaris.policy_activation import HybridError
 from intaris.precedent import find_authoritative_precedent
 from intaris.prompts import render_user_decisions_section
 from intaris.sanitize import (
@@ -1586,6 +1587,22 @@ class JudgeReviewer:
         record = await asyncio.to_thread(
             self._audit.get_by_call_id, call_id, user_id=user_id
         )
+        if (
+            record.get("decision") == "escalate"
+            and record.get("user_decision") is None
+            and await asyncio.to_thread(
+                self._audit.is_obsolete_escalation, call_id, user_id=user_id
+            )
+        ):
+            # Session authorization moved on during review, so nobody can
+            # resolve this receipt. Let the client re-evaluate, never approve.
+            raise HybridError(
+                "stale_resolution",
+                "Session changed during review; re-evaluate the call",
+                409,
+                call_id=call_id,
+                retryable=True,
+            )
         if (
             record.get("outcome_override") == UNATTENDED_JUDGE_REVIEW
             and record.get("effective_decision") == "escalate"

@@ -1037,6 +1037,112 @@ class TestJudgeReviewer:
 
         asyncio.run(_test())
 
+    @pytest.mark.parametrize("outcome", ["skipped", "timeout"])
+    def test_review_for_evaluate_reports_receipt_obsoleted_during_review(
+        self,
+        mock_llm,
+        audit_store,
+        session_store,
+        mock_evaluator,
+        mock_metrics,
+        outcome,
+    ):
+        """A receipt no one can resolve any more is retryable, never approved."""
+        from intaris.policy_activation import HybridError
+
+        async def _test():
+            _create_session(session_store)
+            session = session_store.get("test-session", user_id="test-user")
+            audit_store.insert(
+                call_id="test-call",
+                user_id="test-user",
+                session_id="test-session",
+                agent_id="test-agent",
+                tool="skill",
+                args_redacted={"name": "architecture-fit"},
+                classification="write",
+                evaluation_path="llm",
+                decision="escalate",
+                risk="medium",
+                reasoning="Needs assessment",
+                latency_ms=1,
+                evaluation_metadata={
+                    "evaluation_policy_version": "hybrid_v1",
+                    "policy_revision": session["policy_revision"],
+                    "state_revision": session["state_revision"],
+                },
+            )
+            reviewer = self._make_reviewer(
+                mock_llm=mock_llm,
+                audit_store=audit_store,
+                session_store=session_store,
+                mock_evaluator=mock_evaluator,
+                mock_metrics=mock_metrics,
+            )
+
+            async def review(**kwargs):
+                # A new user message lands while the Judge is reviewing.
+                session_store.update_status(
+                    "test-session", "active", user_id="test-user"
+                )
+                if outcome == "timeout":
+                    raise asyncio.TimeoutError
+                raise HybridError(
+                    "stale_resolution", "Session changed before resolution", 409
+                )
+
+            reviewer._do_review = review
+            with pytest.raises(HybridError) as raised:
+                await reviewer.review_for_evaluate(
+                    call_id="test-call",
+                    user_id="test-user",
+                    session_id="test-session",
+                )
+            assert raised.value.code == "stale_resolution"
+            assert raised.value.status == 409
+            assert raised.value.retryable
+            record = audit_store.get_by_call_id("test-call", user_id="test-user")
+            assert record["user_decision"] is None
+
+        asyncio.run(_test())
+
+    def test_review_for_evaluate_keeps_fresh_skips_as_escalations(
+        self,
+        mock_llm,
+        audit_store,
+        session_store,
+        mock_evaluator,
+        mock_metrics,
+    ):
+        """Legacy or still-current receipts keep the unresolved escalation."""
+
+        async def _test():
+            _create_session(session_store)
+            _create_escalated_record(audit_store)
+            reviewer = self._make_reviewer(
+                mock_llm=mock_llm,
+                audit_store=audit_store,
+                session_store=session_store,
+                mock_evaluator=mock_evaluator,
+                mock_metrics=mock_metrics,
+            )
+
+            async def review(**kwargs):
+                session_store.update_status(
+                    "test-session", "active", user_id="test-user"
+                )
+                raise ValueError("Escalation already resolved")
+
+            reviewer._do_review = review
+            outcome = await reviewer.review_for_evaluate(
+                call_id="test-call",
+                user_id="test-user",
+                session_id="test-session",
+            )
+            assert outcome.decision == "escalate"
+
+        asyncio.run(_test())
+
     def test_review_for_evaluate_timeout_falls_back_to_escalate(
         self,
         mock_llm,

@@ -395,6 +395,10 @@ class AuditRecord(BaseModel):
     judge_decision: str | None = None
     judge_risk: str | None = None
     evaluation_metadata: dict[str, Any] | None = None
+    # Set only by GET /audit/{call_id}: True when this pending escalation can
+    # no longer be resolved because session authorization changed; the client
+    # must re-evaluate the call.
+    obsolete: bool | None = None
 
 
 class AuditListResponse(BaseModel):

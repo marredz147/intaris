@@ -147,7 +147,10 @@ async def test_hybrid_review_encloses_multiple_model_stages_but_honors_request_d
     reviewer = JudgeReviewer(
         llm=SimpleNamespace(_timeout_ms=20),
         config=JudgeConfig(mode="auto"),
-        audit_store=Mock(get_by_call_id=Mock(return_value=record)),
+        audit_store=Mock(
+            get_by_call_id=Mock(return_value=record),
+            is_obsolete_escalation=Mock(return_value=False),
+        ),
         session_store=Mock(),
         evaluator=Mock(),
     )
