@@ -13,6 +13,8 @@
  *    - approve: tool executes normally
  *    - deny: throws error with reasoning (blocks execution)
  *    - escalate: polls only when /evaluate still returns unresolved escalation
+ *      (an escalation the server reports obsolete is re-evaluated, bounded,
+ *      never approved)
  *    - Periodic checkpoints sent every N calls (configurable)
  * 4. session.updated: Updates Intaris intention when session title changes
  * 5. session.deleted / session.idle: Updates session lifecycle in Intaris
@@ -245,11 +247,15 @@ const IntarisPlugin = async (
     code?: string
   }
 
-  // Session or parent state that changes while a call is evaluated rejects it
-  // before anything is recorded. A fresh /evaluate passes the server's
-  // intention and alignment barriers again, so retry these few times.
-  const AUTHORIZATION_CONFLICTS = new Set(["policy_state_changed", "stale_policy_revision", "stale_admission"])
+  // Session or parent state that changes while a call is evaluated (or while
+  // the Judge reviews it) rejects it as not dispatched. A fresh /evaluate
+  // passes the server's intention and alignment barriers again, so retry
+  // these few times.
+  const AUTHORIZATION_CONFLICTS = new Set(["policy_state_changed", "stale_policy_revision", "stale_admission", "stale_resolution"])
   const CONFLICT_RETRY_DELAYS_MS = [250, 1000]
+  // A pending escalation the server reports obsolete can never be approved;
+  // re-evaluate the call this many times before failing closed.
+  const OBSOLETE_REEVALUATIONS = 2
 
   async function callApi(
     method: string,
@@ -393,13 +399,40 @@ const IntarisPlugin = async (
       .catch(() => {})
   }
 
+  async function evaluateWithConflictRetry(
+    payload: object,
+    signal?: AbortSignal,
+    assertCurrent?: () => void,
+  ): Promise<ApiResult> {
+    for (let attempt = 0; ; attempt++) {
+      const evaluation = await callApi("POST", "/api/v1/evaluate", payload, 60000, undefined, signal)
+      assertCurrent?.()
+      const delay = CONFLICT_RETRY_DELAYS_MS[attempt]
+      if (evaluation.status !== 409 || !AUTHORIZATION_CONFLICTS.has(evaluation.code ?? "") || delay === undefined) return evaluation
+      await new Promise<void>((resolve, reject) => {
+        if (signal?.aborted) return reject(new Error("[intaris] Execution cancelled"))
+        const timer = setTimeout(() => { signal?.removeEventListener("abort", cancel); resolve() }, delay)
+        const cancel = () => { clearTimeout(timer); reject(new Error("[intaris] Execution cancelled")) }
+        signal?.addEventListener("abort", cancel, { once: true })
+      })
+      assertCurrent?.()
+    }
+  }
+
+  /**
+   * Poll until the escalation is resolved and return the approved call_id.
+   * When the server reports the receipt obsolete (session authorization moved
+   * on, so nobody can resolve it), `reevaluate` submits the call again; it
+   * returns an approve or escalate result and throws on anything else.
+   */
   async function waitForEscalationResolution(
     tool: string,
     callId: string,
     reason: string,
     signal?: AbortSignal,
     assertCurrent?: () => void,
-  ): Promise<void> {
+    reevaluate?: () => Promise<any>,
+  ): Promise<string> {
     assertCurrent?.()
     await client.app
       .log({
@@ -421,6 +454,7 @@ const IntarisPlugin = async (
     const startTime = Date.now()
     let pollAttempt = 0
     let lastReminderAt = startTime
+    let reevaluations = 0
 
     while (true) {
       assertCurrent?.()
@@ -490,7 +524,7 @@ const IntarisPlugin = async (
         showToast(`Tool "${tool}" approved — proceeding`, "success")
         if (signal?.aborted) throw new Error("[intaris] Approval cancelled")
         assertCurrent?.()
-        return
+        return callId
       }
 
       if (auditRecord.user_decision === "deny") {
@@ -501,6 +535,35 @@ const IntarisPlugin = async (
         throw new Error(
           `[intaris] DENIED by user (${callId}): ${reason}${denyNote}`,
         )
+      }
+
+      if (auditRecord.user_decision == null && auditRecord.obsolete === true) {
+        if (!reevaluate || ++reevaluations > OBSOLETE_REEVALUATIONS) {
+          throw new Error(
+            `[intaris] Escalation ${callId} for ${tool} can no longer be approved because the session changed; retry the tool call`,
+          )
+        }
+        await client.app
+          .log({
+            body: {
+              service: "intaris",
+              level: "warn",
+              message: `Escalation ${callId} for ${tool} is obsolete — re-evaluating`,
+            },
+          })
+          .catch(() => {})
+        assertCurrent?.()
+        showToast(`Session changed — re-evaluating "${tool}"...`, "info")
+        const next = await reevaluate()
+        assertCurrent?.()
+        if (signal?.aborted) throw new Error("[intaris] Approval cancelled")
+        if (next.decision === "approve") {
+          showToast(`Tool "${tool}" approved — proceeding`, "success")
+          return next.call_id
+        }
+        callId = next.call_id
+        reason = next.reasoning || reason
+        pollAttempt = 0
       }
     }
   }
@@ -1527,32 +1590,16 @@ const IntarisPlugin = async (
       // /reasoning call to arrive before evaluating (race condition fix).
       const intentionPending = state.intentionPending
       assertCurrent()
-      let evaluation: ApiResult
-      for (let attempt = 0; ; attempt++) {
-        evaluation = await callApi(
-          "POST",
-          "/api/v1/evaluate",
-          {
-            session_id: intarisSessionId,
-            tool,
-            args: _output.args || {},
-            ...(intentionPending && { intention_pending: true }),
-          },
-          60000,
-          undefined,
-          input.signal,
-        )
-        assertCurrent()
-        const delay = CONFLICT_RETRY_DELAYS_MS[attempt]
-        if (evaluation.status !== 409 || !AUTHORIZATION_CONFLICTS.has(evaluation.code ?? "") || delay === undefined) break
-        await new Promise<void>((resolve, reject) => {
-          if (input.signal?.aborted) return reject(new Error("[intaris] Execution cancelled"))
-          const timer = setTimeout(() => { input.signal?.removeEventListener("abort", cancel); resolve() }, delay)
-          const cancel = () => { clearTimeout(timer); reject(new Error("[intaris] Execution cancelled")) }
-          input.signal?.addEventListener("abort", cancel, { once: true })
-        })
-        assertCurrent()
-      }
+      const evaluation = await evaluateWithConflictRetry(
+        {
+          session_id: intarisSessionId,
+          tool,
+          args: _output.args || {},
+          ...(intentionPending && { intention_pending: true }),
+        },
+        input.signal,
+        assertCurrent,
+      )
       const { data: result, error: evalError, status: evalStatus } = evaluation
       if (input.signal?.aborted) throw new Error("[intaris] Execution cancelled")
 
@@ -1587,12 +1634,36 @@ const IntarisPlugin = async (
           `[intaris] Evaluation failed for ${tool}: ${evalError || "server unreachable"} (INTARIS_FAIL_OPEN=false)`,
         )
       }
-      if (input.codeMode && (
-        !["approve", "deny", "escalate"].includes(result.decision)
-        || typeof result.call_id !== "string" || !result.call_id.trim()
-        || typeof result.path !== "string" || !result.path
-        || !Number.isInteger(result.latency_ms) || result.latency_ms < 0
-      )) throw new Error("[intaris] Invalid execution evaluation response")
+      const invalidEvaluation = (r: any) => !!input.codeMode && (
+        !["approve", "deny", "escalate"].includes(r.decision)
+        || typeof r.call_id !== "string" || !r.call_id.trim()
+        || typeof r.path !== "string" || !r.path
+        || !Number.isInteger(r.latency_ms) || r.latency_ms < 0
+      )
+      if (invalidEvaluation(result)) throw new Error("[intaris] Invalid execution evaluation response")
+
+      // Re-submit a call whose pending escalation became obsolete. Failures
+      // and denials always throw: INTARIS_FAIL_OPEN never turns a pending
+      // escalation into execution.
+      const reevaluate = async () => {
+        const { data: next, error } = await evaluateWithConflictRetry(
+          { session_id: intarisSessionId, tool, args: _output.args || {} },
+          input.signal,
+          assertCurrent,
+        )
+        if (input.signal?.aborted) throw new Error("[intaris] Execution cancelled")
+        if (!next) throw new Error(`[intaris] Re-evaluation failed for ${tool}: ${error || "server unreachable"}`)
+        if (invalidEvaluation(next)) throw new Error("[intaris] Invalid execution evaluation response")
+        if (input.callID && next.call_id) state.toolCallAuditIds.set(input.callID, next.call_id)
+        if (next.decision === "deny") {
+          if (next.session_status === "suspended" || next.session_status === "terminated") {
+            throw new Error(`[intaris] Session ${next.session_status}: ${next.status_reason || next.reasoning || "re-evaluation denied"}`)
+          }
+          throw new Error(`[intaris] DENIED: ${next.reasoning || "Tool call denied on re-evaluation"}`)
+        }
+        if (next.decision !== "approve" && next.decision !== "escalate") throw new Error("[intaris] Execution not approved")
+        return next
+      }
 
       // Track decision statistics
       state.callCount++
@@ -1750,6 +1821,7 @@ const IntarisPlugin = async (
                   reResult.reasoning || "Tool call requires human approval",
                   input.signal,
                   assertCurrent,
+                  reevaluate,
                 )
                 assertCurrent()
                 return
@@ -1784,11 +1856,14 @@ const IntarisPlugin = async (
         )
       }
 
+      let admittedCallId = result.call_id
       if (result.decision === "escalate") {
         const reason =
           result.reasoning ||
           "Tool call requires human approval"
-        await waitForEscalationResolution(tool, result.call_id, reason, input.signal, assertCurrent)
+        admittedCallId = await waitForEscalationResolution(
+          tool, result.call_id, reason, input.signal, assertCurrent, reevaluate,
+        )
         assertCurrent()
       }
 
@@ -1796,7 +1871,7 @@ const IntarisPlugin = async (
         if (result.decision !== "approve" && result.decision !== "escalate") throw new Error("[intaris] Execution not approved")
         if (input.signal?.aborted) throw new Error("[intaris] Execution cancelled")
         assertCurrent()
-        input.codeMode.onApproved(result.call_id)
+        input.codeMode.onApproved(admittedCallId)
       }
       // decision === "approve" (or escalation approved) — tool call proceeds normally
       assertCurrent()
