@@ -23,6 +23,11 @@ EXAMPLES = [
             "content": [{"startId": "@27@", "endId": "@56@", "summary": "Done."}],
         },
     ),
+    ("task_status", {"sessionID": "ses_child"}),
+    ("task_result", {"sessionID": "ses_child"}),
+    ("question", {"questions": [{"question": "Which parser?", "options": []}]}),
+    ("wait_for_user", {"reason": "Waiting for review."}),
+    ("serena_read_memory", {"memory_file_name": "overview"}),
     ("read", {"file_path": "/repo/README.md"}),
     ("grep", {"path": "/repo", "pattern": "test"}),
     ("list_directory", {"path": "/repo"}),
@@ -195,3 +200,18 @@ def test_only_the_context_compress_shape_is_a_static_read(args):
         "Compress",
         {"topic": "x", "content": [{"startId": "@1@", "endId": "@2@", "summary": "s"}]},
     )
+
+
+@pytest.mark.parametrize(
+    ("tool", "args"),
+    [
+        ("task_status", {"sessionID": "ses_child", "message": "continue"}),
+        ("task_result", {"sessionID": ["ses_child"]}),
+        ("question", {"questions": "Deploy now?", "command": "deploy"}),
+        ("wait_for_user", {}),
+        ("Task_Status", {"sessionID": "ses_child"}),
+        ("task_message", {"sessionID": "ses_child"}),
+    ],
+)
+def test_only_exact_agent_coordination_shapes_are_static_reads(tool, args):
+    assert not verified_read_only(tool, args)

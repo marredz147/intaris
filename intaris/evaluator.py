@@ -37,6 +37,7 @@ from intaris.classifier import (
     classify,
     extract_apply_patch_paths,
     extract_paths,
+    is_patch_envelope,
     is_path_within,
     is_read_only,
     reads_secret_location,
@@ -93,7 +94,9 @@ _CONTEXT_ARG_KEY = "__intaris_context"
 
 # Edit tools whose approval opens a session write scope (approved workspace
 # edits). bash is deliberately excluded: its targets are not determinable.
-_WORKSPACE_EDIT_TOOLS = frozenset({"edit", "write", "multiedit", "apply_patch"})
+_WORKSPACE_EDIT_TOOLS = frozenset(
+    {"edit", "write", "multiedit", "apply_patch", "patch"}
+)
 # Directory names that hold deploy manifests (k8s/helm); edits under them
 # always go to the evaluator model.
 _DEPLOY_DIRS = frozenset(
@@ -279,11 +282,11 @@ def _edit_targets(
     """
     name = tool.lower()
     if name not in _WORKSPACE_EDIT_TOOLS or (
-        name == "apply_patch" and tool != "apply_patch"
+        name in {"apply_patch", "patch"} and not is_patch_envelope(tool, args)
     ):
         return None
     raw = extract_paths(args)
-    if name == "apply_patch":
+    if name in {"apply_patch", "patch"}:
         patch = args.get("patchText")
         headers = extract_apply_patch_paths(patch) if isinstance(patch, str) else []
         # Deleting files is a delete effect that needs its own assessment.
@@ -318,7 +321,7 @@ def _denied_targets(
 
     Includes deleted and moved patch paths and per-edit multiedit paths.
     """
-    if tool.lower() == "apply_patch":
+    if tool.lower() == "apply_patch" or is_patch_envelope(tool, args):
         tool = "apply_patch"
     targets = resolve_tool_paths(tool, args, working_directory or "")
     edits = args.get("edits")

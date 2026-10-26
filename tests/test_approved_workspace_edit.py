@@ -252,6 +252,23 @@ def test_apply_patch_with_one_target_outside_scope_goes_to_model(env):
     assert_model(llm, result, 2)
 
 
+def test_opencode_patch_tool_shares_apply_patch_scopes(env):
+    _, _, llm, evaluator, sid, _ = env
+    edit(evaluator, sid, f"{WD}/a.py")
+    inside = "*** Begin Patch\n*** Update File: b.py\n@@\n-a\n+b\n*** End Patch\n"
+    assert_skipped(
+        llm, edit(evaluator, sid, None, tool="patch", args={"patchText": inside}), 1
+    )
+    outside = (
+        "*** Begin Patch\n*** Update File: /etc/hosts\n@@\n-a\n+b\n*** End Patch\n"
+    )
+    result = edit(evaluator, sid, None, tool="patch", args={"patchText": outside})
+    assert_model(llm, result, 2)
+    deleting = "*** Begin Patch\n*** Delete File: b.py\n*** End Patch\n"
+    result = edit(evaluator, sid, None, tool="patch", args={"patchText": deleting})
+    assert_model(llm, result, 3)
+
+
 @pytest.mark.parametrize(
     "patch",
     [
