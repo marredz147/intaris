@@ -689,7 +689,7 @@ Relative paths are resolved against `working_directory` using `os.path.normpath(
 The evaluator maintains an in-memory cache of approved path prefixes per session. When a read-only tool call that was reclassified to WRITE due to path policy is approved — either by the LLM directly or by a user resolving an escalation — the evaluator caches the approved directory prefix. Subsequent reads under that prefix are fast-pathed as READ without LLM evaluation.
 
 **Two learning paths:**
-- **LLM approval**: When the LLM approves a path-reclassified read, the prefix is cached immediately in the evaluate pipeline.
+- **LLM approval**: When the LLM approves a path-reclassified read, the prefix is cached immediately in the evaluate pipeline (legacy and hybrid; hybrid admits covered reads under the approved-workspace-edit gate).
 - **User-approved escalation**: When a user approves an escalated read via `POST /decision`, the endpoint calls `evaluator.learn_from_approved_escalation()` which extracts file paths from the audit record, looks up the session's `working_directory`, and caches the prefix.
 
 **Prefix computation** uses a depth-aware heuristic:
