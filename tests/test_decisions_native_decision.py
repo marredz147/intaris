@@ -18,7 +18,7 @@ from intaris.policy_activation import HybridError
 from intaris.session import SessionStore
 from tests.test_decisions import answer_request
 
-NATIVE_QUESTIONS = ["aligned", "risk", "decision"]
+NATIVE_QUESTIONS = ["aligned", "risk"]
 # Factual best guesses for a routine local edit; relationship is unconfident.
 ROUTINE = {
     "relationship": "supports_intent",
@@ -187,11 +187,11 @@ def test_confident_facts_need_no_second_opinion(run):
 @pytest.mark.parametrize(
     "native,native_mutate",
     [
-        ({"decision": "escalate"}, None),
-        ({"decision": "deny"}, None),
         ({"risk": "high"}, None),
+        ({"risk": "critical"}, None),
+        (None, lambda p: p["answers"][0].update(probability=0.2)),
         (None, lambda p: p["answers"][0].update(probability=0.5)),
-        (None, lambda p: p["answers"][2].update(confidence=0.69)),
+        (None, lambda p: p["answers"][1].update(confidence=0.69)),
         (None, lambda p: p["answers"][0].update(type="refusal")),
     ],
 )
@@ -352,28 +352,25 @@ def test_trimmed_input_keeps_the_generative_review(view):
     assert not l1_review.native_answers_eligible({**routine, "model_view": view})
 
 
-def native_answers(aligned, decision=None, confidence=1.0):
-    decision = decision or {"approve": 1.0}
+def native_answers(aligned, risk=None, confidence=1.0):
+    risk = risk or {"low": 1.0}
 
     def mutate(payload):
         for answer in payload["answers"]:
             if answer["name"] == "aligned":
                 answer["probability"] = aligned
-            if answer["name"] == "decision":
-                answer["choice"] = max(decision, key=decision.get)
+            if answer["name"] == "risk":
+                answer["choice"] = max(risk, key=risk.get)
                 answer["confidence"] = confidence
                 answer["probabilities"] = [
-                    {
-                        "value": row["value"],
-                        "probability": decision.get(row["value"], 0.0),
-                    }
+                    {"value": row["value"], "probability": risk.get(row["value"], 0.0)}
                     for row in answer["probabilities"]
                 ]
 
     return mutate
 
 
-def evaluate_native(mutate, minimum=0.7):
+def evaluate_native(mutate, minimum=0.7, operation=None):
     requests = []
 
     def handler(request):
@@ -392,6 +389,7 @@ def evaluate_native(mutate, minimum=0.7):
             decisions.evaluate_native(
                 state={"task_context": "Edit /repo/usage.md"},
                 evaluation_rules="Apply the Intaris rubric.",
+                operation=operation,
             ),
             requests,
         )
@@ -399,35 +397,48 @@ def evaluate_native(mutate, minimum=0.7):
         decisions.close()
 
 
-def test_native_form_uses_chosen_answer_probability_not_margin():
-    # Production shape: aligned 0.79 and approve 0.75 fail a margin rule
-    # (0.58 / 0.5) but pass the pre-hybrid probability rule at 0.7.
+def test_aligned_and_risk_decide_by_chosen_answer_probability():
+    # Production shape: aligned 0.79 fails a margin rule (0.58) but passes
+    # the pre-hybrid probability rule at 0.7; no separate decision question.
     result, requests = evaluate_native(
-        native_answers(0.79, {"approve": 0.75, "escalate": 0.25}, confidence=0.8)
+        native_answers(0.79, {"low": 0.75, "medium": 0.25}, confidence=0.8)
     )
     assert "classification_uncertainty" not in result.metadata
     assert (result.aligned, result.risk, result.decision) == (True, "low", "approve")
     assert result.metadata["alignment_confidence"] == pytest.approx(0.79)
-    assert result.metadata["decision_confidence"] == pytest.approx(0.75)
-    instructions = {q["name"]: q["instructions"] for q in requests[0]["questions"]}
-    assert "approve permitted aligned low/medium work" in instructions["decision"]
+    assert result.metadata["risk_confidence"] == pytest.approx(0.75)
+    assert [q["name"] for q in requests[0]["questions"]] == ["aligned", "risk"]
 
 
 @pytest.mark.parametrize(
-    "aligned,decision,confidence,minimum,certain",
+    "aligned,risk,decision",
     [
-        (0.65, {"approve": 1.0}, 1.0, 0.7, False),
-        (0.65, {"approve": 1.0}, 1.0, 0.6, True),
-        (0.95, {"approve": 0.65, "escalate": 0.35}, 1.0, 0.7, False),
-        (0.95, {"approve": 0.9, "escalate": 0.1}, 0.6, 0.7, False),
-        (0.95, {"approve": 0.9, "escalate": 0.1}, 0.6, 0.6, True),
+        (0.9, {"medium": 1.0}, "approve"),
+        (0.9, {"high": 1.0}, "escalate"),
+        (0.9, {"critical": 1.0}, "deny"),
+        (0.1, {"low": 1.0}, "escalate"),
+    ],
+)
+def test_decision_follows_alignment_and_risk(aligned, risk, decision):
+    result, _ = evaluate_native(native_answers(aligned, risk))
+    assert result.decision == decision
+
+
+@pytest.mark.parametrize(
+    "aligned,risk,confidence,minimum,certain",
+    [
+        (0.65, {"low": 1.0}, 1.0, 0.7, False),
+        (0.65, {"low": 1.0}, 1.0, 0.6, True),
+        (0.95, {"low": 0.65, "medium": 0.35}, 1.0, 0.7, False),
+        (0.95, {"low": 0.9, "medium": 0.1}, 0.6, 0.7, False),
+        (0.95, {"low": 0.9, "medium": 0.1}, 0.6, 0.6, True),
     ],
 )
 def test_native_threshold_follows_minimum_confidence(
-    aligned, decision, confidence, minimum, certain
+    aligned, risk, confidence, minimum, certain
 ):
     result, _ = evaluate_native(
-        native_answers(aligned, decision, confidence), minimum=minimum
+        native_answers(aligned, risk, confidence), minimum=minimum
     )
     assert ("classification_uncertainty" not in result.metadata) is certain
 
@@ -436,3 +447,40 @@ def test_invalid_native_response_is_never_certain():
     result, _ = evaluate_native(lambda payload: payload["answers"].pop())
     assert result.metadata["validation_error"]
     assert result.decision == "escalate"
+
+
+@pytest.mark.parametrize(
+    "tool,kind,phrase",
+    [
+        ("read", "read", "reads or searches"),
+        ("patch", "edit", "edits files"),
+        ("bash", "command", "runs a command"),
+        ("subagent", "delegate", "delegates work"),
+        ("custom_tool", None, None),
+    ],
+)
+def test_questions_carry_operation_guidance(tool, kind, phrase):
+    from intaris.decisions import native_operation
+
+    assert native_operation(tool) == kind
+    _, requests = evaluate_native(native_answers(0.9), operation=kind)
+    aligned = requests[0]["questions"][0]["instructions"]
+    if phrase:
+        assert phrase in aligned
+    else:
+        assert "This call" not in aligned
+
+
+def test_production_flow_sends_operation_guidance(run, monkeypatch):
+    seen = []
+    original = DecisionsClient.evaluate_native
+
+    def spy(self, **kwargs):
+        seen.append(kwargs.get("operation"))
+        return original(self, **kwargs)
+
+    monkeypatch.setattr(DecisionsClient, "evaluate_native", spy)
+    result, requests, _ = run(*BASH)
+    assert requests[-1] == NATIVE_QUESTIONS
+    assert seen == ["command"]
+    assert result["decision"] == "approve"
