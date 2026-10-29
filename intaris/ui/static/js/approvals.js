@@ -102,17 +102,17 @@ function approvalsTab() {
         this._scheduleLoad();
       } else if (data.type === 'judge_reviewed') {
         this._scheduleLoad();
+        this._scheduleLoadDenials();
       } else if (data.type === 'evaluated' && data.decision === 'deny') {
         this._scheduleLoadDenials();
       } else if (data.type === 'decided') {
         // Another user (or this user via resolve/override) resolved an item
         const callId = data.call_id;
         if (callId) {
-          if (data.decision === 'deny') {
-            // Denial override — remove from denials list
-            this.denials = this.denials.filter(d => d.call_id !== callId);
-            this.denialsTotal = this.denials.length;
-          } else {
+          // Any human decision settles a listed denial (including judge denials)
+          this.denials = this.denials.filter(d => d.call_id !== callId);
+          this.denialsTotal = this.denials.length;
+          if (data.decision !== 'deny') {
             // Escalation resolution — remove from pending list
             this._markResolved(callId);
             this.pending = this.pending.filter(p => p.call_id !== callId);
@@ -210,14 +210,30 @@ function approvalsTab() {
           resolved: false,
           limit: 20,
         };
+        // Escalations the judge denied stay overridable until a human decides.
+        const judgeParams = {
+          decision: 'escalate',
+          record_type: 'tool_call',
+          resolved_by: 'judge',
+          user_decision: 'deny',
+          limit: 20,
+        };
         const agentFilter = Alpine.store('nav').selectedAgent;
-        if (agentFilter) params.agent_id = agentFilter;
-        const result = await IntarisAPI.listAudit(params);
+        if (agentFilter) {
+          params.agent_id = agentFilter;
+          judgeParams.agent_id = agentFilter;
+        }
+        const [result, judged] = await Promise.all([
+          IntarisAPI.listAudit(params),
+          IntarisAPI.listAudit(judgeParams),
+        ]);
         // Filter out session-status denials (evaluation_path='fast')
         // which cannot benefit from the denial override retry mechanism.
-        const items = (result.items || []).filter(
-          item => item.evaluation_path !== 'fast'
-        );
+        const items = (result.items || [])
+          .filter(item => item.evaluation_path !== 'fast')
+          .concat(judged.items || [])
+          .sort((a, b) => (a.timestamp < b.timestamp ? 1 : -1))
+          .slice(0, 20);
         this.denials = items;
         this.denialsTotal = items.length;
       } catch (e) {

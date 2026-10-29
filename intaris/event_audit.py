@@ -188,6 +188,8 @@ class EventAuditStore:
         from_ts: str | None = None,
         to_ts: str | None = None,
         resolved: bool | None = None,
+        resolved_by: str | None = None,
+        user_decision: str | None = None,
         event_type: str | None = None,
         event_source: str | None = None,
         page: int = 1,
@@ -219,6 +221,8 @@ class EventAuditStore:
                 risk,
                 evaluation_path,
                 resolved,
+                resolved_by,
+                user_decision,
             )
         )
         event_only_filters = event_type is not None or event_source is not None
@@ -237,6 +241,8 @@ class EventAuditStore:
                 from_ts=from_ts,
                 to_ts=to_ts,
                 resolved=resolved,
+                resolved_by=resolved_by,
+                user_decision=user_decision,
                 page=page if pending else 1,
                 limit=limit if pending else branch_limit,
             )
