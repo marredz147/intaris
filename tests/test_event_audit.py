@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from intaris.audit import AuditStore
 from intaris.config import DBConfig, EventStoreConfig
 from intaris.db import Database
@@ -338,3 +340,46 @@ def test_mixed_source_equal_timestamp_pages_do_not_overlap(tmp_path):
     second_ids = {item["id"] for item in second["items"]}
     assert len(first_ids | second_ids) == 4
     assert first_ids.isdisjoint(second_ids)
+
+
+def test_resolution_filters_select_judge_denials(tmp_path):
+    db = _database(tmp_path)
+    _session(db)
+    audit = AuditStore(db)
+    for call_id in ("judge-deny", "judge-approve", "user-deny"):
+        audit.insert(
+            call_id=call_id,
+            user_id="alice",
+            session_id="sess-1",
+            agent_id="agent-1",
+            tool="bash",
+            args_redacted={"command": call_id},
+            classification="write",
+            evaluation_path="llm",
+            decision="escalate",
+            risk="medium",
+            reasoning="Needs review",
+            latency_ms=1,
+        )
+    audit.resolve_escalation("judge-deny", "deny", user_id="alice", resolved_by="judge")
+    audit.resolve_escalation(
+        "judge-approve", "approve", user_id="alice", resolved_by="judge"
+    )
+    audit.resolve_escalation("user-deny", "deny", user_id="alice", resolved_by="user")
+
+    store = EventAuditStore(db)
+    result = store.query(
+        user_id="alice",
+        source="all",
+        decision="escalate",
+        resolved_by="judge",
+        user_decision="deny",
+    )
+    assert [item["call_id"] for item in result["items"]] == ["judge-deny"]
+
+    denied = store.query(user_id="alice", user_decision="deny")
+    assert {item["call_id"] for item in denied["items"]} == {"judge-deny", "user-deny"}
+
+    for bad in ({"resolved_by": "admin"}, {"user_decision": "escalate"}):
+        with pytest.raises(ValueError):
+            store.query(user_id="alice", **bad)

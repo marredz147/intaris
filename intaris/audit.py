@@ -482,6 +482,8 @@ class AuditStore:
         from_ts: str | None = None,
         to_ts: str | None = None,
         resolved: bool | None = None,
+        resolved_by: str | None = None,
+        user_decision: str | None = None,
         page: int = 1,
         limit: int = 50,
     ) -> dict[str, Any]:
@@ -496,6 +498,8 @@ class AuditStore:
                 returns all records regardless of resolution status.
                 With decision='escalate', unresolved revision-bound receipts
                 must also satisfy current session/task-context freshness.
+            resolved_by: Filter by resolver (``user`` or ``judge``).
+            user_decision: Filter by resolution outcome (``approve`` or ``deny``).
 
         Returns:
             Dict with 'items', 'total', 'page', 'pages'.
@@ -533,6 +537,16 @@ class AuditStore:
         if to_ts:
             conditions.append("timestamp <= ?")
             params.append(to_ts)
+        if resolved_by:
+            if resolved_by not in ("user", "judge"):
+                raise ValueError("resolved_by must be 'user' or 'judge'")
+            conditions.append("resolved_by = ?")
+            params.append(resolved_by)
+        if user_decision:
+            if user_decision not in ("approve", "deny"):
+                raise ValueError("user_decision must be 'approve' or 'deny'")
+            conditions.append("user_decision = ?")
+            params.append(user_decision)
         if resolved is True:
             conditions.append("user_decision IS NOT NULL")
         elif resolved is False:

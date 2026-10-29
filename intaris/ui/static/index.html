@@ -1500,6 +1500,7 @@
                 <div class="flex items-center justify-between">
                   <div class="flex items-center gap-3">
                     <span class="badge badge-deny">deny</span>
+                    <span x-show="item.resolved_by === 'judge'" class="badge badge-judge">judge</span>
                     <span class="font-mono text-sm" x-text="item.tool"></span>
                     <span :class="riskBadgeClass(item.risk)" x-text="item.risk" x-show="item.risk"></span>
                     <span class="text-xs text-muted px-1.5 py-0.5 rounded bg-surface-tertiary" x-text="item.evaluation_path"></span>
@@ -1512,10 +1513,18 @@
                     <span x-text="formatTime(item.timestamp)"></span>
                   </div>
                 </div>
-                <div x-show="item.reasoning && expandedDenialId !== item.call_id" class="mt-2 text-sm text-secondary truncate" x-text="truncate(item.reasoning, 150)"></div>
+                <div x-show="(item.judge_reasoning || item.reasoning) && expandedDenialId !== item.call_id" class="mt-2 text-sm text-secondary truncate" x-text="truncate(item.judge_reasoning || item.reasoning, 150)"></div>
 
                 <!-- Expanded Detail -->
                 <div x-show="expandedDenialId === item.call_id" x-cloak @click.stop class="mt-4 pt-4 border-t border-brand-border">
+                  <!-- Judge reasoning -->
+                  <template x-if="expandedDenialRecord?.resolved_by === 'judge' && expandedDenialRecord?.judge_reasoning">
+                    <div class="mb-3">
+                      <div class="text-xs text-muted mb-1">Judge Reasoning</div>
+                      <div class="text-sm bg-brand-elevated rounded p-3" x-text="expandedDenialRecord.judge_reasoning"></div>
+                    </div>
+                  </template>
+
                   <!-- Reasoning -->
                   <template x-if="expandedDenialRecord?.reasoning">
                     <div class="mb-3">
